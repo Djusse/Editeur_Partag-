@@ -166,6 +166,7 @@ mode local (E2E) ......... 24/24 — WebSocket natif, PDF réel, quota, crédit,
 persistance locale ....... 7/7   — document, texte, lien, session, clé admin
 versions ................. 11/11 — enregistrement, liste, restauration gratuite
 routes visiteur .......... 7/7   — /d/... à la racine, /api/d/... en 404
+lien réel (bout en bout) .. 13/13 — statut, claim, PDF, URL absolue, quota
 typecheck frontend ....... OK
 build Next ............... 8 pages statiques
 template CloudFormation .. YAML valide, 20 ressources
