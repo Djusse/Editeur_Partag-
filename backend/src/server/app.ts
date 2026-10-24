@@ -4,9 +4,16 @@
  * Toutes les routes REST sont préfixées par `/api` : nginx proxifie `/api` vers
  * Node et sert le front statique directement, ce qui évite que le processus
  * applicatif traite des fichiers.
+ *
+ * CORS : en production, front et API partagent la même origine (nginx), donc
+ * aucun en-tête CORS n'est nécessaire. En **développement**, le front tourne sur
+ * `localhost:3000` et l'API sur `localhost:4000` : ce sont deux origines, et le
+ * navigateur exige alors un préflight `OPTIONS` **avec** les en-têtes CORS.
+ * Sans ce plugin, la connexion échoue avec « CORS header missing ».
  */
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
+import fastifyCors from '@fastify/cors';
 import { existsSync } from 'node:fs';
 import { config, publicConfig } from '../lib/config';
 import { AppError } from '../lib/errors';
@@ -23,6 +30,25 @@ export function buildApp(options: { staticDir?: string; logger?: boolean } = {})
     logger: options.logger ?? false,
     bodyLimit: 1024 * 1024,
     trustProxy: true,
+  });
+
+  // --- CORS ---------------------------------------------------------------
+  // Même origine en production : `WEB_ORIGIN` n'est alors pas défini et l'on
+  // n'autorise que l'origine de la requête (aucun élargissement inutile).
+  // En développement, `WEB_ORIGIN` liste explicitement l'interface.
+  const origins = (process.env.WEB_ORIGIN ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  void app.register(fastifyCors, {
+    origin: origins.length > 0 ? origins : true,
+    credentials: false,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['content-type', 'authorization', 'x-admin-key'],
+    maxAge: 600,
+    // Le service ne sert aucun cookie : pas besoin de credentials.
+    strictPreflight: true,
   });
 
   // --- Gestion d'erreurs uniforme -----------------------------------------

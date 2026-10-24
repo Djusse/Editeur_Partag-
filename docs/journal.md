@@ -69,17 +69,31 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
    même nom, donc `/admin` refusait systématiquement. Corrigé par des noms distincts.
 10. **`ADD` mal décodé dans le double en mémoire.** `[^S]` avec l'option `/i` excluait
     la lettre « s » et tronquait `:minusOne` : le quota ne se décrémentait pas.
+11. **Aucun CORS dans le serveur Fastify (mode local).** Le front tourne sur
+    `localhost:3000` et l'API sur `localhost:4000` : ce sont deux origines, donc le
+    navigateur exige un préflight `OPTIONS` avec les en-têtes CORS. Fastify répondait
+    `404` sans en-têtes, d'où « Connexion impossible » sur la page d'entrée et
+    « Impossible de charger l'état » sur `/admin`. *Correction* : `@fastify/cors`,
+    origines lues dans `WEB_ORIGIN`, en-têtes `content-type`, `authorization` et
+    `x-admin-key` autorisés. En production, front et API partagent la même origine
+    (nginx) : ce chemin n'est jamais emprunté.
+    **Leçon** : un test E2E en Node ne voit pas ce bug, car `fetch` n'envoie pas de
+    préflight. Le script vérifie donc désormais explicitement `OPTIONS`.
 
 ## Preuves exécutées
 
 ```
 typecheck backend ......... OK (0 erreur)
 tests unitaires .......... 29/29
-mode local (E2E) ......... 20/20 — WebSocket natif, PDF réel, quota, crédit
+mode local (E2E) ......... 24/24 — WebSocket natif, PDF réel, quota, crédit, CORS
 typecheck frontend ....... OK
 build Next ............... 8 pages statiques
 template CloudFormation .. YAML valide, 20 ressources
 ```
+
+> Le script E2E suppose un serveur **fraîchement démarré** : il crée un document et
+> un lien, puis épuise ce lien. Lancé deux fois sans redémarrage, la seconde passe
+> échoue sur le quota déjà consommé.
 
 ## Coûts
 

@@ -1,12 +1,17 @@
 /**
  * Verification de bout en bout du mode local (aucun AWS).
+ *
  * Couvre : session, document, etat, WebSocket natif, ecriture, idempotence,
- * credit, repli HTTP, lien, claim, PDF, echeance, admin, controle d'acces.
+ * credit, repli HTTP, lien, claim, PDF, echeance, admin, controle d'acces,
+ * et le **preflight CORS** (le seul cas qu'un client Node ne voit pas).
  */
 import * as Y from 'yjs';
 import WebSocket from 'ws';
 
 const API = 'http://localhost:4000';
+// Origine du front en developpement : le navigateur l'envoie en `Origin`.
+const FRONT_ORIGIN = process.env.FRONT_ORIGIN ?? 'http://localhost:3000';
+
 let ok = 0;
 let ko = 0;
 
@@ -37,6 +42,39 @@ async function json(path, opts = {}) {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 0. Preflight CORS — indispensable pour le navigateur en developpement.
+// Un `fetch` Node ne fait pas de preflight : sans ce test, le bug reste invisible.
+{
+  const preflight = await fetch(`${API}/api/admin/state`, {
+    method: 'OPTIONS',
+    headers: {
+      origin: FRONT_ORIGIN,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'x-admin-key',
+    },
+  });
+  const allowOrigin = preflight.headers.get('access-control-allow-origin');
+  const allowHeaders = preflight.headers.get('access-control-allow-headers') ?? '';
+  check(
+    'preflight CORS (OPTIONS) accepte',
+    preflight.status === 204 || preflight.status === 200,
+    `HTTP ${preflight.status}`,
+  );
+  check('en-tete Access-Control-Allow-Origin present', Boolean(allowOrigin), allowOrigin ?? 'absent');
+  check(
+    'x-admin-key autorise en CORS',
+    allowHeaders.toLowerCase().includes('x-admin-key'),
+    allowHeaders || 'absent',
+  );
+
+  // La reponse reelle doit aussi porter les en-tetes CORS.
+  const real = await fetch(`${API}/api/config`, { headers: { origin: FRONT_ORIGIN } });
+  check(
+    'reponse reelle porte Access-Control-Allow-Origin',
+    Boolean(real.headers.get('access-control-allow-origin')),
+  );
+}
+
 // 1. Session
 const session = await json('/api/session', {
   method: 'POST',
@@ -56,7 +94,10 @@ const docId = doc.body.id;
 
 // 3. Etat initial
 const state0 = await json(`/api/documents/${docId}/state`, { headers: auth });
-check('GET state -> seq 0 + etat', state0.status === 200 && state0.body.seq === 0 && typeof state0.body.state === 'string');
+check(
+  'GET state -> seq 0 + etat',
+  state0.status === 200 && state0.body.seq === 0 && typeof state0.body.state === 'string',
+);
 
 // 4. WebSocket natif
 const ticket = await json('/api/ws-ticket', {
@@ -138,7 +179,11 @@ const link = await json(`/api/documents/${docId}/links`, {
   headers: auth,
   body: JSON.stringify({ maxDownloads: 2 }),
 });
-check('POST links -> 201', link.status === 201, `token=${link.body.token ? link.body.token.slice(0, 8) : '?'}...`);
+check(
+  'POST links -> 201',
+  link.status === 201,
+  `token=${link.body.token ? link.body.token.slice(0, 8) : '?'}...`,
+);
 const token = link.body.token;
 
 const claim = (visitorId) =>

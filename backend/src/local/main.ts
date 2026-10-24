@@ -88,6 +88,9 @@ async function main(): Promise<void> {
     // d'administration (donc un refus systématique sur /admin).
     JWT_SECRET_PARAM: '/local/jwt-secret',
     ADMIN_KEY_PARAM: '/local/admin-key',
+    // En développement, le front (3000) et l'API (4000) sont deux origines :
+    // le navigateur exige donc un préflight CORS autorisant cette origine.
+    WEB_ORIGIN: 'http://localhost:3000',
   });
 
   resetConfigCache();
