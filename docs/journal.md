@@ -134,10 +134,20 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
 typecheck backend ......... OK (0 erreur)
 tests unitaires .......... 29/29
 mode local (E2E) ......... 24/24 — WebSocket natif, PDF réel, quota, crédit, CORS
+persistance locale ....... 7/7   — document, texte, lien, session, clé admin
+versions ................. 11/11 — enregistrement, liste, restauration gratuite
+typecheck frontend ....... OK
+build Next ............... 8 pages statiques
+template CloudFormation .. YAML valide, 20 ressources
+```
 
 > Le script E2E suppose un serveur **fraîchement démarré** : il crée un document et
 > un lien, puis épuise ce lien. Lancé deux fois sans redémarrage, la seconde passe
 > échoue sur le quota déjà consommé.
+
+> **Ordre d'arrêt important** : `SIGTERM` déclenche une sauvegarde de
+> `.local-data.json`. Pour repartir d'un état vierge, il faut donc **tuer le
+> serveur d'abord**, puis supprimer le fichier — sinon il est recréé à l'arrêt.
 
 ## Coûts
 
