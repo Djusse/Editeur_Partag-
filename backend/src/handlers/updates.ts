@@ -6,7 +6,7 @@
  *   GET  /documents/{id}/state           → snapshot + updates (nouveau client)
  */
 import { badRequest } from '../lib/errors';
-import { json, parseBody, requireSession, type RequestContext, type ResponsePayload } from '../lib/http';
+import { json, parseBody, requireSession, type RequestContext, type ResponsePayload, httpHandler } from '../lib/http';
 import { requireDocumentAccess } from '../lib/documents';
 import { commitUpdate, loadDocumentState, listUpdatesSince, prepareUpdate } from '../lib/updates';
 import { broadcast } from '../lib/connections';
@@ -83,3 +83,8 @@ export async function stateHandler(ctx: RequestContext): Promise<ResponsePayload
     })),
   });
 }
+
+// --- exports Lambda (points d'entrée réellement déployés) ---
+export const post = httpHandler(postHandler);
+export const list = httpHandler(listHandler);
+export const state = httpHandler(stateHandler);

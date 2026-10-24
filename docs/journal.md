@@ -52,6 +52,24 @@ quelque chose.
    qu'une `devDependency`. En Lambda (seuls les bundles sont déployés), l'appel aurait
    levé `MODULE_NOT_FOUND`. *Correction* : import statique + `yjs` en dépendance de
    production. Vérifié : aucun `require("yjs")` non résolu dans `dist/handlers/`.
+7. **Template pointant vers des fonctions internes.** Les `Handler:` du template
+   visaient `documents.listHandler`, `links.createHandler`, `updates.postHandler`…
+   Ces noms **n'étaient pas exportés** par les bundles : toutes les routes HTTP
+   auraient renvoyé une erreur d'initialisation. *Correction* : chaque fichier de
+   handler exporte des handlers Lambda wrappés (`httpHandler`), et le template les
+   référence (`documents.list`, `links.create`, …).
+8. **`POST /documents`, `PATCH` et `DELETE` sur le handler de `GET`.** La création
+   d'un document aurait répondu comme une liste. *Correction* : trois fonctions
+   distinctes (`DocumentsCreateFunction`, `DocumentWriteFunction`,
+   `DocumentDeleteFunction`).
+9. **Écriture impossible en repli HTTP.** Le provider exigeait `synced` avant
+   d'envoyer quoi que ce soit ; comme ce drapeau n'était posé que par le WebSocket,
+   aucune modification ne partait lorsque le WebSocket était indisponible.
+   *Correction* : bascule immédiate en repli + envoi sans attendre `synced`.
+
+Les défauts 7 à 9 ont été trouvés en construisant le **mode local**
+([`docs/developpement-local.md`](developpement-local.md)), qui exécute les vrais
+handlers sans AWS : 17 points du parcours vérifiés, dont le PDF réel.
 
 ## Coûts
 

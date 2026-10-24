@@ -5,7 +5,7 @@
  *   GET  /d/{token}/file    → URL présignée ou waiting
  */
 import { badRequest } from '../lib/errors';
-import { json, parseBody, type RequestContext, type ResponsePayload } from '../lib/http';
+import { json, parseBody, type RequestContext, type ResponsePayload, httpHandler } from '../lib/http';
 import { claimDownload, fileForVisitor, linkStatus, type ClaimResult } from '../lib/links';
 
 const STATUS_CACHE_ACTIVE = 'public, max-age=2, stale-while-revalidate=3';
@@ -64,3 +64,8 @@ export async function fileHandler(ctx: RequestContext): Promise<ResponsePayload>
   const result = await fileForVisitor(token, visitorId);
   return claimResponse(result);
 }
+
+// --- exports Lambda (points d'entrée réellement déployés) ---
+export const status = httpHandler(statusHandler);
+export const claim = httpHandler(claimHandler);
+export const file = httpHandler(fileHandler);

@@ -348,7 +348,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/documents.listHandler
+      Handler: handlers/documents.list
       Description: GET/POST /documents
       Policies:
         - Statement:
@@ -367,6 +367,22 @@ Resources:
         List:
           Type: HttpApi
           Properties: { ApiId: !Ref HttpApi, Path: /documents, Method: GET }
+
+  DocumentsCreateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/documents.create
+      Description: POST /documents — création
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem]
+              Resource: [!GetAtt DocumentsTable.Arn, !GetAtt MembersTable.Arn]
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
         Create:
           Type: HttpApi
           Properties: { ApiId: !Ref HttpApi, Path: /documents, Method: POST }
@@ -375,12 +391,12 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/documents.getHandler
-      Description: GET/PATCH/DELETE /documents/{id}
+      Handler: handlers/documents.get
+      Description: GET /documents/{id}
       Policies:
         - Statement:
             - Effect: Allow
-              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Action: [dynamodb:GetItem, dynamodb:Query]
               Resource:
                 - !GetAtt DocumentsTable.Arn
                 - !GetAtt MembersTable.Arn
@@ -394,9 +410,46 @@ Resources:
         Get:
           Type: HttpApi
           Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}', Method: GET }
+
+  DocumentWriteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/documents.rename
+      Description: PATCH/DELETE /documents/{id}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !GetAtt LinksTable.Arn
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
         Rename:
           Type: HttpApi
           Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}', Method: PATCH }
+
+  DocumentDeleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/documents.remove
+      Description: DELETE /documents/{id}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:DeleteItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
         Delete:
           Type: HttpApi
           Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}', Method: DELETE }
@@ -405,7 +458,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/documents.addMemberHandler
+      Handler: handlers/documents.addMember
       Description: POST /documents/{id}/members
       Policies:
         - Statement:
@@ -426,7 +479,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/links.createHandler
+      Handler: handlers/links.create
       Description: POST /documents/{id}/links
       Policies:
         - Statement:
@@ -449,7 +502,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/updates.postHandler
+      Handler: handlers/updates.post
       Description: Repli HTTP de l'édition et lecture du journal
       Timeout: 25
       Policies:
@@ -490,7 +543,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/versions.listHandler
+      Handler: handlers/versions.list
       Description: Historique et restauration de versions
       Timeout: 25
       Policies:
@@ -520,7 +573,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/versions.createHandler
+      Handler: handlers/versions.create
       Description: POST /documents/{id}/versions — snapshot explicite
       Timeout: 25
       Policies:
@@ -547,7 +600,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/versions.restoreHandler
+      Handler: handlers/versions.restore
       Description: POST /documents/{id}/versions/{n}/restore
       Timeout: 25
       Policies:
@@ -577,7 +630,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/credit.handler
+      Handler: handlers/credit.lambda
       Description: GET /me/credit
       Policies:
         - Statement:
@@ -596,7 +649,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/ws-ticket.handler
+      Handler: handlers/ws-ticket.lambda
       Description: POST /ws-ticket — ticket WebSocket à usage unique
       Policies:
         - Statement:
@@ -615,7 +668,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/visitor.statusHandler
+      Handler: handlers/visitor.status
       Description: Parcours visiteur (status, claim, file)
       Timeout: 25
       Policies:
@@ -648,7 +701,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/visitor.fileHandler
+      Handler: handlers/visitor.file
       Description: GET /d/{token}/file
       Policies:
         - Statement:
@@ -673,7 +726,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../backend/dist/
-      Handler: handlers/admin.handler
+      Handler: handlers/admin.lambda
       Description: GET /admin/state — supervision
       Timeout: 25
       Policies:

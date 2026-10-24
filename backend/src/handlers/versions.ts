@@ -5,7 +5,7 @@
  *   POST /documents/{id}/versions/{n}/restore
  */
 import { badRequest } from '../lib/errors';
-import { json, requireSession, type RequestContext, type ResponsePayload } from '../lib/http';
+import { json, requireSession, type RequestContext, type ResponsePayload, httpHandler } from '../lib/http';
 import { requireDocumentAccess } from '../lib/documents';
 import { createVersion, listVersions, restoreVersion, validateVersionNumber } from '../lib/versions';
 import { loadDocumentState, stateFromJournal } from '../lib/updates';
@@ -46,3 +46,8 @@ export async function restoreHandler(ctx: RequestContext): Promise<ResponsePaylo
   const result = await restoreVersion({ docId, n, authorEmail: session.email, authorName: session.name });
   return json(200, { restored: n, seq: result.seq });
 }
+
+// --- exports Lambda (points d'entrée réellement déployés) ---
+export const list = httpHandler(listHandler);
+export const create = httpHandler(createHandler);
+export const restore = httpHandler(restoreHandler);

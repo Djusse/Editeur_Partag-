@@ -14,6 +14,21 @@ export function setPresignerOverride(
   presignerOverride = override;
 }
 
+/**
+ * Réservé au mode local : remplace le stockage objet par une implémentation en
+ * mémoire. Permet de tester le parcours PDF complet sans compte AWS.
+ */
+export interface ObjectStore {
+  put(key: string, body: Uint8Array, contentType: string): Promise<void>;
+  get(key: string): Promise<Uint8Array>;
+}
+
+let objectStoreOverride: ObjectStore | null = null;
+
+export function setObjectStore(store: ObjectStore | null): void {
+  objectStoreOverride = store;
+}
+
 export function s3(): S3Client {
   if (!client) client = new S3Client({ region: config().region });
   return client;
@@ -28,6 +43,7 @@ export function snapshotKey(docId: string, seq: number): string {
 }
 
 export async function putObject(key: string, body: Uint8Array, contentType: string): Promise<void> {
+  if (objectStoreOverride) return objectStoreOverride.put(key, body, contentType);
   await s3().send(
     new PutObjectCommand({
       Bucket: config().pdfBucket,
@@ -40,6 +56,7 @@ export async function putObject(key: string, body: Uint8Array, contentType: stri
 }
 
 export async function getObject(key: string): Promise<Uint8Array> {
+  if (objectStoreOverride) return objectStoreOverride.get(key);
   const out = await s3().send(new GetObjectCommand({ Bucket: config().pdfBucket, Key: key }));
   return (await out.Body!.transformToByteArray()) as Uint8Array;
 }

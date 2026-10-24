@@ -2,7 +2,7 @@
 import { config } from '../lib/config';
 import { abuseId, getCredit } from '../lib/credits';
 import { getItem } from '../lib/db';
-import { json, requireSession, type RequestContext, type ResponsePayload } from '../lib/http';
+import { json, requireSession, type RequestContext, type ResponsePayload , httpHandler } from '../lib/http';
 import { utcDay } from '../lib/ids';
 import type { AbuseRow } from '../lib/types';
 
@@ -20,3 +20,6 @@ export async function handler(ctx: RequestContext): Promise<ResponsePayload> {
     refusals: abuse?.refusals ?? 0,
   });
 }
+
+// --- export Lambda (point d'entrée réellement déployé) ---
+export const lambda = httpHandler(handler);

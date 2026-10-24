@@ -210,6 +210,32 @@ aws ssm get-parameter --name /editeur-documents/admin-key \
 
 ## 6. Tester
 
+### Tester en local, sans déployer
+
+Un mode local exécute **les vrais handlers** avec DynamoDB en mémoire, S3 simulé
+et PDF réellement généré. C'est la façon la plus rapide de vérifier C1, C3 et C4.
+
+```bash
+# Terminal 1 — API locale (affiche la clé admin)
+cd backend && npm install && npm run dev:local
+
+# Terminal 2 — interface
+cd frontend && npm install && npm run dev:local
+```
+
+Ouvrir <http://localhost:3000>. Le statut affiché en éditeur est « Mode repli
+HTTP » : le WebSocket n'existe pas en local, mais les updates empruntent le même
+chemin serveur (même transaction, même crédit).
+
+Ce qui **n'est pas** testable en local : le pic de charge (C5), le WebSocket et
+les e-mails SES. Tout le détail, y compris le parcours de vérification de C1
+pas à pas, est dans [`docs/developpement-local.md`](docs/developpement-local.md).
+
+```bash
+# Vérification automatisée du parcours (17 points), serveur local démarré
+cd backend && node test-local.mjs
+```
+
 ### Tests unitaires (aucun cloud requis)
 
 ```bash

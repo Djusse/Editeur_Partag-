@@ -8,9 +8,9 @@
  *   POST /documents/{id}/members → partager
  */
 import { badRequest, forbidden } from '../lib/errors';
-import { json, parseBody, requireSession, type RequestContext, type ResponsePayload } from '../lib/http';
+import { json, parseBody, requireSession, type RequestContext, type ResponsePayload, httpHandler } from '../lib/http';
 import {
-  addMember,
+  addMember as addMemberToDocument,
   createDocument,
   deleteDocument,
   listDocumentsFor,
@@ -83,7 +83,7 @@ export async function addMemberHandler(ctx: RequestContext): Promise<ResponsePay
   if (!docId) throw badRequest('MISSING_DOC_ID', 'Identifiant de document manquant');
   await requireDocumentAccess(docId, session.email);
   const body = parseBody<{ email?: string; name?: string }>(ctx);
-  const member = await addMember({
+  const member = await addMemberToDocument({
     docId,
     email: String(body.email ?? ''),
     name: String(body.name ?? ''),
@@ -91,3 +91,11 @@ export async function addMemberHandler(ctx: RequestContext): Promise<ResponsePay
   });
   return json(201, { member });
 }
+
+// --- exports Lambda (points d'entrée réellement déployés) ---
+export const list = httpHandler(listHandler);
+export const create = httpHandler(createHandler);
+export const get = httpHandler(getHandler);
+export const rename = httpHandler(renameHandler);
+export const remove = httpHandler(deleteHandler);
+export const addMember = httpHandler(addMemberHandler);

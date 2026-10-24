@@ -121,6 +121,13 @@ export class YjsWebSocketProvider {
       this.socket = socket;
     } catch (error) {
       this.options.events?.onError?.((error as Error).message);
+      // Le WebSocket est indisponible : on bascule en repli HTTP **tout de
+      // suite**, sans attendre une reconnexion. Sans cela, le drapeau `synced`
+      // resterait faux et aucune écriture ne partirait jamais.
+      this.setStatus('fallback');
+      await this.catchUp();
+      this.startFallbackPolling();
+      this.flush();
       this.scheduleReconnect();
     }
   }
@@ -295,7 +302,9 @@ export class YjsWebSocketProvider {
 
   private flush(): void {
     if (this.inflight || this.readOnly) return;
-    if (!this.synced && this.status !== 'connected') return;
+    // On ne dépend pas de `synced` : l'éditeur a déjà chargé l'état complet via
+    // `GET /documents/{id}/state`, et les updates Yjs sont commutatifs. Bloquer
+    // ici empêcherait toute écriture en repli HTTP (WebSocket indisponible).
 
     if (this.buffer.length > 0) {
       const merged = Y.mergeUpdates(this.buffer);

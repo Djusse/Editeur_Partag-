@@ -5,6 +5,9 @@
  * Ce n'est pas un émulateur complet : il n'implémente que les expressions
  * utilisées par l'application, ce qui suffit à prouver les propriétés visées
  * (C1 : jamais N+1 ; C4 : jamais plus que le crédit).
+ *
+ * Ce fichier sert aux tests **et** au serveur local (`backend/src/dev/server.ts`),
+ * pour que les deux exercent exactement le même code métier.
  */
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
@@ -239,6 +242,8 @@ export class MemoryDynamo {
         }
 
         if (name === 'DeleteCommand') {
+          const definition = self.tables.get(tableName);
+          if (definition) definition.rows.delete(compositeKey(input.Key as Item, definition.key));
           return {};
         }
 

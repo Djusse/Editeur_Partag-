@@ -3,7 +3,7 @@
  *   POST /documents/{id}/links
  */
 import { badRequest } from '../lib/errors';
-import { json, parseBody, requireSession, type RequestContext, type ResponsePayload } from '../lib/http';
+import { json, parseBody, requireSession, type RequestContext, type ResponsePayload, httpHandler } from '../lib/http';
 import { requireDocumentAccess } from '../lib/documents';
 import { createLink } from '../lib/links';
 
@@ -29,3 +29,6 @@ export async function createHandler(ctx: RequestContext): Promise<ResponsePayloa
     },
   });
 }
+
+// --- exports Lambda (points d'entrée réellement déployés) ---
+export const create = httpHandler(createHandler);
