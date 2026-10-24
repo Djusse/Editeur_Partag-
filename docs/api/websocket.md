@@ -72,12 +72,27 @@ Réponse : `{ "type": "pong", "at": 1700000000000 }`.
   "type": "joined",
   "documentId": "doc_ab12",
   "seq": 142,
-  "you": { "email": "awa@exemple.cm", "name": "Awa", "color": "#2563EB" }
+  "you": { "email": "awa@exemple.cm", "name": "Awa", "color": "#2563EB" },
+  "creditRemaining": 7420,
+  "resetsAt": "2026-10-25T00:00:00.000Z"
 }
 ```
 
 Après un `join`, le message porte aussi `caughtUp: <nombre d'updates renvoyés>`.
-Si l'utilisateur est bloqué, `readOnly` contient le code (`BLOCKED`).
+
+`creditRemaining` et `resetsAt` sont **toujours** présents : ils permettent au
+rédacteur d'afficher une jauge exacte dès l'ouverture, sans appel
+supplémentaire. Sans eux, la jauge restait à sa dernière valeur connue alors que
+le crédit pouvait déjà être épuisé.
+
+Si l'écriture est impossible, `readOnly` contient le code (`CREDIT_EXHAUSTED`,
+`BLOCKED`, `FORBIDDEN`) et `blockedUntil` accompagne `BLOCKED`.
+
+**Le serveur renvoie `readOnly` à chaque `joined`, y compris ceux de `join`.**
+Le client ne doit rejouer la procédure de rejet (section 9.5) qu'**une seule
+fois** : mémoriser le code reçu, sinon chaque reconnexion déclenche une
+reconstruction du document, qui rouvre une connexion, qui renvoie `readOnly`…
+boucle infinie.
 
 ### `update`
 
@@ -119,7 +134,7 @@ Un client qui reçoit un `seq` supérieur à `lastSeq + 1` détecte un trou
 ### `error`
 
 ```json
-{ "type": "error", "code": "CREDIT_EXHAUSTED", "opId": "op_8f14…", "creditRemaining": 0 }
+{ "type": "error", "code": "CREDIT_EXHAUSTED", "opId": "op_8f14…", "creditRemaining": 0, "blockedUntil": "2026-10-25T00:00:00.000Z" }
 ```
 
 | `code` | Effet attendu côté client (interface, section 9.5) |

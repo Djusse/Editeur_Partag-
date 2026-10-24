@@ -25,7 +25,7 @@ import { AppError, WsErrorCodes } from '../lib/errors';
 import { base64Size, base64ToBytes } from '../lib/base64';
 import { colorFor, randomToken } from '../lib/ids';
 import { requireAccess } from '../lib/documents';
-import { assertNotBlocked } from '../lib/credits';
+import { assertNotBlocked, getCreditState } from '../lib/credits';
 import { creditCost, InvalidUpdateError } from '../lib/yjs-update';
 import { consumeTicket } from './tickets';
 import { manager } from './manager';
@@ -78,18 +78,30 @@ async function handleConnection(socket: WebSocket, request: IncomingMessage): Pr
   client.seq = state.seq;
   manager.join(ticket.docId, state, client);
 
+  const credit = await getCreditState(ticket.email);
   const blocked = await assertNotBlocked(ticket.email).then(
     () => null,
     (error: AppError) => error,
   );
 
+  // Le refus éventuel est annoncé une seule fois, à l'ouverture. `readOnly`
+  // accompagne aussi chaque `join` (voir `handleJoin`), mais le client ne
+  // rejoue la procédure de rejet que si aucun code n'a déjà été mémorisé.
+  //
+  // `creditRemaining` est indispensable dans ce message : sans lui, la jauge
+  // restait à sa dernière valeur connue (souvent « 1 / 10 000 ») alors que le
+  // crédit était déjà à zéro — l'utilisateur ne comprenait pas l'arrêt.
   send(client, {
     type: 'joined',
     connectionId: client.id,
     documentId: ticket.docId,
     seq: state.seq,
     you: { email: client.email, name: client.name, color: client.color },
+    creditRemaining: credit.remaining,
+    resetsAt: credit.resetsAt,
     ...(blocked ? { readOnly: blocked.code } : {}),
+    ...(credit.blockedUntil ? { blockedUntil: credit.blockedUntil } : {}),
+    ...(credit.remaining <= 0 && !blocked ? { readOnly: 'CREDIT_EXHAUSTED' } : {}),
   });
 
   socket.on('message', (raw: Buffer) => {

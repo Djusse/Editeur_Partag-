@@ -169,6 +169,11 @@ async function main(): Promise<void> {
 
   // Sert les fichiers « S3 » (PDF et snapshots) pour que le téléchargement
   // fonctionne réellement depuis le navigateur.
+  //
+  // Le nom du fichier vient de `?filename=…`, jamais du chemin : celui-ci finit
+  // par `v{seq}.pdf`, un nom interne. Sans l'en-tête `Content-Disposition`, le
+  // navigateur déduit le nom du dernier segment de l'URL et enregistrait donc
+  // « v1.pdf ». On reproduit ici ce que fait S3 via `ResponseContentDisposition`.
   app.get('/files/*', async (request, reply) => {
     const key = decodeURIComponent((request.params as { '*': string })['*']);
     if (!store.has(key)) {
@@ -176,8 +181,17 @@ async function main(): Promise<void> {
       return { error: 'NOT_FOUND' };
     }
     const body = await store.get(key);
+    const query = request.query as { filename?: string };
+    const filename = typeof query.filename === 'string' ? query.filename : '';
+    if (filename) {
+      // `filename*` (RFC 6266) couvre les accents ; `filename` sert de repli.
+      const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '');
+      reply.header(
+        'content-disposition',
+        `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      );
+    }
     reply.header('content-type', store.contentType(key));
-    reply.header('content-disposition', 'inline');
     return reply.send(Buffer.from(body));
   });
 
@@ -187,6 +201,38 @@ async function main(): Promise<void> {
     tables: Object.fromEntries(TABLES.map(([name]) => [name, memory.count(name)])),
     documentsInMemory: manager.openDocuments(),
   }));
+
+  // --- Outils de développement -------------------------------------------
+  //
+  // Remise à zéro du crédit d'une adresse. En production, la recharge est
+  // quotidienne et le blocage dure jusqu'à minuit UTC : sans cet outil, un test
+  // manuel du scénario d'épuisement condamne le compte pour la journée, ce qui
+  // rend le parcours impossible à rejouer (constaté en essai).
+  //
+  // Ces routes n'existent **que** dans le mode local : `src/server/main.ts` ne
+  // les enregistre pas.
+  app.post('/__reset-credit', async (request) => {
+    const body = (request.body ?? {}) as { email?: string };
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const day = new Date().toISOString().slice(0, 10);
+    if (email) {
+      memory.delete('Credits', { id: `${email}#${day}` });
+      memory.delete('Abuse', { id: `${email}#${day}` });
+      return { reset: email, day };
+    }
+    // Sans adresse : on efface crédits et blocages du jour pour tout le monde.
+    let cleared = 0;
+    for (const table of ['Credits', 'Abuse']) {
+      const rows = await memory.scan<{ id: string }>(table);
+      for (const row of rows) {
+        if (row.id.endsWith(`#${day}`)) {
+          memory.delete(table, { id: row.id });
+          cleared++;
+        }
+      }
+    }
+    return { reset: 'tous', day, cleared };
+  });
 
   await app.listen({ port, host: '127.0.0.1' });
 

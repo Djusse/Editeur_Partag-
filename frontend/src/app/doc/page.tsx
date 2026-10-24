@@ -166,6 +166,8 @@ function EditorScreen() {
 
       // Si le conteneur est déjà rendu, on remonte immédiatement ; sinon l'effet
       // ci-dessus s'en charge au prochain rendu.
+      // `readOnlyReason` est lu ici dans la closure : après un refus, il vaut
+      // déjà le nouveau code, donc l'éditeur remonté est bien en lecture seule.
       mountEditor(fresh, readOnlyReason !== null);
       await startProvider(current, fresh, state.seq, true);
     },
@@ -197,6 +199,19 @@ function EditorScreen() {
           );
         },
         onRejection: (payload) => {
+          // Section 9.6 : la jauge doit tomber à zéro immédiatement. Sans cet
+          // alignement, elle restait à « 1 / 10 000 » alors que l'écriture
+          // était déjà refusée — l'écart entre le compteur et le comportement
+          // était incompréhensible.
+          if (typeof payload.creditRemaining === 'number') {
+            const remaining = payload.creditRemaining;
+            setCredit((previous) =>
+              previous
+                ? { ...previous, remaining, used: previous.limit - remaining }
+                : previous,
+            );
+          }
+
           if (payload.code === 'CREDIT_EXHAUSTED') {
             setReadOnlyReason('credit');
             pushToast('Vos dernières modifications n\'ont pas été enregistrées.', 'error');
@@ -213,6 +228,10 @@ function EditorScreen() {
               'error',
             );
           }
+
+          // `PAYLOAD_TOO_LARGE` laisse l'écriture active (9.5) : on reconstruit
+          // tout de même pour effacer le texte non enregistré, mais sans
+          // repasser l'éditeur en lecture seule.
           void rebuildFromServer(current);
         },
       },

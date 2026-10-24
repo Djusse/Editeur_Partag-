@@ -244,7 +244,12 @@ function VisitorScreen() {
                 Le téléchargement démarre automatiquement.
               </p>
               {url && (
-                <a href={url} download>
+                // `download` reçoit explicitement le titre : sans valeur, et
+                // sur la même origine (cas de la production), le navigateur
+                // nommerait le fichier d'après le dernier segment de l'URL,
+                // c'est-à-dire « v0.pdf ». En développement, l'origine diffère
+                // et c'est `Content-Disposition` qui s'applique.
+                <a href={url} download={`${title || 'document'}.pdf`}>
                   <button type="button" className="btn-secondary">
                     Si rien ne se passe, cliquez ici
                   </button>

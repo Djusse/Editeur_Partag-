@@ -181,6 +181,35 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     le serveur** — les trois défauts de cette famille (20, 22, 23) sont passés
     inaperçus précisément parce que tous mes tests interrogeaient l'API.
 
+24. **« L'application bug » quand le crédit s'épuise.** Symptôme observé : trois
+    toasts identiques empilés, « Reconnexion… » clignotant, et le texte en cours
+    qui disparaît. Le texte qui s'efface est **conforme** à la spécification
+    (9.5 : un update refusé n'est jamais visible des autres, on reconstruit donc
+    depuis le serveur). En revanche la boucle était un vrai défaut :
+    `protocol.ts` renvoie `readOnly` **à chaque** `joined`, y compris ceux de
+    `join {sinceSeq}`, et `provider.ts` traitait chacun comme un rejet. Or
+    `handleRejection` → `onRejection` → `rebuildFromServer` → `provider.destroy()`
+    → reconnexion → nouveau `joined` → nouveau rejet : boucle infinie.
+    Deux aggravations : `this.readOnly` n'était jamais mis à `true`, et le refus
+    n'annonçait pas `creditRemaining`, donc la jauge restait figée à
+    « 1 / 10 000 » tout en refusant la frappe.
+    *Correction* : mémorisation du code de rejet (`rejectionCode`) pour ne
+    rejouer la procédure qu'une fois, `readOnly` réellement positionné, file et
+    tampon vidés (mémoire **et** `localStorage`, 9.5 étape 1), `creditRemaining`
+    ajouté à `joined` et relayé jusqu'à la jauge. Vérifié par
+    `backend/test-credit-exhaustion.mjs` (19 points).
+25. **Le PDF téléchargé s'appelait « v1.pdf ».** Le nom est porté par le
+    paramètre `?filename=` de l'URL présignée ([`links.ts`](backend/src/lib/links.ts:259)),
+    mais [`LocalStore.presign`](backend/src/local/main.ts:70) le laissait en
+    paramètre : le navigateur nomme d'après le **dernier segment du chemin**, ici
+    `v1.pdf`. S3, lui, utilise `ResponseContentDisposition`. *Correction* : la
+    route `/files/*` du mode local pose un `Content-Disposition` conforme à la
+    RFC 6266 (`filename` ASCII de repli + `filename*` UTF-8 pour les accents), et
+    le lien de secours du visiteur reçoit `download="{titre}.pdf"` — sans valeur,
+    sur la même origine (production), le navigateur ignorerait l'en-tête.
+    `slug()` conserve désormais accents et casse (`Rapport final — Été 2026.pdf`)
+    au lieu de tout réduire en minuscules sans accents.
+
 ## Preuves exécutées
 
 ```

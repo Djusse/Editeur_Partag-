@@ -332,14 +332,24 @@ async function lastWrittenSeq(docId: string): Promise<number> {
   return doc?.seq ?? 0;
 }
 
+/**
+ * Nom de fichier lisible dérivé du titre.
+ *
+ * On conserve les accents et la casse (`Document de démonstration.pdf`) : c'est
+ * le titre que l'auteur a choisi, et le navigateur l'affiche tel quel dans la
+ * barre de téléchargement. On retire seulement ce qu'un système de fichiers
+ * interdit (`/ \ : * ? " < > |`) et les caractères de contrôle.
+ */
 export function slug(title: string): string {
   const clean = title
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .toLowerCase()
-    .slice(0, 80);
+    .normalize('NFC')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[/\\:*?"<>|]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+/, '')
+    .slice(0, 120)
+    .trim();
   return clean || 'document';
 }
 

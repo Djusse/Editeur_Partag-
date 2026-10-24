@@ -29,11 +29,26 @@ export interface Peer {
 
 export type RejectionCode = 'CREDIT_EXHAUSTED' | 'BLOCKED' | 'FORBIDDEN' | 'PAYLOAD_TOO_LARGE';
 
+/** Charge utile d'un refus : section 9.5 et 9.6 de la spécification. */
+export interface RejectionPayload {
+  code: RejectionCode;
+  blockedUntil?: string;
+  message?: string;
+  /**
+   * Crédit restant annoncé avec le refus.
+   *
+   * Sans lui, la jauge restait figée à sa dernière valeur connue (souvent
+   * « 1 / 10 000 ») au lieu de tomber à zéro : l'utilisateur ne comprenait pas
+   * pourquoi l'écriture s'arrêtait.
+   */
+  creditRemaining?: number;
+}
+
 export interface ProviderCallbacks {
   onState?: (state: ConnectionState) => void;
   onPresence?: (users: Peer[]) => void;
   onAck?: (payload: { seq: number; creditRemaining: number }) => void;
-  onRejection?: (payload: { code: RejectionCode; blockedUntil?: string; message?: string }) => void;
+  onRejection?: (payload: RejectionPayload) => void;
   onQueueChange?: (size: number) => void;
   onRemoteUpdate?: () => void;
 }
@@ -83,6 +98,17 @@ export class CollaborativeProvider {
   private reconnectAttempts = 0;
   private closed = false;
   private readOnly = false;
+  /**
+   * Code du dernier refus subi (`CREDIT_EXHAUSTED`, `BLOCKED`, `FORBIDDEN`).
+   *
+   * Il est mémorisé pour deux raisons : éviter de rejouer la procédure de
+   * rejet à chaque reconnexion (le serveur renvoie `readOnly` dans chaque
+   * `joined`, ce qui provoquait une boucle reconstruire → reconnecter →
+   * reconstruire), et rester en lecture seule tant que la page n'est pas
+   * rechargée (section 9.6 : « L'écriture n'est réactivée qu'après un
+   * rechargement de la page »).
+   */
+  private rejectionCode: RejectionCode | null = null;
   private lastSeq = 0;
   /** `pendingOps` rejouées depuis `localStorage`, en attente du `join`. */
   private pendingFromStorage: PendingOp[] = [];
@@ -199,11 +225,24 @@ export class CollaborativeProvider {
       const seq = Number(message.seq ?? 0);
       this.lastSeq = Math.max(this.lastSeq, seq);
       this.joined = true;
-      if (typeof message.readOnly === 'string') {
-        this.handleRejection({ code: message.readOnly as RejectionCode });
+
+      // `readOnly` accompagne **chaque** `joined` (ouverture, puis chaque
+      // `join {sinceSeq}`). Sans le garde `rejectionCode === null`, la
+      // procédure de rejet se rejouait à chaque reconnexion : reconstruction
+      // du document, nouvelle connexion, nouveau rejet… boucle infinie, avec
+      // un toast empilé par tour.
+      if (typeof message.readOnly === 'string' && this.rejectionCode === null) {
+        this.handleRejection({
+          code: message.readOnly as RejectionCode,
+          blockedUntil: typeof message.blockedUntil === 'string' ? message.blockedUntil : undefined,
+          creditRemaining: typeof message.creditRemaining === 'number' ? message.creditRemaining : undefined,
+        });
+        return;
       }
-      // Une fois synchronisé, on renvoie la file dans l'ordre.
-      this.resendQueue();
+
+      // Une fois synchronisé, on renvoie la file dans l'ordre — sauf en
+      // lecture seule, où il n'y a plus rien à envoyer.
+      if (!this.readOnly) this.resendQueue();
       return;
     }
 
@@ -239,10 +278,13 @@ export class CollaborativeProvider {
     if (type === 'error') {
       const code = String(message.code ?? 'ERROR');
       if (code === 'CREDIT_EXHAUSTED' || code === 'BLOCKED' || code === 'FORBIDDEN' || code === 'PAYLOAD_TOO_LARGE') {
+        // `creditRemaining` accompagne le refus : il met la jauge à zéro sans
+        // appel réseau supplémentaire.
         this.handleRejection({
-          code,
+          code: code as RejectionCode,
           blockedUntil: typeof message.blockedUntil === 'string' ? message.blockedUntil : undefined,
           message: typeof message.message === 'string' ? message.message : undefined,
+          creditRemaining: typeof message.creditRemaining === 'number' ? message.creditRemaining : undefined,
         });
         return;
       }
@@ -258,15 +300,25 @@ export class CollaborativeProvider {
    * autres : on cesse d'envoyer, on vide la file, et la page reconstruit le
    * document depuis le serveur (callback `onRejection`).
    */
-  private handleRejection(payload: { code: RejectionCode; blockedUntil?: string; message?: string }): void {
+  private handleRejection(payload: RejectionPayload): void {
     if (payload.code !== 'PAYLOAD_TOO_LARGE') {
       this.readOnly = true;
+      this.rejectionCode = payload.code;
     }
+    // Section 9.5, étape 1 : cesser d'envoyer et vider `pendingOps` (mémoire
+    // **et** `localStorage`). Sans le second, la file refusée serait rejouée au
+    // prochain chargement de la page.
     for (const op of this.queue) {
       if (op.timer) clearTimeout(op.timer);
     }
     this.queue = [];
+    this.buffer = [];
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     this.persist();
+    this.options.callbacks?.onQueueChange?.(0);
     this.options.callbacks?.onRejection?.(payload);
   }
 
