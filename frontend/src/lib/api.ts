@@ -135,9 +135,15 @@ function safeJson(text: string): unknown {
   }
 }
 
-/** Requête visiteur : 410/202 sont des états attendus, pas des exceptions. */
-async function visitorRequest<T>(path: string, init: RequestInit = {}): Promise<{ status: number; body: T }> {
-  const response = await fetch(`${API_BASE}${path}`, {
+/**
+ * Requête visiteur : 410/202 sont des états attendus, pas des exceptions.
+ *
+ * `path` doit être une URL **complète** (base + chemin), car le parcours
+ * visiteur ne partage pas la base `/api`. Ne jamais re-préfixer ici : cela
+ * produisait `http://localhost:4000/apihttp://localhost:4000/d/...`.
+ */
+async function visitorRequest<T>(url: string, init: RequestInit = {}): Promise<{ status: number; body: T }> {
+  const response = await fetch(url, {
     ...init,
     headers: { 'content-type': 'application/json', ...(init.headers as Record<string, string>) },
   });
