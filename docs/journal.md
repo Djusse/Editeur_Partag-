@@ -43,8 +43,8 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
 ## Défauts trouvés et corrigés (les plus instructifs)
 
 1. **Template pointant vers des handlers inexistants (v6).** Toutes les routes HTTP
-   auraient échoué : les `Handler:` visaient des fonctions internes (`documents.listHandler`)
-   que les bundles n'exportaient pas.
+   auraient échoué : les `Handler:` visaient des fonctions internes
+   (`documents.listHandler`) que les bundles n'exportaient pas.
 2. **`POST /documents` sur le handler de `GET`.** Créer un document aurait renvoyé
    une liste.
 3. **Écriture impossible en repli HTTP (v6).** Le provider exigeait `synced` avant
@@ -70,13 +70,12 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
 10. **`ADD` mal décodé dans le double en mémoire.** `[^S]` avec l'option `/i` excluait
     la lettre « s » et tronquait `:minusOne` : le quota ne se décrémentait pas.
 11. **Aucun CORS dans le serveur Fastify (mode local).** Le front tourne sur
-    `localhost:3000` et l'API sur `localhost:4000` : ce sont deux origines, donc le
-    navigateur exige un préflight `OPTIONS` avec les en-têtes CORS. Fastify répondait
-    `404` sans en-têtes, d'où « Connexion impossible » sur la page d'entrée et
-    « Impossible de charger l'état » sur `/admin`. *Correction* : `@fastify/cors`,
-    origines lues dans `WEB_ORIGIN`, en-têtes `content-type`, `authorization` et
-    `x-admin-key` autorisés. En production, front et API partagent la même origine
-    (nginx) : ce chemin n'est jamais emprunté.
+    `localhost:3000` et l'API sur `localhost:4000` : deux origines, donc le navigateur
+    exige un préflight `OPTIONS` avec les en-têtes CORS. Fastify répondait `404` sans
+    en-têtes, d'où « Connexion impossible » et « Impossible de charger l'état ».
+    *Correction* : `@fastify/cors`, origines lues dans `WEB_ORIGIN`, en-têtes
+    `content-type`, `authorization`, `x-admin-key`. En production, front et API
+    partagent la même origine (nginx) : ce chemin n'est jamais emprunté.
     **Leçon** : un test E2E en Node ne voit pas ce bug, car `fetch` n'envoie pas de
     préflight. Le script vérifie donc désormais explicitement `OPTIONS`.
 12. **Zone d'écriture vide et clavier inopérant.** `mountEditor` était appelé dans
@@ -85,17 +84,22 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     n'était créé**. *Correction* : le `Y.Doc` à monter est mis en attente
     (`attachPending`) et branché par un `useEffect` qui s'exécute **après** le
     rendu ; l'éditeur reçoit aussi le focus pour écrire sans clic préalable.
-13. **Focus de la modale sur la croix de fermeture.** L'attribut `autoFocus` est
-    ignoré par React après le montage, et l'ordre du DOM place le bouton « × »
-    avant le champ : chaque frappe atterrissait donc sur la croix. *Correction* :
-    `Modal` privilégie `[data-autofocus]`, puis le premier champ de saisie, puis
-    le premier élément focusable.
-14. **Impossible de tester deux rédacteurs dans un même navigateur.** La clé
-    `session` vivait dans `localStorage`, partagée par tous les onglets : changer
-    d'identité dans l'un déconnectait l'autre et « Mes documents » restait vide.
-    *Correction* : la session active est celle du `sessionStorage` **de l'onglet**,
-    `localStorage` servant de valeur par défaut pour un nouvel onglet. Chaque
-    onglet incarne donc un rédacteur, et un rechargement conserve la session.
+13. **Focus de la modale sur la croix de fermeture.** `autoFocus` est ignoré par
+    React après le montage, et l'ordre du DOM place le bouton « × » avant le champ :
+    chaque frappe atterrissait sur la croix. *Correction* : `Modal` privilégie
+    `[data-autofocus]`, puis le premier champ de saisie, puis le premier élément
+    focusable.
+14. **Deux rédacteurs impossibles dans un même navigateur.** La clé `session` vivait
+    dans `localStorage`, partagée par tous les onglets : changer d'identité dans l'un
+    déconnectait l'autre, et « Mes documents » restait vide. *Correction* : la session
+    active est celle du `sessionStorage` **de l'onglet**, `localStorage` servant de
+    valeur par défaut pour un nouvel onglet.
+15. **`.next` corrompu : « Cannot find module './819.js' ».** `next build` a été
+    lancé **pendant** que `next dev` tournait ; les deux écrivent dans `.next`, qui
+    s'est retrouvé avec un mélange de manifestes de production et de développement.
+    *Correction* : arrêt du serveur, suppression de `.next`, redémarrage.
+    **Règle retenue** : ne jamais lancer `npm run build` tant que `next dev` tourne.
+    Le build de vérification se fait serveur arrêté, ou après `rm -rf .next`.
 
 ## Preuves exécutées
 

@@ -6,6 +6,7 @@
     "dev": "next dev",
     "dev:local": "NEXT_PUBLIC_API_BASE=http://localhost:4000/api NEXT_PUBLIC_WS_BASE=ws://localhost:4000/ws next dev -p 3000",
     "build": "next build",
+    "build:check": "next build --no-lint",
     "start": "next start",
     "typecheck": "tsc --noEmit"
   },
