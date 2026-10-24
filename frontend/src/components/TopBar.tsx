@@ -62,6 +62,12 @@ export default function TopBar({ session, credit }: Props) {
       </Link>
 
       <div className="row" style={{ gap: 16 }}>
+        {/* Accès à la supervision : la clé est demandée sur place, elle n'est
+            jamais stockée (voir /admin). */}
+        <Link href="/admin" className="btn-ghost" style={{ textDecoration: 'none' }}>
+          Supervision
+        </Link>
+
         <CreditMeter credit={credit} />
 
         {session && (

@@ -4,6 +4,7 @@
  * Les identifiants exposés sont `id` (contrat d'interface, section 3.1) alors
  * que la clé DynamoDB est `docId` : la conversion se fait ici, une fois.
  */
+import * as Y from 'yjs';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { base64ToBytes, base64Size } from '../lib/base64';
 import { config } from '../lib/config';
@@ -219,6 +220,39 @@ export function registerDocumentRoutes(app: FastifyInstance): void {
     await requireAccess(id, user.email);
     const { listVersions } = await import('../lib/versions');
     return { versions: await listVersions(id) };
+  });
+
+  /**
+   * Enregistre une version **maintenant**.
+   *
+   * Le plan v7 prévoit des versions automatiques (50 entrées ou 2 minutes
+   * d'activité) et la spécification d'interface n'affiche aucun bouton de
+   * création. En pratique, un document fraîchement créé n'a donc aucune version
+   * et la modale paraît cassée. Le sujet exige de pouvoir **consulter et
+   * restaurer** des versions : on garde l'automatisme et l'on ajoute un
+   * enregistrement explicite, à la demande. Écart documenté dans le README.
+   */
+  app.post('/documents/:id/versions', async (request, reply) => {
+    const user = await requireUser(request);
+    const { id } = request.params as { id: string };
+    await requireAccess(id, user.email);
+
+    const { saveVersion } = await import('../lib/versions');
+    const state = await manager.load(id);
+    const snapshot = Y.encodeStateAsUpdate(state.ydoc);
+    const seq = state.seq;
+
+    await saveVersion({
+      docId: id,
+      seq,
+      state: snapshot,
+      chars: state.ydoc.getText('content').length,
+      authorEmail: user.email,
+      authorName: user.name,
+    });
+
+    reply.code(201);
+    return { version: { n: seq, chars: state.textLength, createdAt: new Date().toISOString() } };
   });
 
   app.post('/documents/:id/versions/:n/restore', async (request) => {

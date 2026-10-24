@@ -114,6 +114,19 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     *Correction* : indicateur **flottant** (`position: fixed`, `pointer-events: none`),
     qui ne modifie jamais la mise en page. L'animation est désactivée sous
     `prefers-reduced-motion`.
+18. **« Aucune version enregistrée » alors que l'on écrit.** `maybeSnapshot`
+    déposait bien le snapshot dans S3, mais **n'ajoutait aucune ligne dans la
+    table `Versions`** : seule la restauration appelait `saveVersion`. La modale
+    était donc structurellement toujours vide. *Correction* : un snapshot crée
+    désormais **aussi** la version consultable (même `seq`, même clé S3), et un
+    endpoint `POST /documents/{id}/versions` permet d'en enregistrer une à la
+    demande. Écart assumé par rapport à la spécification (qui ne prévoyait aucun
+    bouton) : sans lui, un document neuf n'a aucune version à restaurer, alors que
+    le sujet exige de pouvoir « consulter les versions et en restaurer une ».
+    Vérifié par `backend/test-versions.mjs` (11 points).
+19. **Aucun accès à la supervision depuis l'interface.** `/admin` existait mais
+    n'était lié nulle part : le lien est ajouté dans la barre supérieure et sur la
+    page d'entrée.
 
 ## Preuves exécutées
 
@@ -121,11 +134,6 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
 typecheck backend ......... OK (0 erreur)
 tests unitaires .......... 29/29
 mode local (E2E) ......... 24/24 — WebSocket natif, PDF réel, quota, crédit, CORS
-persistance locale ....... 7/7  — document, texte, lien, session, clé admin
-typecheck frontend ....... OK
-build Next ............... 8 pages statiques
-template CloudFormation .. YAML valide, 20 ressources
-```
 
 > Le script E2E suppose un serveur **fraîchement démarré** : il crée un document et
 > un lien, puis épuise ce lien. Lancé deux fois sans redémarrage, la seconde passe

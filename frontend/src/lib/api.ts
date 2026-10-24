@@ -173,6 +173,14 @@ export const api = {
     return request<{ versions: Version[] }>(`/documents/${encodeURIComponent(id)}/versions`, { token });
   },
 
+  /** Enregistre une version immédiatement (les versions sont aussi automatiques). */
+  async createVersion(token: string, id: string) {
+    return request<{ version: { n: number; chars: number; createdAt: string } }>(
+      `/documents/${encodeURIComponent(id)}/versions`,
+      { method: 'POST', token, body: JSON.stringify({}) },
+    );
+  },
+
   async restoreVersion(token: string, id: string, n: number) {
     return request<{ seq: number }>(`/documents/${encodeURIComponent(id)}/versions/${n}/restore`, {
       method: 'POST',

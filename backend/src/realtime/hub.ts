@@ -414,22 +414,60 @@ function applyAndBroadcast(
   })();
 }
 
-/** Snapshot S3 : borne la taille du rattrapage et sert de base au PDF. */
+/**
+ * Snapshot S3 **et** création d'une version consultable.
+ *
+ * Un snapshot sert deux buts :
+ *  1. borner la taille du rattrapage (`latestSnapshotSeq`) et fournir la base
+ *     du PDF ;
+ *  2. être **listé dans la modale « Versions »**.
+ *
+ * Le point 2 avait été oublié : le fichier était bien écrit dans S3, mais aucune
+ * ligne n'était ajoutée à la table `Versions`, donc l'interface affichait
+ * toujours « Aucune version enregistrée ». Les deux écritures sont désormais
+ * faites ensemble.
+ *
+ * Les snapshots sont pris automatiquement (50 entrées de journal ou 2 minutes
+ * d'activité) : l'interface n'expose **aucun bouton** de création manuelle,
+ * conformément à la spécification.
+ */
 async function maybeSnapshot(state: DocumentState): Promise<void> {
   if (!state.shouldSnapshot()) return;
   try {
+    const seq = state.seq;
     const snapshot = Y.encodeStateAsUpdate(state.ydoc);
-    await putObject(snapshotKey(state.docId, state.seq), snapshot, 'application/octet-stream');
+    await putObject(snapshotKey(state.docId, seq), snapshot, 'application/octet-stream');
+
+    // Version consultable : c'est ce que lit `GET /documents/{id}/versions`.
+    await db()
+      .put(
+        config().versionsTable,
+        {
+          docId: state.docId,
+          n: seq,
+          s3Key: snapshotKey(state.docId, seq),
+          authorEmail: 'system',
+          authorName: 'Enregistrement automatique',
+          chars: state.textLength,
+          createdAt: new Date().toISOString(),
+        },
+        { condition: 'attribute_not_exists(n)' },
+      )
+      .catch((error: unknown) => {
+        // Une version déjà enregistrée pour ce `seq` n'est pas une erreur.
+        if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
+      });
+
     await db().update(
       config().documentsTable,
       { docId: state.docId },
       {
         update: 'SET latestSnapshotSeq = :seq',
         condition: 'attribute_not_exists(latestSnapshotSeq) OR latestSnapshotSeq < :seq',
-        values: { ':seq': state.seq },
+        values: { ':seq': seq },
       },
     );
-    state.markSnapshot(state.seq);
+    state.markSnapshot(seq);
   } catch (error) {
     console.warn('Snapshot ignoré', { docId: state.docId, error });
   }

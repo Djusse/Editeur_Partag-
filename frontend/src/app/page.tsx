@@ -108,6 +108,12 @@ export default function EntryPage() {
             {busy ? 'Connexion…' : 'Entrer'}
           </button>
         </form>
+
+        {/* L'administration ne dépend d'aucune session : elle a sa propre clé.
+            Sans ce lien, la page /admin était inaccessible depuis l'interface. */}
+        <p className="muted" style={{ marginTop: 24, textAlign: 'center' }}>
+          <a href="/admin">Accéder à la supervision</a>
+        </p>
       </div>
     </main>
   );

@@ -613,16 +613,38 @@ function VersionsModal({
   const [confirming, setConfirming] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        const result = await api.listVersions(session.token, documentId);
-        setVersions(result.versions);
-      } catch {
-        setVersions([]);
-      }
-    })();
+  const refresh = useCallback(async () => {
+    try {
+      const result = await api.listVersions(session.token, documentId);
+      setVersions(result.versions);
+    } catch {
+      setVersions([]);
+    }
   }, [documentId, session.token]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  /**
+   * Enregistrement explicite d'une version.
+   *
+   * Les versions sont aussi créées automatiquement (50 entrées ou 2 minutes),
+   * mais un document neuf n'en a aucune : sans ce bouton, la modale affichait
+   * « Aucune version enregistrée » et l'on ne pouvait rien restaurer.
+   */
+  async function snapshot() {
+    setBusy(true);
+    try {
+      await api.createVersion(session.token, documentId);
+      await refresh();
+      onToast('Version enregistrée.', 'success');
+    } catch {
+      onToast('Enregistrement impossible.', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function restore(n: number) {
     setBusy(true);
@@ -639,10 +661,19 @@ function VersionsModal({
 
   return (
     <Modal title={`Versions de « ${title} »`} onClose={onClose}>
+      <div className="spread" style={{ marginBottom: 16 }}>
+        <span className="muted">Enregistrez une version pour pouvoir y revenir.</span>
+        <button type="button" className="btn-secondary" onClick={() => void snapshot()} disabled={busy}>
+          {busy ? 'Enregistrement…' : 'Enregistrer une version'}
+        </button>
+      </div>
+
       {versions === null && <p className="muted">Chargement…</p>}
 
       {versions && versions.length === 0 && (
-        <p className="muted">Aucune version enregistrée pour l&#8217;instant.</p>
+        <p className="muted">
+          Aucune version enregistrée pour l&#8217;instant. Utilisez « Enregistrer une version ».
+        </p>
       )}
 
       {versions && versions.length > 0 && (
@@ -687,7 +718,8 @@ function VersionsModal({
       )}
 
       <p className="muted" style={{ marginTop: 16 }}>
-        Une version est enregistrée automatiquement pendant l&#8217;écriture.
+        Une version est aussi enregistrée automatiquement pendant l&#8217;écriture.
+        La restauration est gratuite : elle ne consomme pas de crédit.
       </p>
     </Modal>
   );
