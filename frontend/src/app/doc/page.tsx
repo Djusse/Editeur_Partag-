@@ -98,32 +98,27 @@ function EditorScreen() {
     }
   }, []);
 
-  /** Reconstruit le document depuis le serveur (procédure de rejet, 9.5). */
-  const rebuildFromServer = useCallback(
-    async (current: Session) => {
-      const state = await api.getState(current.token, docId);
-      const fresh = new Y.Doc();
-      Y.applyUpdate(fresh, Uint8Array.from(atob(state.state), (char) => char.charCodeAt(0)));
+  /**
+   * Montage / remontage de CodeMirror sur un nouveau Y.Doc.
+   *
+   * **Point critique** : le `<div ref={host}>` n'existe dans le DOM qu'après un
+   * rendu React. Si l'on appelle `mountEditor` depuis un `await` avant que
+   * `loading` passe à `false`, `host.current` est `null` et aucune zone
+   * d'écriture n'est créée : la page paraît vide et le clavier ne fait rien.
+   * `attachPending` conserve donc le `Y.Doc` à monter, et un `useEffect`
+   * s'exécute **après** le rendu pour le brancher.
+   */
+  const attachPending = useRef<{ doc: Y.Doc; readOnly: boolean } | null>(null);
 
-      provider.current?.destroy();
-      provider.current = null;
-      view.current?.destroy();
-      view.current = null;
-      ydoc.current?.destroy();
+  const mountEditor = useCallback((doc: Y.Doc, readOnly: boolean) => {
+    const container = host.current;
+    if (!container) {
+      // Le conteneur n'est pas encore rendu : on montera au prochain effet.
+      attachPending.current = { doc, readOnly };
+      return;
+    }
 
-      ydoc.current = fresh;
-      mountEditor(fresh, true);
-      await startProvider(current, fresh, state.seq, true);
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [docId],
-  );
-
-  // --- Montage de l'éditeur -----------------------------------------------
-  const mountEditor = (doc: Y.Doc, readOnly: boolean) => {
-    if (!host.current) return;
     const ytext = doc.getText('content');
-
     const state = EditorState.create({
       doc: ytext.toString(),
       extensions: [
@@ -134,8 +129,49 @@ function EditorScreen() {
       ],
     });
 
-    view.current = new EditorView({ state, parent: host.current });
-  };
+    view.current?.destroy();
+    view.current = new EditorView({ state, parent: container });
+    // Le focus permet d'écrire immédiatement, sans clic préalable.
+    view.current.focus();
+    attachPending.current = null;
+  }, []);
+
+  // Branche l'éditeur une fois le conteneur présent dans le DOM.
+  useEffect(() => {
+    if (loading) return;
+    const pending = attachPending.current;
+    if (pending) mountEditor(pending.doc, pending.readOnly);
+  }, [loading, mountEditor]);
+
+  /**
+   * Reconstruit le document depuis le serveur (procédure de rejet, section 9.5).
+   *
+   * Un update refusé est déjà affiché localement mais invisible pour les autres :
+   * on repart de l'état serveur, avec un nouveau `Y.Doc`, ce qui fait disparaître
+   * le texte refusé.
+   */
+  const rebuildFromServer = useCallback(
+    async (current: Session) => {
+      const state = await api.getState(current.token, docId);
+      const fresh = new Y.Doc();
+      Y.applyUpdate(
+        fresh,
+        Uint8Array.from(atob(state.state), (char) => char.charCodeAt(0)),
+      );
+
+      provider.current?.destroy();
+      provider.current = null;
+      ydoc.current?.destroy();
+      ydoc.current = fresh;
+
+      // Si le conteneur est déjà rendu, on remonte immédiatement ; sinon l'effet
+      // ci-dessus s'en charge au prochain rendu.
+      mountEditor(fresh, readOnlyReason !== null);
+      await startProvider(current, fresh, state.seq, true);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [docId],
+  );
 
   const startProvider = async (
     current: Session,

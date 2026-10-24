@@ -165,7 +165,9 @@ export default function DocumentsPage() {
                   setTitleError(null);
                 }}
                 maxLength={120}
-                autoFocus
+                // `data-autofocus` est honoré par le composant Modal : il place
+                // le curseur ici, et non sur le bouton de fermeture.
+                data-autofocus
                 aria-invalid={Boolean(titleError)}
                 aria-describedby={titleError ? 'title-error' : undefined}
               />

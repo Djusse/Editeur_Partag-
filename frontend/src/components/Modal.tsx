@@ -22,9 +22,23 @@ export default function Modal({ title, onClose, children }: Props) {
   useEffect(() => {
     previousFocus.current = document.activeElement as HTMLElement | null;
 
-    // Focus sur le premier champ disponible, sinon sur la boîte.
-    const first = box.current?.querySelector<HTMLElement>(FOCUSABLE);
-    first?.focus();
+    /**
+     * Priorité de focus à l'ouverture :
+     *   1. un élément explicitement marqué `data-autofocus` (le champ principal) ;
+     *   2. le premier **champ de saisie** ;
+     *   3. à défaut, le premier élément focusable.
+     *
+     * Ne PAS se fier à `autofocus` : React l'ignore après le montage, et l'ordre
+     * du DOM place le bouton « × » avant le champ — le focus atterrissait donc
+     * sur la croix, et la frappe suivante fermait la modale.
+     */
+    const candidates = box.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [];
+    const list = [...candidates].filter((element) => element.offsetParent !== null);
+    const explicit = list.find((element) => element.hasAttribute('data-autofocus'));
+    const firstField = list.find((element) =>
+      ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName),
+    );
+    (explicit ?? firstField ?? list[0] ?? box.current)?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {

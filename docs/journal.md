@@ -79,6 +79,23 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     (nginx) : ce chemin n'est jamais emprunté.
     **Leçon** : un test E2E en Node ne voit pas ce bug, car `fetch` n'envoie pas de
     préflight. Le script vérifie donc désormais explicitement `OPTIONS`.
+12. **Zone d'écriture vide et clavier inopérant.** `mountEditor` était appelé dans
+    un `await`, **avant** que React n'ait rendu le `<div ref={host}>` : le garde
+    `if (!host.current) return` sortait silencieusement, donc **aucun CodeMirror
+    n'était créé**. *Correction* : le `Y.Doc` à monter est mis en attente
+    (`attachPending`) et branché par un `useEffect` qui s'exécute **après** le
+    rendu ; l'éditeur reçoit aussi le focus pour écrire sans clic préalable.
+13. **Focus de la modale sur la croix de fermeture.** L'attribut `autoFocus` est
+    ignoré par React après le montage, et l'ordre du DOM place le bouton « × »
+    avant le champ : chaque frappe atterrissait donc sur la croix. *Correction* :
+    `Modal` privilégie `[data-autofocus]`, puis le premier champ de saisie, puis
+    le premier élément focusable.
+14. **Impossible de tester deux rédacteurs dans un même navigateur.** La clé
+    `session` vivait dans `localStorage`, partagée par tous les onglets : changer
+    d'identité dans l'un déconnectait l'autre et « Mes documents » restait vide.
+    *Correction* : la session active est celle du `sessionStorage` **de l'onglet**,
+    `localStorage` servant de valeur par défaut pour un nouvel onglet. Chaque
+    onglet incarne donc un rédacteur, et un rechargement conserve la session.
 
 ## Preuves exécutées
 
