@@ -1,0 +1,1045 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Éditeur de documents partagé — application serverless (Next.js statique + Lambda
+  Node.js + DynamoDB + API Gateway HTTP & WebSocket + S3/CloudFront + SES).
+  Une seule région. Toutes les ressources portent le tag Project pour la preuve de coût.
+
+Parameters:
+  SesSenderEmail:
+    Type: String
+    Description: Adresse expéditrice vérifiée dans SES (bac à sable ou production).
+  WebOrigin:
+    Type: String
+    Default: '*'
+    Description: Origine autorisée pour CORS (URL CloudFront), '*' avant le premier déploiement.
+  PdfUrlTtlSeconds:
+    Type: Number
+    Default: 60
+  CreditPerDay:
+    Type: Number
+    Default: 10000
+  MaxUpdateBytes:
+    Type: Number
+    Default: 16384
+  SnapshotInterval:
+    Type: Number
+    Default: 50
+  AdminAllowedCidr:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: Non utilisé pour filtrer (documenté) ; la clé admin protège /admin.
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    MemorySize: 512
+    Timeout: 20
+    Environment:
+      Variables:
+        NODE_OPTIONS: '--enable-source-maps'
+        DOCUMENTS_TABLE: !Ref DocumentsTable
+        MEMBERS_TABLE: !Ref MembersTable
+        UPDATES_TABLE: !Ref UpdatesTable
+        CONNECTIONS_TABLE: !Ref ConnectionsTable
+        CREDITS_TABLE: !Ref CreditsTable
+        OPIDS_TABLE: !Ref OpIdsTable
+        ABUSE_TABLE: !Ref AbuseTable
+        LINKS_TABLE: !Ref LinksTable
+        TICKETS_TABLE: !Ref TicketsTable
+        WSTICKETS_TABLE: !Ref WsTicketsTable
+        PDFCACHE_TABLE: !Ref PdfCacheTable
+        VERSIONS_TABLE: !Ref VersionsTable
+        PDF_BUCKET: !Ref PdfBucket
+        WS_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${WsStage}'
+        JWT_SECRET_PARAM: !Sub '/${AWS::StackName}/jwt-secret'
+        ADMIN_KEY_PARAM: !Sub '/${AWS::StackName}/admin-key'
+        SES_SENDER: !Ref SesSenderEmail
+        WEB_ORIGIN: !Ref WebOrigin
+        PDF_FUNCTION_NAME: !Sub '${AWS::StackName}-pdf'
+        CREDIT_PER_DAY: !Ref CreditPerDay
+        MAX_UPDATE_BYTES: !Ref MaxUpdateBytes
+        PDF_URL_TTL_SECONDS: !Ref PdfUrlTtlSeconds
+        SNAPSHOT_INTERVAL: !Ref SnapshotInterval
+    Tags:
+      Project: editeur-documents-partage
+      Stage: prod
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Stockage objet : PDF et snapshots CRDT (privé), front statique
+  # ---------------------------------------------------------------------------
+  PdfBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-pdf-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-pdf
+            Status: Enabled
+            ExpirationInDays: 30
+            Prefix: pdf/
+      Tags:
+        - Key: Project
+          Value: editeur-documents-partage
+
+  FrontBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-front-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: editeur-documents-partage
+
+  # ---------------------------------------------------------------------------
+  # Tables DynamoDB (facturation à la demande)
+  # ---------------------------------------------------------------------------
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: docId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: docId, KeyType: HASH }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: false }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  MembersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: docId, AttributeType: S }
+        - { AttributeName: email, AttributeType: S }
+      KeySchema:
+        - { AttributeName: docId, KeyType: HASH }
+        - { AttributeName: email, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - { AttributeName: email, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  UpdatesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: docId, AttributeType: S }
+        - { AttributeName: seq, AttributeType: N }
+      KeySchema:
+        - { AttributeName: docId, KeyType: HASH }
+        - { AttributeName: seq, KeyType: RANGE }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: connectionId, AttributeType: S }
+        - { AttributeName: docId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: connectionId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: docId-index
+          KeySchema:
+            - { AttributeName: docId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  CreditsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  OpIdsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  AbuseTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  LinksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: token, AttributeType: S }
+        - { AttributeName: docId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: token, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: docId-index
+          KeySchema:
+            - { AttributeName: docId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: token, AttributeType: S }
+        - { AttributeName: visitorId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: token, KeyType: HASH }
+        - { AttributeName: visitorId, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  WsTicketsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: ticket, AttributeType: S }
+      KeySchema:
+        - { AttributeName: ticket, KeyType: HASH }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  PdfCacheTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  VersionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: docId, AttributeType: S }
+        - { AttributeName: n, AttributeType: N }
+      KeySchema:
+        - { AttributeName: docId, KeyType: HASH }
+        - { AttributeName: n, KeyType: RANGE }
+      Tags:
+        - { Key: Project, Value: editeur-documents-partage }
+
+  # ---------------------------------------------------------------------------
+  # API HTTP
+  # ---------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration:
+        AllowOrigins: [!Ref WebOrigin]
+        AllowHeaders: [content-type, authorization, x-admin-key]
+        AllowMethods: [GET, POST, PATCH, DELETE, OPTIONS]
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 500
+        ThrottlingRateLimit: 1000
+
+  # Handlers HTTP -------------------------------------------------------------
+  SessionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/session.handler
+      Description: POST /session — émission du JWT
+      Environment:
+        Variables:
+          SESSION_TTL_SECONDS: '604800'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:PutItem]
+              Resource: !GetAtt CreditsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt AbuseTable.Arn
+      Events:
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /session
+            Method: POST
+
+  DocumentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/documents.listHandler
+      Description: GET/POST /documents
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !Sub '${MembersTable.Arn}/index/*'
+                - !GetAtt LinksTable.Arn
+                - !Sub '${LinksTable.Arn}/index/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        List:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /documents, Method: GET }
+        Create:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /documents, Method: POST }
+
+  DocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/documents.getHandler
+      Description: GET/PATCH/DELETE /documents/{id}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !Sub '${MembersTable.Arn}/index/*'
+                - !GetAtt LinksTable.Arn
+                - !Sub '${LinksTable.Arn}/index/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Get:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}', Method: GET }
+        Rename:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}', Method: PATCH }
+        Delete:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}', Method: DELETE }
+
+  MembersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/documents.addMemberHandler
+      Description: POST /documents/{id}/members
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Add:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/members', Method: POST }
+
+  LinksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/links.createHandler
+      Description: POST /documents/{id}/links
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !GetAtt LinksTable.Arn
+                - !Sub '${LinksTable.Arn}/index/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Create:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/links', Method: POST }
+
+  UpdatesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/updates.postHandler
+      Description: Repli HTTP de l'édition et lecture du journal
+      Timeout: 25
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !GetAtt UpdatesTable.Arn
+                - !GetAtt CreditsTable.Arn
+                - !GetAtt OpIdsTable.Arn
+                - !GetAtt AbuseTable.Arn
+                - !GetAtt ConnectionsTable.Arn
+                - !Sub '${ConnectionsTable.Arn}/index/*'
+                - !GetAtt VersionsTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${PdfBucket.Arn}/*'
+            - Effect: Allow
+              Action: [execute-api:ManageConnections]
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Post:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/updates', Method: POST }
+        List:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/updates', Method: GET }
+        State:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/state', Method: GET }
+
+  VersionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/versions.listHandler
+      Description: Historique et restauration de versions
+      Timeout: 25
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !GetAtt UpdatesTable.Arn
+                - !GetAtt VersionsTable.Arn
+                - !GetAtt CreditsTable.Arn
+                - !GetAtt OpIdsTable.Arn
+                - !GetAtt AbuseTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${PdfBucket.Arn}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        List:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/versions', Method: GET }
+
+  VersionsCreateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/versions.createHandler
+      Description: POST /documents/{id}/versions — snapshot explicite
+      Timeout: 25
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !GetAtt UpdatesTable.Arn
+                - !GetAtt VersionsTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${PdfBucket.Arn}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Create:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/versions', Method: POST }
+
+  RestoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/versions.restoreHandler
+      Description: POST /documents/{id}/versions/{n}/restore
+      Timeout: 25
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt MembersTable.Arn
+                - !GetAtt UpdatesTable.Arn
+                - !GetAtt VersionsTable.Arn
+                - !GetAtt CreditsTable.Arn
+                - !GetAtt OpIdsTable.Arn
+                - !GetAtt AbuseTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource: !Sub '${PdfBucket.Arn}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Restore:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/documents/{id}/versions/{n}/restore', Method: POST }
+
+  CreditFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/credit.handler
+      Description: GET /me/credit
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: [!GetAtt CreditsTable.Arn, !GetAtt AbuseTable.Arn]
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Get:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /me/credit, Method: GET }
+
+  WsTicketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/ws-ticket.handler
+      Description: POST /ws-ticket — ticket WebSocket à usage unique
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: [!GetAtt MembersTable.Arn, !GetAtt DocumentsTable.Arn, !GetAtt WsTicketsTable.Arn]
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Create:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /ws-ticket, Method: POST }
+
+  VisitorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/visitor.statusHandler
+      Description: Parcours visiteur (status, claim, file)
+      Timeout: 25
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource:
+                - !GetAtt LinksTable.Arn
+                - !GetAtt TicketsTable.Arn
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt PdfCacheTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${PdfBucket.Arn}/*'
+            - Effect: Allow
+              Action: [lambda:InvokeFunction]
+              Resource: !GetAtt PdfFunction.Arn
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Status:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/d/{token}/status', Method: GET }
+        Claim:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/d/{token}/claim', Method: POST }
+
+  VisitorFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/visitor.fileHandler
+      Description: GET /d/{token}/file
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: [!GetAtt LinksTable.Arn, !GetAtt TicketsTable.Arn, !GetAtt PdfCacheTable.Arn, !GetAtt DocumentsTable.Arn]
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${PdfBucket.Arn}/*'
+            - Effect: Allow
+              Action: [lambda:InvokeFunction]
+              Resource: !GetAtt PdfFunction.Arn
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        File:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/d/{token}/file', Method: GET }
+
+  AdminFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/admin.handler
+      Description: GET /admin/state — supervision
+      Timeout: 25
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Scan, dynamodb:Query]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt LinksTable.Arn
+                - !Sub '${LinksTable.Arn}/index/*'
+                - !GetAtt ConnectionsTable.Arn
+                - !Sub '${ConnectionsTable.Arn}/index/*'
+                - !GetAtt CreditsTable.Arn
+                - !GetAtt AbuseTable.Arn
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Get:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /admin/state, Method: GET }
+
+  # ---------------------------------------------------------------------------
+  # Génération PDF (asynchrone) et notification SES
+  # ---------------------------------------------------------------------------
+  PdfFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-pdf'
+      CodeUri: ../backend/dist/
+      Handler: handlers/pdf.handler
+      Description: Génération PDF d'une version figée (invoquée en asynchrone)
+      MemorySize: 1024
+      Timeout: 120
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:UpdateItem]
+              Resource:
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt UpdatesTable.Arn
+                - !GetAtt PdfCacheTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${PdfBucket.Arn}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      EventInvokeConfig:
+        MaximumRetryAttempts: 1
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/notify.handler
+      Description: DynamoDB Streams → SES (dernier exemplaire distribué)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt LinksTable.Arn
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: '*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt LinksTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: true
+
+  # ---------------------------------------------------------------------------
+  # API WebSocket
+  # ---------------------------------------------------------------------------
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-ws'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.type'
+
+  WsConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations'
+
+  WsDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations'
+
+  WsMessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsMessageFunction.Arn}/invocations'
+
+  WsConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsConnectIntegration}'
+
+  WsDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsDisconnectIntegration}'
+
+  WsDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsMessageIntegration}'
+
+  WsStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: prod
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 500
+        ThrottlingRateLimit: 500
+
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsConnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/$connect'
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsDisconnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/$disconnect'
+
+  WsDefaultPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsMessageFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/*'
+
+  WsConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/ws.connectHandler
+      Description: $connect — validation du ticket à usage unique
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource:
+                - !GetAtt WsTicketsTable.Arn
+                - !GetAtt ConnectionsTable.Arn
+                - !Sub '${ConnectionsTable.Arn}/index/*'
+                - !GetAtt MembersTable.Arn
+                - !GetAtt DocumentsTable.Arn
+            - Effect: Allow
+              Action: [execute-api:ManageConnections]
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+
+  WsDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/ws.disconnectHandler
+      Description: $disconnect — nettoyage et présence
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource:
+                - !GetAtt ConnectionsTable.Arn
+                - !Sub '${ConnectionsTable.Arn}/index/*'
+            - Effect: Allow
+              Action: [execute-api:ManageConnections]
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+
+  WsMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/dist/
+      Handler: handlers/ws.messageHandler
+      Description: Messages `update` / `awareness` / `ping`
+      MemorySize: 768
+      Timeout: 25
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource:
+                - !GetAtt ConnectionsTable.Arn
+                - !Sub '${ConnectionsTable.Arn}/index/*'
+                - !GetAtt MembersTable.Arn
+                - !GetAtt DocumentsTable.Arn
+                - !GetAtt UpdatesTable.Arn
+                - !GetAtt CreditsTable.Arn
+                - !GetAtt OpIdsTable.Arn
+                - !GetAtt AbuseTable.Arn
+            - Effect: Allow
+              Action: [execute-api:ManageConnections]
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+
+  # ---------------------------------------------------------------------------
+  # CloudFront : front statique (OAC) + /api/* vers l'API HTTP
+  # ---------------------------------------------------------------------------
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  RewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-rewrite'
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          // /api/* -> l'API Gateway attend /* (le préfixe sert au routage CloudFront)
+          if (uri.indexOf('/api/') === 0) {
+            var stripped = uri.substring(4);
+            request.uri = stripped === '' ? '/' : stripped;
+            return request;
+          }
+          // Export statique Next.js : /doc/ -> /doc/index.html
+          if (uri.endsWith('/')) {
+            request.uri = uri + 'index.html';
+          } else if (uri.indexOf('.') === -1) {
+            request.uri = uri + '/index.html';
+          }
+          return request;
+        }
+      FunctionConfig:
+        Comment: Routage SPA et retrait du préfixe /api
+        Runtime: cloudfront-js-2.0
+
+  FrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${AWS::StackName} — front statique et API'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: s3-front
+            DomainName: !GetAtt FrontBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: api-http
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: s3-front
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RewriteFunction.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api-http
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized (respecte Cache-Control de l'origine)
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # AllViewerExceptHostHeader
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt RewriteFunction.FunctionARN
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+
+  FrontBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontDistribution}'
+
+Outputs:
+  ApiUrl:
+    Description: URL de l'API HTTP
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  WebSocketUrl:
+    Description: URL WebSocket (wss)
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  FrontDistributionDomain:
+    Description: Domaine CloudFront du front
+    Value: !GetAtt FrontDistribution.DomainName
+  FrontBucketName:
+    Description: Bucket S3 du front (cible du déploiement statique)
+    Value: !Ref FrontBucket
+  PdfBucketName:
+    Description: Bucket S3 privé des PDF et snapshots
+    Value: !Ref PdfBucket
+  AdminKeyParameter:
+    Description: Paramètre SSM contenant la clé admin
+    Value: !Sub '/${AWS::StackName}/admin-key'

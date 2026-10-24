@@ -1,0 +1,14 @@
+# Configuration SAM par défaut. Les valeurs sensibles ne sont jamais ici :
+# SES_SENDER est passé en paramètre de déploiement (voir scripts/deploy.sh).
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "editeur-documents"
+region = "eu-west-3"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+no_fail_on_empty_changeset = true
+confirm_changeset = false
+
+[default.local_start_api.parameters]
+region = "eu-west-3"

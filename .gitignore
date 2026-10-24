@@ -1,0 +1,27 @@
+# Dépendances
+node_modules/
+.pnp/
+.pnp.js
+
+# Builds
+backend/dist/
+frontend/.next/
+frontend/out/
+*.tsbuildinfo
+
+# Environnement / secrets
+.env
+.env.*
+!.env.example
+aws-sam/
+.aws-sam/
+samconfig.local.toml
+
+# Tests et artefacts
+tests/results/*.json
+tests/results/*.log
+coverage/
+
+# Divers
+.DS_Store
+*.swp

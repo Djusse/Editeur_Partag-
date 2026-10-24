@@ -1,0 +1,653 @@
+openapi: 3.0.3
+info:
+  title: Éditeur de documents partagé — API
+  version: 1.0.0
+  description: |
+    API de l'éditeur collaboratif. Identité légère : un nom et un e-mail suffisent
+    (`POST /session` renvoie un JWT HS256). Les visiteurs de liens n'ont aucune
+    identité à donner : ils utilisent un `visitorId` aléatoire généré par le client.
+
+    **États visiteur normalisés** : `ready` (200 + URL présignée 60 s), `waiting`
+    (202 + `retryAfter`), `exhausted` (410). Aucune autre réponse n'est produite
+    pour un parcours normal : le visiteur n'est jamais « jeté ».
+
+    **Codes d'erreur métier** : `CREDIT_EXHAUSTED`, `BLOCKED`, `OP_ID_CONFLICT`,
+    `INVALID_UPDATE`, `WRITE_CONTENTION`, `EXHAUSTED`, `NO_TICKET`.
+servers:
+  - url: https://{apiId}.execute-api.eu-west-3.amazonaws.com
+    variables:
+      apiId:
+        default: REPLACE_ME
+security:
+  - bearerAuth: []
+tags:
+  - name: session
+  - name: documents
+  - name: temps-reel
+  - name: liens
+  - name: visiteur
+  - name: supervision
+
+paths:
+  /session:
+    post:
+      tags: [session]
+      summary: Ouvrir une session (nom + e-mail → JWT)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email]
+              properties:
+                name: { type: string, maxLength: 80, example: Awa Nkemta }
+                email: { type: string, format: email, example: awa@exemple.cm }
+      responses:
+        '200':
+          description: Session créée
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: JWT HS256, durée 7 jours }
+                  session:
+                    type: object
+                    properties:
+                      email: { type: string }
+                      name: { type: string }
+                      role: { type: string, enum: [editor, admin] }
+                  credit: { $ref: '#/components/schemas/Credit' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /ws-ticket:
+    post:
+      tags: [temps-reel]
+      summary: Ticket à usage unique (60 s) pour ouvrir le WebSocket
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [docId]
+              properties:
+                docId: { type: string }
+      responses:
+        '201':
+          description: Ticket émis (utilisable une seule fois)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ticket: { type: string }
+                  expiresIn: { type: integer, example: 60 }
+                  docId: { type: string }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /documents:
+    get:
+      tags: [documents]
+      summary: Lister mes documents
+      responses:
+        '200':
+          description: Liste des documents accessibles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documents:
+                    type: array
+                    items: { $ref: '#/components/schemas/Document' }
+    post:
+      tags: [documents]
+      summary: Créer un document
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, maxLength: 200 }
+      responses:
+        '201':
+          description: Document créé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document: { $ref: '#/components/schemas/Document' }
+
+  /documents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/DocId'
+    get:
+      tags: [documents]
+      summary: Détail (membres + liens)
+      responses:
+        '200':
+          description: Détail du document
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document: { $ref: '#/components/schemas/Document' }
+                  role: { type: string, enum: [owner, editor] }
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/Member' }
+                  links:
+                    type: array
+                    items: { $ref: '#/components/schemas/Link' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [documents]
+      summary: Renommer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+      responses:
+        '200': { description: Renommé }
+    delete:
+      tags: [documents]
+      summary: Supprimer (propriétaire uniquement)
+      responses:
+        '200': { description: Supprimé }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /documents/{id}/members:
+    parameters:
+      - $ref: '#/components/parameters/DocId'
+    post:
+      tags: [documents]
+      summary: Donner accès à un rédacteur
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                name: { type: string }
+      responses:
+        '201':
+          description: Membre ajouté
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  member: { $ref: '#/components/schemas/Member' }
+
+  /documents/{id}/state:
+    parameters:
+      - $ref: '#/components/parameters/DocId'
+    get:
+      tags: [temps-reel]
+      summary: État complet (snapshot + updates) pour un nouveau client
+      responses:
+        '200':
+          description: État CRDT encodé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document:
+                    type: object
+                    properties:
+                      docId: { type: string }
+                      title: { type: string }
+                      seq: { type: integer }
+                      textLength: { type: integer }
+                  seq: { type: integer }
+                  snapshot:
+                    type: string
+                    nullable: true
+                    description: État Yjs complet en Base64 (`encodeStateAsUpdate`)
+                  updates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq: { type: integer }
+                        author: { type: string }
+                        payload: { type: string, description: Update Yjs en Base64 }
+
+  /documents/{id}/updates:
+    parameters:
+      - $ref: '#/components/parameters/DocId'
+    post:
+      tags: [temps-reel]
+      summary: Publier un update (repli HTTP du WebSocket, mêmes règles)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [opId, update]
+              properties:
+                opId:
+                  type: string
+                  maxLength: 100
+                  description: Identifiant d'opération stable — un retry doit réutiliser le même
+                update:
+                  type: string
+                  description: Update Yjs encodé en Base64 (≤ 16 Ko de binaire)
+      responses:
+        '200':
+          description: Update accepté ou déjà accepté (idempotent)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ack:
+                    type: object
+                    properties:
+                      opId: { type: string }
+                      seq: { type: integer }
+                      duplicate: { type: boolean }
+                      chars: { type: integer, description: Caractères facturés (insertions + suppressions) }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403':
+          description: Crédit épuisé ou écriture bloquée
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Conflit de déduplication (`OP_ID_CONFLICT`) ou contention (`WRITE_CONTENTION`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { description: Update trop volumineux }
+    get:
+      parameters:
+        - name: since
+          in: query
+          schema: { type: integer, default: 0 }
+          description: Renvoie les updates de `seq` strictement supérieur
+      tags: [temps-reel]
+      summary: Rattrapage après reconnexion
+      responses:
+        '200':
+          description: Updates manquants, ordonnés par `seq`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq: { type: integer }
+                        author: { type: string }
+                        authorName: { type: string }
+                        opId: { type: string }
+                        payload: { type: string }
+                        createdAt: { type: string }
+
+  /documents/{id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/DocId'
+    get:
+      tags: [documents]
+      summary: Historique des versions
+      responses:
+        '200':
+          description: Versions (snapshots horodatés)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentSeq: { type: integer }
+                  versions:
+                    type: array
+                    items: { $ref: '#/components/schemas/Version' }
+    post:
+      tags: [documents]
+      summary: Enregistrer une version maintenant
+      responses:
+        '201':
+          description: Version créée
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { $ref: '#/components/schemas/Version' }
+
+  /documents/{id}/versions/{n}/restore:
+    parameters:
+      - $ref: '#/components/parameters/DocId'
+      - name: n
+        in: path
+        required: true
+        schema: { type: integer }
+    post:
+      tags: [documents]
+      summary: Restaurer une version (gratuit, historique conservé)
+      responses:
+        '200':
+          description: Restauration appliquée comme un nouvel update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  restored: { type: integer }
+                  seq: { type: integer }
+
+  /documents/{id}/links:
+    parameters:
+      - $ref: '#/components/parameters/DocId'
+    post:
+      tags: [liens]
+      summary: Créer un lien de téléchargement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [maxDownloads]
+              properties:
+                maxDownloads: { type: integer, minimum: 1, maximum: 100000, example: 500 }
+      responses:
+        '201':
+          description: Lien créé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  link: { $ref: '#/components/schemas/Link' }
+
+  /me/credit:
+    get:
+      tags: [documents]
+      summary: Crédit restant du jour et état de blocage
+      responses:
+        '200':
+          description: Crédit
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Credit' }
+
+  /d/{token}/status:
+    parameters:
+      - $ref: '#/components/parameters/Token'
+    get:
+      tags: [visiteur]
+      summary: État public du lien (cachable)
+      security: []
+      responses:
+        '200':
+          description: État du lien
+          headers:
+            Cache-Control:
+              schema: { type: string }
+              description: 2 s tant qu'ACTIVE, 30 s une fois EXHAUSTED
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [active, exhausted] }
+                  remaining: { type: integer }
+                  maxDownloads: { type: integer }
+                  docTitle: { type: string }
+                  updatedAt: { type: string }
+
+  /d/{token}/claim:
+    parameters:
+      - $ref: '#/components/parameters/Token'
+    post:
+      tags: [visiteur]
+      summary: Réserver un exemplaire (idempotent par visitorId)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [visitorId]
+              properties:
+                visitorId:
+                  type: string
+                  minLength: 8
+                  maxLength: 100
+                  description: Aléatoire côté client ; un retry renvoie le MÊME ticket
+      responses:
+        '200':
+          description: PDF prêt
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { type: string, enum: [ready] }
+                  url: { type: string, description: URL S3 présignée, expire en 60 s }
+                  seq: { type: integer, description: Version figée (T1) }
+                  remaining: { type: integer }
+                  expiresIn: { type: integer, example: 60 }
+        '202':
+          description: Génération en cours — le visiteur patiente
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { type: string, enum: [waiting] }
+                  retryAfter: { type: integer }
+                  remaining: { type: integer }
+                  message: { type: string }
+        '410':
+          description: Lien épuisé — plus aucun calcul
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { type: string, enum: [exhausted] }
+                  remaining: { type: integer, example: 0 }
+                  message: { type: string }
+
+  /d/{token}/file:
+    parameters:
+      - $ref: '#/components/parameters/Token'
+      - name: visitorId
+        in: query
+        required: true
+        schema: { type: string }
+    get:
+      tags: [visiteur]
+      summary: Récupérer l'URL du PDF réservé (polling)
+      security: []
+      responses:
+        '200': { description: PDF prêt (même corps que claim `ready`) }
+        '202': { description: Toujours en génération }
+        '410': { description: Épuisé, ou aucun ticket pour ce visiteur }
+
+  /admin/state:
+    get:
+      tags: [supervision]
+      summary: État de l'application (clé admin)
+      description: |
+        En-tête `X-Admin-Key` obligatoire, valeur du paramètre SSM
+        `/<stack>/admin-key`.
+      parameters:
+        - name: X-Admin-Key
+          in: header
+          required: true
+          schema: { type: string }
+      security: []
+      responses:
+        '200':
+          description: Documents ouverts, liens actifs, personnes bloquées
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminState' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    DocId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, example: doc_ab12cd34 }
+    Token:
+      name: token
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Requête invalide
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Accès refusé
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Ressource introuvable
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: CREDIT_EXHAUSTED }
+            message: { type: string }
+            remaining: { type: integer }
+            resetsIn: { type: integer }
+            blockedUntil: { type: string, format: date-time }
+    Document:
+      type: object
+      properties:
+        docId: { type: string }
+        title: { type: string }
+        ownerEmail: { type: string }
+        ownerName: { type: string }
+        seq: { type: integer, description: Nombre d'updates acceptés (contigu) }
+        latestSnapshotSeq: { type: integer }
+        textLength: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        role: { type: string, enum: [owner, editor] }
+    Member:
+      type: object
+      properties:
+        docId: { type: string }
+        email: { type: string }
+        name: { type: string }
+        role: { type: string, enum: [owner, editor] }
+        addedAt: { type: string, format: date-time }
+    Link:
+      type: object
+      properties:
+        token: { type: string }
+        maxDownloads: { type: integer }
+        remaining: { type: integer }
+        status: { type: string, enum: [ACTIVE, EXHAUSTED] }
+        createdAt: { type: string, format: date-time }
+        path: { type: string, example: /d?token=abc }
+    Version:
+      type: object
+      properties:
+        n: { type: integer, description: Séquence figée du snapshot }
+        chars: { type: integer }
+        createdAt: { type: string, format: date-time }
+        authorName: { type: string }
+        label: { type: string }
+    Credit:
+      type: object
+      properties:
+        used: { type: integer }
+        limit: { type: integer, example: 10000 }
+        remaining: { type: integer }
+        day: { type: string, example: '2026-10-24' }
+        resetsIn: { type: integer, description: Secondes avant minuit UTC }
+        blocked: { type: boolean }
+        blockedUntil: { type: string, format: date-time }
+        refusals: { type: integer }
+    AdminState:
+      type: object
+      properties:
+        generatedAt: { type: string, format: date-time }
+        totals:
+          type: object
+          properties:
+            documents: { type: integer }
+            openDocuments: { type: integer }
+            connections: { type: integer }
+        openDocuments:
+          type: array
+          items:
+            type: object
+            properties:
+              docId: { type: string }
+              title: { type: string }
+              seq: { type: integer }
+              readers: { type: integer }
+              links:
+                type: array
+                items: { $ref: '#/components/schemas/Link' }
+        activeLinks: { type: integer }
+        creditToday:
+          type: array
+          items:
+            type: object
+            properties:
+              email: { type: string }
+              used: { type: integer }
+              limit: { type: integer }
+        blocked:
+          type: array
+          items:
+            type: object
+            properties:
+              email: { type: string }
+              blockedUntil: { type: string, format: date-time }
+              refusals: { type: integer }
