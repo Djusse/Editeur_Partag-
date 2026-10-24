@@ -127,6 +127,22 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
 19. **Aucun accès à la supervision depuis l'interface.** `/admin` existait mais
     n'était lié nulle part : le lien est ajouté dans la barre supérieure et sur la
     page d'entrée.
+20. **« Ce lien n'existe pas ou n'est plus valide » sur un lien valide.**
+    Le serveur expose le parcours visiteur à la **racine** (`/d/...`), mais le
+    client préfixait par `/api` : `GET /api/d/{token}/status` → `404`. L'API
+    répondait pourtant correctement sur `/d/{token}/status`. *Correction* : une
+    constante `VISITOR_BASE` dérivée de `API_BASE` en retirant le suffixe `/api`
+    (`''` en production, `http://localhost:4000` en développement).
+    Vérifié par `backend/test-visitor-routes.mjs` (7 points) : la route correcte
+    répond, la route fautive renvoie bien 404, ce qui documente le contrat.
+    **Leçon** : mes tests E2E appelaient l'API directement, ils ne voyaient donc
+    pas une erreur de construction d'URL côté client.
+21. **Interface non responsive.** La barre supérieure et la barre d'outils de
+    l'éditeur étaient en styles inline à hauteur fixe : sur mobile, le titre
+    passait sur deux lignes et les boutons chevauchaient le contenu. *Correction* :
+    classes `.topbar` / `.doc-toolbar` avec points de rupture à 768 px (identité et
+    lien « Supervision » masqués, jauge compactée, actions en ligne défilante,
+    colonne de présence masquée, `overflow-x: hidden` sur `body`).
 
 ## Preuves exécutées
 
@@ -136,6 +152,7 @@ tests unitaires .......... 29/29
 mode local (E2E) ......... 24/24 — WebSocket natif, PDF réel, quota, crédit, CORS
 persistance locale ....... 7/7   — document, texte, lien, session, clé admin
 versions ................. 11/11 — enregistrement, liste, restauration gratuite
+routes visiteur .......... 7/7   — /d/... à la racine, /api/d/... en 404
 typecheck frontend ....... OK
 build Next ............... 8 pages statiques
 template CloudFormation .. YAML valide, 20 ressources

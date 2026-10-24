@@ -6,7 +6,19 @@
  * et tout problème de CORS en HTTP sur une IP nue.
  */
 
+/**
+ * Base des appels REST.
+ *
+ * En production, nginx sert front et API sur la **même origine** : `/api` est un
+ * chemin relatif, il n'y a donc ni CORS ni URL à configurer. En développement,
+ * `NEXT_PUBLIC_API_BASE` pointe sur `http://localhost:4000/api`.
+ *
+ * Attention : le **parcours visiteur** (`/d/...`) est à la racine du serveur,
+ * pas sous `/api`. Il utilise donc `VISITOR_BASE`, dérivé de `API_BASE` en
+ * retirant le suffixe `/api`.
+ */
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '/api';
+const VISITOR_BASE = API_BASE.replace(/\/api$/, '');
 
 export interface Session {
   token: string;
@@ -232,12 +244,19 @@ export const api = {
   },
 
   // --- Parcours visiteur (aucune authentification) -------------------------
+  //
+  // Ces routes sont à la **racine** du serveur, pas sous `/api` : nginx sert le
+  // front statique sur `/` et ne proxifie que `/api` et `/ws`. Les préfixer par
+  // `/api` produisait un 404 systématique — « Ce lien n'existe pas ou n'est plus
+  // valide » sur un lien parfaitement valide.
   async linkStatus(token: string) {
-    return request<VisitorStatus>(`/d/${encodeURIComponent(token)}/status`);
+    return visitorRequest<VisitorStatus>(`${VISITOR_BASE}/d/${encodeURIComponent(token)}/status`).then(
+      expectOk,
+    );
   },
 
   async claim(token: string, visitorId: string) {
-    return visitorRequest<ClaimResponse>(`/d/${encodeURIComponent(token)}/claim`, {
+    return visitorRequest<ClaimResponse>(`${VISITOR_BASE}/d/${encodeURIComponent(token)}/claim`, {
       method: 'POST',
       body: JSON.stringify({ visitorId }),
     });
@@ -245,10 +264,17 @@ export const api = {
 
   async file(token: string, visitorId: string) {
     return visitorRequest<ClaimResponse>(
-      `/d/${encodeURIComponent(token)}/file?visitorId=${encodeURIComponent(visitorId)}`,
+      `${VISITOR_BASE}/d/${encodeURIComponent(token)}/file?visitorId=${encodeURIComponent(visitorId)}`,
     );
   },
 };
+
+/** `/status` renvoie 200 seulement s'il existe : on lève une erreur au-delà. */
+async function expectOk<T>(result: { status: number; body: T }): Promise<T> {
+  if (result.status === 200) return result.body;
+  const body = result.body as { error?: string; message?: string };
+  throw new ApiError(result.status, body.error ?? 'HTTP_ERROR', body.message ?? `Erreur ${result.status}`);
+}
 
 // --- Stockage navigateur (clés exactes de la spécification, section 2.3) ----
 // **Identité par onglet.** La spécification prévoit `localStorage`, mais cette

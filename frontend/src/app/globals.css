@@ -36,6 +36,8 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
+  /* Aucun débordement horizontal de la page, quelle que soit la largeur. */
+  overflow-x: hidden;
 }
 
 body {
@@ -361,6 +363,188 @@ input[aria-invalid='true'] {
   display: flex;
   justify-content: center;
   padding: 24px;
+}
+
+/* --- Barre supérieure (responsive) --------------------------------------- */
+.topbar {
+  height: 56px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 24px;
+  /* Empêche tout débordement horizontal de la page. */
+  min-width: 0;
+}
+
+.topbar-brand {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  text-decoration: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.topbar-brand:hover {
+  text-decoration: none;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.topbar-identity {
+  text-align: right;
+  line-height: 1.3;
+  min-width: 0;
+}
+
+.topbar-name {
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+.topbar-email {
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.credit-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-end;
+  flex-shrink: 0;
+}
+
+.credit-meter-text {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.credit-meter .credit-track {
+  width: 120px;
+}
+
+/* --- Barre d'outils de l'éditeur (responsive) ---------------------------- */
+.doc-toolbar {
+  min-height: 56px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 24px;
+  flex-wrap: wrap;
+}
+
+.doc-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.doc-toolbar-title {
+  font-size: 18px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40vw;
+}
+
+.doc-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* --- Mobile -------------------------------------------------------------- */
+@media (max-width: 767px) {
+  .topbar {
+    height: auto;
+    min-height: 56px;
+    padding: 8px 16px;
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
+  /* L'e-mail et le nom complet prennent trop de place : on les masque. */
+  .topbar-identity {
+    display: none;
+  }
+
+  /* « Supervision » reste accessible depuis la page /documents. */
+  .topbar-admin {
+    display: none;
+  }
+
+  /* Jauge plus compacte : le libellé long disparaît, la barre reste lisible. */
+  .credit-meter-text {
+    font-size: 12px;
+  }
+
+  .credit-meter .credit-track {
+    width: 88px;
+  }
+
+  .topbar-right {
+    gap: 8px;
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  .doc-toolbar {
+    padding: 8px 16px;
+  }
+
+  .doc-toolbar-title {
+    font-size: 16px;
+    max-width: 55vw;
+  }
+
+  /* Les trois actions ne tiennent pas : elles passent en ligne défilante. */
+  .doc-toolbar-actions {
+    width: 100%;
+    gap: 8px;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    padding-bottom: 4px;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .doc-toolbar-actions button {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .editor-shell {
+    flex-direction: column;
+    min-height: auto;
+  }
+
+  .paper {
+    padding: 16px;
+    min-height: calc(100vh - 180px);
+  }
+
+  .paper .cm-editor {
+    font-size: 16px;
+  }
 }
 
 .paper {

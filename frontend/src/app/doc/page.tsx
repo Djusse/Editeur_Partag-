@@ -345,30 +345,17 @@ function EditorScreen() {
         </div>
       )}
 
-      {/* Barre d'outils */}
-      <div
-        style={{
-          height: 56,
-          background: 'var(--bg)',
-          borderBottom: '1px solid var(--border)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: 16,
-          padding: '0 24px',
-        }}
-      >
-        <div className="row" style={{ gap: 16, minWidth: 0 }}>
+      {/* Barre d'outils : classes responsive (le style inline débordait sur mobile). */}
+      <div className="doc-toolbar">
+        <div className="doc-toolbar-left">
           <NextLink href="/documents" className="btn-ghost" style={{ textDecoration: 'none' }}>
             ← Mes documents
           </NextLink>
-          <span style={{ fontSize: 18, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {detail?.title ?? (loading ? '' : 'Document')}
-          </span>
+          <span className="doc-toolbar-title">{detail?.title ?? (loading ? '' : 'Document')}</span>
         </div>
 
-        <div className="row" style={{ gap: 12 }}>
-          <span className="row" style={{ gap: 6 }}>
+        <div className="doc-toolbar-actions">
+          <span className="row" style={{ gap: 6, flexShrink: 0 }}>
             <span
               className="dot"
               style={{ background: connection === 'connected' ? 'var(--success)' : 'var(--warning)' }}
