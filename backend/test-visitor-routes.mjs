@@ -72,6 +72,14 @@ const wrong = await json(`/api/d/${token}/status`);
 check('GET /api/d/... -> 404 (contrat)', wrong.status === 404, `HTTP ${wrong.status}`);
 
 // 3. Claim à la racine.
+//
+// On mesure **avant/après** et non le total de la table : le mode local
+// persiste sur disque, donc la table `Tickets` contient déjà les tickets des
+// exécutions précédentes. Compter en absolu rendait le test dépendant de
+// l'historique — il échouait à la deuxième exécution sans qu'aucun code ne soit
+// en cause.
+const before = (await json('/__debug')).body.tables.Tickets;
+
 const claim = await json(`/d/${token}/claim`, {
   method: 'POST',
   body: JSON.stringify({ visitorId }),
@@ -85,9 +93,13 @@ const wrongClaim = await json(`/api/d/${token}/claim`, {
 });
 check('POST /api/d/.../claim -> 404 (contrat)', wrongClaim.status === 404, `HTTP ${wrongClaim.status}`);
 
-// 5. Le lien reste consommable : un seul ticket créé.
-const debug = await json('/__debug');
-check('un seul ticket enregistré', debug.body.tables.Tickets === 1, `${debug.body.tables.Tickets}`);
+// 5. Un seul ticket créé par ce claim : le lien reste consommable.
+const after = (await json('/__debug')).body.tables.Tickets;
+check(
+  'un seul ticket créé pour ce claim',
+  after - before === 1,
+  `${before} -> ${after} (delta ${after - before})`,
+);
 
 console.log(`\n=== ${ok} OK, ${ko} FAIL ===`);
 process.exit(ko === 0 ? 0 : 1);

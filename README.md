@@ -176,9 +176,19 @@ cd backend && npm install && npm run local
 cd frontend && npm install && npm run dev:local
 ```
 
-Ouvrir <http://localhost:3001>. Contrairement à une architecture Lambda, le
+Ouvrir <http://localhost:3000>. Contrairement à une architecture Lambda, le
 **WebSocket natif fonctionne ici** : deux onglets convergent réellement, et le PDF
 est généré puis téléchargé.
+
+> **Ne lancez pas `npx next dev` directement.** Ce script définit
+> `NEXT_PUBLIC_API_BASE=http://localhost:4000/api` et
+> `NEXT_PUBLIC_WS_BASE=ws://localhost:4000/ws`. Sans ces variables, le client
+> appelle `/api` sur le port 3000 — qui ne sert pas l'API — et l'interface affiche
+> « Impossible de charger vos documents ».
+>
+> Si vous changez ces variables, arrêtez le serveur et supprimez `frontend/.next` :
+> les valeurs `NEXT_PUBLIC_*` sont **inlinées dans le bundle** à la compilation,
+> un cache périmé continuerait de servir les anciennes.
 
 ```bash
 # Vérification automatisée du parcours (20 points), serveur local démarré

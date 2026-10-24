@@ -156,6 +156,30 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     **Leçon, la même que pour le défaut 20** : un bouchon local qui ne respecte pas
     le contrat de l'implémentation réelle fabrique de faux bugs — et mes tests
     validaient le serveur, pas l'usage que le navigateur fait de la réponse.
+23. **« Impossible de charger vos documents » — toutes les requêtes en 404.**
+    Symptôme : `GET http://localhost:3000/me/credit` et
+    `GET http://localhost:3000/documents/undefined/` en 404 dans la console, alors
+    que `GET http://localhost:4000/api/me/credit` répondait (401 sans jeton).
+    Deux causes cumulées, toutes deux dans la configuration du client :
+    - `next.config.mjs` contenait un bloc `env` qui réécrivait
+      `NEXT_PUBLIC_API_BASE: process.env.NEXT_PUBLIC_API_BASE ?? ''`. Sans
+      variable définie, Next recevait donc une chaîne **vide**, qui écrasait le
+      défaut `'/api'` écrit dans `src/lib/api.ts` ;
+    - le code utilisait `process.env.NEXT_PUBLIC_API_BASE ?? '/api'`, or `??` ne
+      se déclenche que sur `null`/`undefined` : une chaîne vide était conservée.
+      La base valait `''`, donc `fetch('') + '/me/credit'` partait sur l'origine
+      de la page — le port 3000, qui ne sert pas l'API.
+    *Correction* : suppression du bloc `env` (les `NEXT_PUBLIC_*` sont de toute
+    façon inlinées par Next) et passage à `||` avec normalisation de la barre
+    finale. Ajout d'un `console.warn` explicite quand la base vaut `/api` hors
+    production, et d'un garde-fou qui refuse un chemin contenant `/undefined`
+    (l'identifiant manquant était masqué par un 404 serveur).
+    Vérifié par `tests/node/verify-client-bundle.mjs` (8 points en développement,
+    4 en production) : il inspecte les chunks compilés et refuse une base vide,
+    une URL `localhost` dans un build de production, ou un bundle qui vise le
+    mauvais port. **C'est le premier test du projet qui vérifie le client et non
+    le serveur** — les trois défauts de cette famille (20, 22, 23) sont passés
+    inaperçus précisément parce que tous mes tests interrogeaient l'API.
 
 ## Preuves exécutées
 
@@ -167,6 +191,8 @@ persistance locale ....... 7/7   — document, texte, lien, session, clé admin
 versions ................. 11/11 — enregistrement, liste, restauration gratuite
 routes visiteur .......... 7/7   — /d/... à la racine, /api/d/... en 404
 lien réel (bout en bout) .. 13/13 — statut, claim, PDF, URL absolue, quota
+bundle client (dev) ....... 8/8   — base API et WebSocket inlinées, routes réelles
+bundle client (prod) ...... 4/4   — chemin relatif /api, aucune URL localhost
 typecheck frontend ....... OK
 build Next ............... 8 pages statiques
 template CloudFormation .. YAML valide, 20 ressources

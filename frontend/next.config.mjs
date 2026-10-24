@@ -9,10 +9,11 @@ const nextConfig = {
   trailingSlash: true,
   images: { unoptimized: true },
   reactStrictMode: true,
-  env: {
-    NEXT_PUBLIC_API_BASE: process.env.NEXT_PUBLIC_API_BASE ?? '',
-    NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL ?? '',
-  },
+  // PAS de bloc `env` ici. Il réécrivait `NEXT_PUBLIC_API_BASE` avec une chaîne
+  // vide quand la variable n'était pas définie, ce qui écrasait le défaut
+  // `'/api'` appliqué dans `src/lib/api.ts` (`'' ?? '/api'` vaut `''`) : le
+  // client appelait alors `/me/credit` sur l'origine du front (3000), donc 404.
+  // Les variables `NEXT_PUBLIC_*` sont de toute façon inlinées par Next.
 };
 
 export default nextConfig;

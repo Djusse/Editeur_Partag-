@@ -16,9 +16,36 @@
  * Attention : le **parcours visiteur** (`/d/...`) est à la racine du serveur,
  * pas sous `/api`. Il utilise donc `VISITOR_BASE`, dérivé de `API_BASE` en
  * retirant le suffixe `/api`.
+ *
+ * On utilise `||` et non `??` : une variable définie mais **vide** (`''`) doit
+ * retomber sur `/api`. Avec `??`, `''` était conservé et toutes les requêtes
+ * partaient sur l'origine du front — d'où des 404 sur `/me/credit` alors que
+ * l'API répondait sur `/api/me/credit`.
  */
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '/api';
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || '/api').replace(/\/+$/, '');
 const VISITOR_BASE = API_BASE.replace(/\/api$/, '');
+
+// Garde-fou de développement.
+//
+// En production, front et API partagent l'origine : appeler `/api` est correct.
+// En développement, ce n'est vrai que si Next.js est lancé par `npm run dev:local`
+// (qui définit `NEXT_PUBLIC_API_BASE`). Avec un simple `next dev`, `/api` vise le
+// port 3000, qui ne sert pas l'API : toutes les requêtes renvoient 404 et
+// l'interface affiche « Impossible de charger vos documents ».
+//
+// Le piège est silencieux, d'où cet avertissement explicite.
+if (
+  process.env.NODE_ENV !== 'production' &&
+  typeof window !== 'undefined' &&
+  API_BASE === '/api'
+) {
+  console.warn(
+    '[api] NEXT_PUBLIC_API_BASE n’est pas défini : les appels partent sur ' +
+      `${window.location.origin}/api, qui n’existe pas en développement.\n` +
+      'Lancez le front avec « npm run dev:local » (port 3000) et l’API avec ' +
+      '« npm run local » dans backend/.',
+  );
+}
 
 export interface Session {
   token: string;
@@ -104,6 +131,14 @@ async function request<T>(
   path: string,
   init: RequestInit & { token?: string | null; adminKey?: string } = {},
 ): Promise<T> {
+  // Un identifiant absent produisait `GET /documents/undefined` : l'erreur
+  // remontait alors en 404 « document introuvable » côté serveur, ce qui
+  // masquait la vraie cause (un appel construit avant que l'id soit connu).
+  // On échoue ici, avec un message qui désigne le chemin fautif.
+  if (path.includes('/undefined')) {
+    throw new ApiError(0, 'INVALID_ID', `Identifiant manquant dans l’appel : ${path}`);
+  }
+
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     ...((init.headers as Record<string, string>) ?? {}),
