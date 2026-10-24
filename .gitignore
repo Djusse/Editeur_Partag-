@@ -18,6 +18,10 @@ frontend/out/
 !.env.example
 samconfig.local.toml
 
+# Données du mode local (documents, liens, PDF simulés)
+.local-data.json
+.local-data.json.tmp
+
 # Tests et artefacts
 tests/results/
 

@@ -22,6 +22,7 @@ import { setLastSeqReader } from '../lib/links';
 import { resetConfigCache } from '../lib/config';
 import { buildPdf, type PdfJob } from '../lib/pdf';
 import { manager } from '../realtime/manager';
+import { LocalPersistence } from './persistence';
 
 const TABLES: Array<[string, string[]]> = [
   ['Documents', ['docId']],
@@ -37,10 +38,13 @@ const TABLES: Array<[string, string[]]> = [
 ];
 
 class LocalStore implements ObjectStore {
-  private readonly objects = new Map<string, { body: Uint8Array; type: string }>();
+  readonly objects = new Map<string, { body: Uint8Array; type: string }>();
+  /** Appelé après chaque écriture, pour la sauvegarde sur disque. */
+  onChange: (() => void) | null = null;
 
   async put(key: string, body: Uint8Array, contentType: string): Promise<void> {
     this.objects.set(key, { body: new Uint8Array(body), type: contentType });
+    this.onChange?.();
   }
 
   async get(key: string): Promise<Uint8Array> {
@@ -97,11 +101,39 @@ async function main(): Promise<void> {
 
   const memory = new MemoryDatabase(TABLES);
   const store = new LocalStore();
-  const secrets = generateLocalSecrets();
+
+  // --- Persistance sur disque ---------------------------------------------
+  // Sans elle, chaque redémarrage effaçait liens, documents **et sessions** :
+  // un lien copié devenait « inconnu » et l'on croyait à une expiration.
+  // La durabilité en production est assurée par DynamoDB et S3 ; ici, un
+  // fichier JSON suffit.
+  const persistence = new LocalPersistence();
+  const restored = persistence.restore(memory, store.objects);
+  store.onChange = () => persistence.schedule(memory, store.objects);
+
+  // Les secrets sont réutilisés s'ils existent : sinon chaque redémarrage
+  // invalidait toutes les sessions et changeait la clé d'administration.
+  const secrets = persistence.restoredSecrets() ?? generateLocalSecrets();
+  persistence.setSecrets(secrets);
+
+  if (restored) {
+    console.log(`Données locales restaurées depuis ${persistence.path()}`);
+  }
 
   setDatabase(memory);
   setObjectStore(store);
   setSecretOverrides(secrets);
+  // Chaque écriture (update, crédit, lien, ticket…) déclenche une sauvegarde
+  // différée : on ne réécrit pas le fichier à chaque frappe.
+  const scheduleSave = () => persistence.schedule(memory, store.objects);
+  for (const method of ['put', 'update', 'delete', 'transact'] as const) {
+    const original = (memory[method] as (...args: unknown[]) => Promise<unknown>).bind(memory);
+    (memory as unknown as Record<string, unknown>)[method] = async (...args: unknown[]) => {
+      const result = await original(...args);
+      scheduleSave();
+      return result;
+    };
+  }
   // La file devient une exécution immédiate : le visiteur voit bien
   // `waiting` puis `ready`, exactement comme avec SQS.
   setJobQueue({
@@ -112,6 +144,7 @@ async function main(): Promise<void> {
     },
   });
   setLastSeqReader((docId) => manager.lastSeq(docId));
+
 
   const { buildApp } = await import('../server/app');
   const { attachProtocol } = await import('../realtime/protocol');
@@ -147,6 +180,15 @@ async function main(): Promise<void> {
   attachProtocol(wss);
   startTicketSweeper();
 
+  // Sauvegarde immédiate à l'arrêt : les dernières frappes ne sont pas perdues.
+  const shutdown = () => {
+    persistence.flush(memory, store.objects);
+    console.log(`Données sauvegardées dans ${persistence.path()}`);
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
   console.log(`
 ┌───────────────────────────────────────────────────────────────────────┐
 │  Mode local — aucun appel AWS                                         │
@@ -154,9 +196,13 @@ async function main(): Promise<void> {
 │  API         : http://localhost:${port}
 │  Diagnostic  : http://localhost:${port}/__debug
 │  Clé admin   : ${secrets.admin}
+│  Données     : ${persistence.path()}
 │                                                                       │
 │  REST + WebSocket natif + PDF réel + crédit + quota : tout fonctionne │
 │  Non simulé  : pic de charge (C5), SES, CloudFront/nginx              │
+│                                                                       │
+│  Les liens et documents survivent au redémarrage.                     │
+│  Remise à zéro : supprimer le fichier de données ci-dessus.           │
 └───────────────────────────────────────────────────────────────────────┘
 `);
 }

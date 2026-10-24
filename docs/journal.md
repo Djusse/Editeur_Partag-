@@ -100,6 +100,20 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     *Correction* : arrêt du serveur, suppression de `.next`, redémarrage.
     **Règle retenue** : ne jamais lancer `npm run build` tant que `next dev` tourne.
     Le build de vérification se fait serveur arrêté, ou après `rm -rf .next`.
+16. **« Les liens expirent » — en réalité, ils disparaissaient.** Le mode local
+    stockait tout en mémoire : chaque redémarrage de l'API effaçait documents,
+    liens **et sessions**. Un lien copié devenait alors « inconnu », ce qui
+    ressemblait à une expiration. *Correction* : persistance sur disque
+    (`.local-data.json`, écrite de façon atomique et avec débounce), incluant les
+    **secrets** — sans eux, chaque démarrage invalidait toutes les sessions JWT et
+    changeait la clé d'administration. Vérifié par `backend/test-persistence.mjs`
+    (7 points : document, texte, lien, session, clé admin après redémarrage).
+17. **La zone de saisie tremblait à chaque frappe.** Le bandeau « N modification(s)
+    en attente d'enregistrement » était **dans le flux** : son apparition décalait
+    le papier de 32 px, ce qui déplaçait le curseur pendant qu'on tapait.
+    *Correction* : indicateur **flottant** (`position: fixed`, `pointer-events: none`),
+    qui ne modifie jamais la mise en page. L'animation est désactivée sous
+    `prefers-reduced-motion`.
 
 ## Preuves exécutées
 
@@ -107,6 +121,7 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
 typecheck backend ......... OK (0 erreur)
 tests unitaires .......... 29/29
 mode local (E2E) ......... 24/24 — WebSocket natif, PDF réel, quota, crédit, CORS
+persistance locale ....... 7/7  — document, texte, lien, session, clé admin
 typecheck frontend ....... OK
 build Next ............... 8 pages statiques
 template CloudFormation .. YAML valide, 20 ressources

@@ -12,17 +12,23 @@ import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { config } from './config';
 
 const cache = new Map<string, string>();
-let overrides: Record<string, string> | null = null;
+let overrides: { jwt: string; admin: string } | null = null;
 let client: SSMClient | null = null;
 
 /** Réservé aux tests et au mode local. */
-export function setSecretOverrides(values: Record<string, string> | null): void {
+export function setSecretOverrides(values: LocalSecrets | null): void {
   overrides = values;
   cache.clear();
 }
 
+/** Secrets du mode local. Leur persistance évite d'invalider les sessions. */
+export interface LocalSecrets {
+  jwt: string;
+  admin: string;
+}
+
 /** Génère des secrets éphémères pour le mode local. */
-export function generateLocalSecrets(): Record<string, string> {
+export function generateLocalSecrets(): LocalSecrets {
   return {
     jwt: randomBytes(32).toString('base64url'),
     admin: randomBytes(16).toString('base64url'),

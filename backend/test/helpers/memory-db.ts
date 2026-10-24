@@ -32,6 +32,11 @@ export class MemoryDatabase implements Database {
     return table;
   }
 
+  /** Clé de partition d'une table (utilisée par la persistance locale). */
+  keyOf(name: string): string[] {
+    return this.table(name).key;
+  }
+
   /** Lecture directe (tests) : contourne l'API publique. */
   peek<T>(name: string, key: Item): T | undefined {
     const table = this.table(name);
@@ -49,6 +54,25 @@ export class MemoryDatabase implements Database {
 
   reset(): void {
     for (const table of this.tables.values()) table.rows.clear();
+  }
+
+  /** Sérialise toutes les tables (mode local : persistance sur disque). */
+  exportAll(): Record<string, Item[]> {
+    const out: Record<string, Item[]> = {};
+    for (const [name, table] of this.tables) {
+      out[name] = [...table.rows.values()].map((row) => structuredClone(row));
+    }
+    return out;
+  }
+
+  /** Restaure un instantané produit par `exportAll`. */
+  importAll(snapshot: Record<string, Item[]>): void {
+    for (const [name, rows] of Object.entries(snapshot)) {
+      const table = this.tables.get(name);
+      if (!table) continue;
+      table.rows.clear();
+      for (const row of rows) table.rows.set(compositeKey(row, table.key), structuredClone(row));
+    }
   }
 
   // --- Database ------------------------------------------------------------

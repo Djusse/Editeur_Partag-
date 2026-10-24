@@ -412,8 +412,16 @@ function EditorScreen() {
         </div>
       )}
 
+      {/*
+        « N modification(s) en attente » est un indicateur **flottant**.
+        S'il prenait place dans le flux, son apparition et sa disparition
+        décaleraient le « papier » de 32 px à chaque frappe : c'est ce qui
+        faisait trembler la zone de saisie. En `position: fixed`, il ne
+        modifie jamais la mise en page et ne déplace pas le curseur.
+      */}
       {queueSize > 0 && (
-        <div className="banner banner-warning" role="status" aria-live="polite">
+        <div className="pending-indicator" role="status" aria-live="polite">
+          <span className="pending-dot" aria-hidden />
           {queueSize} modification{queueSize > 1 ? 's' : ''} en attente d&#8217;enregistrement…
         </div>
       )}

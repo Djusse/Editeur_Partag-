@@ -374,6 +374,70 @@ input[aria-invalid='true'] {
   padding: 40px;
 }
 
+/*
+ * Indicateur « N modification(s) en attente ».
+ *
+ * Il est **hors du flux** (`position: fixed`) : dans le flux, son apparition
+ * décalait le papier de 32 px à chaque frappe, ce qui faisait visiblement
+ * trembler la zone de saisie et déplaçait le curseur. Il est aussi
+ * `pointer-events: none` pour ne jamais intercepter un clic destiné à l'éditeur.
+ */
+.pending-indicator {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  border: 1px solid rgba(180, 83, 9, 0.2);
+  box-shadow: var(--shadow-modal);
+  font-size: 13px;
+  pointer-events: none;
+  animation: pending-in 160ms ease-out;
+}
+
+.pending-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warning);
+  animation: pending-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pending-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@keyframes pending-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pending-indicator,
+  .pending-dot {
+    animation: none;
+  }
+}
+
 .paper .cm-editor {
   min-height: calc(100vh - 280px);
   font-size: 16px;
