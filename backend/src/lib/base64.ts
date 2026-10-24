@@ -1,6 +1,6 @@
 /**
- * Conversions Base64 (les updates Yjs sont binaires, WebSocket et JSON sont
- * textuels : le Base64 est obligatoire et coûte +33 % de taille).
+ * Conversions Base64. Les updates Yjs sont binaires ; le protocole JSON les
+ * transporte en Base64 (+33 % de taille, plafond applicatif de 64 Ko binaires).
  */
 export function bytesToBase64(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('base64');
@@ -13,7 +13,7 @@ export function base64ToBytes(value: string): Uint8Array {
   return new Uint8Array(Buffer.from(padded, 'base64'));
 }
 
-/** Taille binaire estimée sans décoder (rapide et suffisant pour un plafond). */
+/** Taille binaire estimée sans décoder (rapide, suffisant pour un plafond). */
 export function base64Size(value: string): number {
   return Math.floor((value.length * 3) / 4);
 }

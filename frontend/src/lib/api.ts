@@ -1,83 +1,116 @@
-/** Client HTTP de l'API (JWT en mémoire + localStorage). */
+/**
+ * Client HTTP de l'API.
+ *
+ * Tous les chemins sont **relatifs** (`/api`) : l'application est servie par
+ * nginx sur la même origine que l'API, ce qui évite toute configuration d'URL
+ * et tout problème de CORS en HTTP sur une IP nue.
+ */
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? '').replace(/\/$/, '');
-const TOKEN_KEY = 'editeur.session.token';
-const PROFILE_KEY = 'editeur.session.profile';
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '/api';
 
-export interface Profile {
-  email: string;
+export interface Session {
+  token: string;
   name: string;
+  email: string;
 }
 
-export interface ApiErrorShape {
-  code: string;
-  message: string;
-  [key: string]: unknown;
+export interface Credit {
+  limit: number;
+  used: number;
+  remaining: number;
+  day: string;
+  blockedUntil: string | null;
+  resetsAt: string;
+  resetsIn: number;
 }
 
+export interface DocumentSummary {
+  id: string;
+  title: string;
+  ownerName: string;
+  ownerEmail: string;
+  updatedAt: string;
+  role: string;
+}
+
+export interface DocumentDetail {
+  id: string;
+  title: string;
+  ownerEmail: string;
+  ownerName: string;
+  members: Array<{ email: string; name: string; role: string }>;
+}
+
+export interface Version {
+  n: number;
+  createdAt: string;
+  authorName: string;
+  chars: number;
+}
+
+export interface Link {
+  token: string;
+  maxDownloads: number;
+  remaining: number;
+  status: 'ACTIVE' | 'EXHAUSTED';
+  createdAt?: string;
+}
+
+export interface VisitorStatus {
+  status: 'active' | 'exhausted';
+  title: string;
+  remaining: number;
+}
+
+export type ClaimResponse =
+  | { state: 'ready'; url: string; expiresIn: number }
+  | { state: 'waiting'; retryAfter: number }
+  | { state: 'exhausted' };
+
+export interface AdminState {
+  openDocuments: Array<{ docId: string; title: string; connections: number }>;
+  activeLinks: Array<{ token: string; docId: string; title: string; maxDownloads: number; remaining: number }>;
+  blocked: Array<{ email: string; blockedUntil: string }>;
+}
+
+/** Erreur applicative : `code` vient du serveur (`INVALID_INPUT`, `FORBIDDEN`…). */
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
-  readonly details: Record<string, unknown>;
+  readonly field?: string;
 
-  constructor(status: number, payload: ApiErrorShape) {
-    super(payload.message ?? payload.code);
+  constructor(status: number, code: string, message: string, field?: string) {
+    super(message);
     this.name = 'ApiError';
     this.status = status;
-    this.code = payload.code;
-    this.details = payload;
+    this.code = code;
+    this.field = field;
   }
 }
 
-export function apiBase(): string {
-  return API_BASE;
-}
-
-export function wsUrl(): string {
-  return process.env.NEXT_PUBLIC_WS_URL ?? '';
-}
-
-export function getToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  return window.localStorage.getItem(TOKEN_KEY);
-}
-
-export function getProfile(): Profile | null {
-  if (typeof window === 'undefined') return null;
-  const raw = window.localStorage.getItem(PROFILE_KEY);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as Profile;
-  } catch {
-    return null;
-  }
-}
-
-export function setSession(token: string, profile: Profile): void {
-  window.localStorage.setItem(TOKEN_KEY, token);
-  window.localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
-}
-
-export function clearSession(): void {
-  window.localStorage.removeItem(TOKEN_KEY);
-  window.localStorage.removeItem(PROFILE_KEY);
-}
-
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(
+  path: string,
+  init: RequestInit & { token?: string | null; adminKey?: string } = {},
+): Promise<T> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     ...((init.headers as Record<string, string>) ?? {}),
   };
-  const token = getToken();
-  if (token) headers.authorization = `Bearer ${token}`;
+  if (init.token) headers.authorization = `Bearer ${init.token}`;
+  if (init.adminKey) headers['x-admin-key'] = init.adminKey;
 
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   const text = await response.text();
   const payload = text ? safeJson(text) : {};
 
   if (!response.ok) {
-    const error = (payload as { error?: ApiErrorShape }).error ?? { code: 'HTTP_ERROR', message: text || `HTTP ${response.status}` };
-    throw new ApiError(response.status, error);
+    const body = payload as { error?: string; message?: string; field?: string };
+    throw new ApiError(
+      response.status,
+      body.error ?? 'HTTP_ERROR',
+      body.message ?? `Erreur ${response.status}`,
+      body.field,
+    );
   }
   return payload as T;
 }
@@ -90,237 +123,220 @@ function safeJson(text: string): unknown {
   }
 }
 
-export const api = {
-  async createSession(name: string, email: string) {
-    return request<{ token: string; session: Profile; credit: CreditInfo }>('/session', {
-      method: 'POST',
-      body: JSON.stringify({ name, email }),
-    });
-  },
-
-  async listDocuments() {
-    return request<{ documents: DocumentSummary[] }>('/documents');
-  },
-
-  async createDocument(title: string) {
-    return request<{ document: DocumentSummary }>('/documents', {
-      method: 'POST',
-      body: JSON.stringify({ title }),
-    });
-  },
-
-  async getDocument(docId: string) {
-    return request<DocumentDetail>(`/documents/${docId}`);
-  },
-
-  async renameDocument(docId: string, title: string) {
-    return request<{ ok: boolean }>(`/documents/${docId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ title }),
-    });
-  },
-
-  async deleteDocument(docId: string) {
-    return request<{ ok: boolean }>(`/documents/${docId}`, { method: 'DELETE' });
-  },
-
-  async addMember(docId: string, email: string, name: string) {
-    return request<{ member: Member }>(`/documents/${docId}/members`, {
-      method: 'POST',
-      body: JSON.stringify({ email, name }),
-    });
-  },
-
-  async createLink(docId: string, maxDownloads: number) {
-    return request<{ link: LinkSummary & { path: string } }>(`/documents/${docId}/links`, {
-      method: 'POST',
-      body: JSON.stringify({ maxDownloads }),
-    });
-  },
-
-  async getState(docId: string) {
-    return request<DocumentState>(`/documents/${docId}/state`);
-  },
-
-  async listUpdates(docId: string, since: number) {
-    return request<{ updates: WireUpdate[] }>(`/documents/${docId}/updates?since=${since}`);
-  },
-
-  async postUpdate(docId: string, opId: string, payload: string) {
-    return request<{ ack: { opId: string; seq: number; duplicate: boolean; chars: number } }>(
-      `/documents/${docId}/updates`,
-      { method: 'POST', body: JSON.stringify({ opId, update: payload }) },
-    );
-  },
-
-  async getCredit() {
-    return request<CreditInfo>('/me/credit');
-  },
-
-  async listVersions(docId: string) {
-    return request<{ currentSeq: number; versions: VersionSummary[] }>(`/documents/${docId}/versions`);
-  },
-
-  async createVersion(docId: string) {
-    return request<{ version: { n: number; chars: number; createdAt: string } }>(`/documents/${docId}/versions`, {
-      method: 'POST',
-      body: JSON.stringify({}),
-    });
-  },
-
-  async restoreVersion(docId: string, n: number) {
-    return request<{ restored: number; seq: number }>(`/documents/${docId}/versions/${n}/restore`, {
-      method: 'POST',
-      body: JSON.stringify({}),
-    });
-  },
-
-  async wsTicket(docId: string) {
-    return request<{ ticket: string; expiresIn: number; docId: string }>('/ws-ticket', {
-      method: 'POST',
-      body: JSON.stringify({ docId }),
-    });
-  },
-
-  async adminState(adminKey: string) {
-    const response = await fetch(`${API_BASE}/admin/state`, { headers: { 'x-admin-key': adminKey } });
-    const text = await response.text();
-    const payload = text ? safeJson(text) : {};
-    if (!response.ok) {
-      const error = (payload as { error?: ApiErrorShape }).error ?? { code: 'HTTP_ERROR', message: text };
-      throw new ApiError(response.status, error);
-    }
-    return payload as AdminState;
-  },
-
-  // --- Parcours visiteur (aucune authentification) ---
-  async linkStatus(token: string) {
-    return request<LinkStatus>(`/d/${token}/status`);
-  },
-
-  async claim(token: string, visitorId: string) {
-    return rawRequest<ClaimResponse>(`/d/${token}/claim`, {
-      method: 'POST',
-      body: JSON.stringify({ visitorId }),
-    });
-  },
-
-  async file(token: string, visitorId: string) {
-    return rawRequest<ClaimResponse>(`/d/${token}/file?visitorId=${encodeURIComponent(visitorId)}`);
-  },
-};
-
-/** Pour le visiteur : on ne lève pas d'exception sur 410/202, ce sont des états. */
-async function rawRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+/** Requête visiteur : 410/202 sont des états attendus, pas des exceptions. */
+async function visitorRequest<T>(path: string, init: RequestInit = {}): Promise<{ status: number; body: T }> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: { 'content-type': 'application/json', ...(init.headers as Record<string, string>) },
   });
   const text = await response.text();
   const payload = text ? safeJson(text) : {};
-  return { ...(payload as object), httpStatus: response.status } as T;
+  return { status: response.status, body: payload as T };
 }
 
-// --- Types partagés avec l'API ---
-export interface CreditInfo {
-  used: number;
-  limit: number;
-  remaining: number;
-  day: string;
-  resetsIn: number;
-  blocked?: boolean;
-  blockedUntil?: string;
-  refusals?: number;
+export const api = {
+  async createSession(name: string, email: string) {
+    return request<{ token: string; user: { name: string; email: string }; credit: Credit }>('/session', {
+      method: 'POST',
+      body: JSON.stringify({ name, email }),
+    });
+  },
+
+  async listDocuments(token: string) {
+    return request<{ documents: DocumentSummary[] }>('/documents', { token });
+  },
+
+  async createDocument(token: string, title: string) {
+    return request<{ id: string; title: string }>('/documents', {
+      method: 'POST',
+      token,
+      body: JSON.stringify({ title }),
+    });
+  },
+
+  async getDocument(token: string, id: string) {
+    return request<DocumentDetail>(`/documents/${encodeURIComponent(id)}`, { token });
+  },
+
+  async getState(token: string, id: string) {
+    return request<{ seq: number; state: string }>(`/documents/${encodeURIComponent(id)}/state`, { token });
+  },
+
+  async addMember(token: string, id: string, email: string) {
+    return request<{ members: Array<{ email: string; name: string; role: string }> }>(
+      `/documents/${encodeURIComponent(id)}/members`,
+      { method: 'POST', token, body: JSON.stringify({ email }) },
+    );
+  },
+
+  async listVersions(token: string, id: string) {
+    return request<{ versions: Version[] }>(`/documents/${encodeURIComponent(id)}/versions`, { token });
+  },
+
+  async restoreVersion(token: string, id: string, n: number) {
+    return request<{ seq: number }>(`/documents/${encodeURIComponent(id)}/versions/${n}/restore`, {
+      method: 'POST',
+      token,
+      body: JSON.stringify({}),
+    });
+  },
+
+  async createLink(token: string, id: string, maxDownloads: number) {
+    return request<Link>(`/documents/${encodeURIComponent(id)}/links`, {
+      method: 'POST',
+      token,
+      body: JSON.stringify({ maxDownloads }),
+    });
+  },
+
+  async listLinks(token: string, id: string) {
+    return request<{ links: Link[] }>(`/documents/${encodeURIComponent(id)}/links`, { token });
+  },
+
+  async getCredit(token: string) {
+    return request<Credit>('/me/credit', { token });
+  },
+
+  async wsTicket(token: string, documentId: string) {
+    return request<{ ticket: string; expiresIn: number; documentId: string }>('/ws-ticket', {
+      method: 'POST',
+      token,
+      body: JSON.stringify({ documentId }),
+    });
+  },
+
+  async postUpdate(token: string, id: string, opId: string, update: string) {
+    return request<{ ack: { opIds: string[]; seq: number; creditRemaining: number } }>(
+      `/documents/${encodeURIComponent(id)}/updates`,
+      { method: 'POST', token, body: JSON.stringify({ opId, update }) },
+    );
+  },
+
+  async listUpdates(token: string, id: string, since: number) {
+    return request<{ updates: Array<{ seq: number; payload: string }> }>(
+      `/documents/${encodeURIComponent(id)}/updates?since=${since}`,
+      { token },
+    );
+  },
+
+  async adminState(adminKey: string) {
+    return request<AdminState>('/admin/state', { adminKey });
+  },
+
+  // --- Parcours visiteur (aucune authentification) -------------------------
+  async linkStatus(token: string) {
+    return request<VisitorStatus>(`/d/${encodeURIComponent(token)}/status`);
+  },
+
+  async claim(token: string, visitorId: string) {
+    return visitorRequest<ClaimResponse>(`/d/${encodeURIComponent(token)}/claim`, {
+      method: 'POST',
+      body: JSON.stringify({ visitorId }),
+    });
+  },
+
+  async file(token: string, visitorId: string) {
+    return visitorRequest<ClaimResponse>(
+      `/d/${encodeURIComponent(token)}/file?visitorId=${encodeURIComponent(visitorId)}`,
+    );
+  },
+};
+
+// --- Stockage navigateur (clés exactes de la spécification, section 2.3) ----
+const SESSION_KEY = 'session';
+
+export function loadSession(): Session | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Session;
+    if (!parsed?.token || !parsed?.email) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
-export interface DocumentSummary {
-  docId: string;
-  title: string;
-  ownerEmail: string;
-  ownerName: string;
-  seq: number;
-  textLength: number;
-  createdAt: string;
-  updatedAt: string;
-  role?: string;
+export function saveSession(session: Session): void {
+  try {
+    window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  } catch {
+    /* stockage indisponible : la session reste en mémoire pour la page */
+  }
 }
 
-export interface Member {
-  docId: string;
-  email: string;
-  name: string;
-  role: 'owner' | 'editor';
-  addedAt: string;
+export function clearSession(): void {
+  try {
+    window.localStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* rien à faire */
+  }
 }
 
-export interface LinkSummary {
-  token: string;
-  maxDownloads: number;
-  remaining: number;
-  status: 'ACTIVE' | 'EXHAUSTED';
-  createdAt?: string;
+/** Identifiant de visiteur propre à **ce lien** (clé `visitorId:<token>`). */
+export function visitorIdFor(token: string): string {
+  const key = `visitorId:${token}`;
+  try {
+    const existing = window.localStorage.getItem(key);
+    if (existing) return existing;
+  } catch {
+    /* stockage indisponible */
+  }
+  return '';
 }
 
-export interface DocumentDetail {
-  document: DocumentSummary;
-  role: string;
-  members: Member[];
-  links: LinkSummary[];
+export function saveVisitorId(token: string, visitorId: string): void {
+  try {
+    window.localStorage.setItem(`visitorId:${token}`, visitorId);
+  } catch {
+    /* ignoré : l'identifiant reste en mémoire pour la page */
+  }
 }
 
-export interface WireUpdate {
-  seq: number;
-  author: string;
-  authorName?: string;
-  opId?: string;
-  payload: string;
-  createdAt?: string;
+export function hasClaimed(token: string): boolean {
+  try {
+    return window.localStorage.getItem(`claimed:${token}`) === '1';
+  } catch {
+    return false;
+  }
 }
 
-export interface DocumentState {
-  document: { docId: string; title: string; seq: number; textLength: number };
-  seq: number;
-  snapshot: string | null;
-  updates: WireUpdate[];
+export function markClaimed(token: string): void {
+  try {
+    window.localStorage.setItem(`claimed:${token}`, '1');
+  } catch {
+    /* ignoré */
+  }
 }
 
-export interface VersionSummary {
-  n: number;
-  chars: number;
-  createdAt: string;
-  authorName: string;
-  label: string;
+/** File des updates non acquittés (clé `pendingOps:<docId>:<email>`). */
+export interface PendingOp {
+  opId: string;
+  update: string;
 }
 
-export interface LinkStatus {
-  status: 'active' | 'exhausted';
-  remaining: number;
-  maxDownloads: number;
-  docTitle: string;
+export function loadPendingOps(documentId: string, email: string): PendingOp[] {
+  try {
+    const raw = window.localStorage.getItem(`pendingOps:${documentId}:${email}`);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as PendingOp[];
+    return Array.isArray(parsed) ? parsed.filter((op) => op?.opId && op?.update) : [];
+  } catch {
+    return [];
+  }
 }
 
-export interface ClaimResponse {
-  state: 'ready' | 'waiting' | 'exhausted';
-  url?: string;
-  remaining: number;
-  retryAfter?: number;
-  seq?: number;
-  message?: string;
-  code?: string;
-  httpStatus?: number;
+export function savePendingOps(documentId: string, email: string, ops: PendingOp[]): void {
+  try {
+    const key = `pendingOps:${documentId}:${email}`;
+    if (ops.length === 0) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, JSON.stringify(ops));
+  } catch {
+    /* ignoré : la file reste en mémoire */
+  }
 }
 
-export interface AdminState {
-  generatedAt: string;
-  totals: { documents: number; openDocuments: number; connections: number };
-  openDocuments: Array<{
-    docId: string;
-    title: string;
-    seq: number;
-    readers: number;
-    links: Array<{ token: string; status: string; remaining: number; maxDownloads: number }>;
-  }>;
-  activeLinks: number;
-  creditToday: Array<{ email: string; used: number; limit: number }>;
-  blocked: Array<{ email: string; blockedUntil: string; refusals: number }>;
+export function clearPendingOps(documentId: string, email: string): void {
+  savePendingOps(documentId, email, []);
 }

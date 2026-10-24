@@ -1,124 +1,68 @@
 /**
- * JWT HS256 minimal (aucune dépendance externe). Le secret est lu dans SSM
- * Parameter Store et mis en cache pour la durée de vie du conteneur Lambda.
+ * JWT HS256 minimal, sans dépendance externe.
+ *
+ * L'identité est volontairement légère (nom + e-mail, sans mot de passe) :
+ * c'est ce que le sujet autorise. La limite est documentée dans le dossier.
  */
-import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
-import { GetParameterCommand, PutParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config';
 import { unauthorized } from './errors';
-
-export type Role = 'editor' | 'admin';
+import { jwtSecret } from './secrets';
 
 export interface Session {
   email: string;
   name: string;
-  role: Role;
   iat: number;
   exp: number;
 }
 
-let ssm: SSMClient | null = null;
-const cache = new Map<string, string>();
-
-/**
- * Lit un paramètre SSM. S'il n'existe pas (premier déploiement), l'application
- * le **crée** avec une valeur aléatoire forte : aucun secret n'est présent dans
- * le dépôt, et le déploiement reste en une seule commande.
- */
-async function readParameter(name: string): Promise<string> {
-  const cached = cache.get(name);
-  if (cached) return cached;
-  if (!ssm) ssm = new SSMClient({ region: config().region });
-
-  try {
-    const result = await ssm.send(new GetParameterCommand({ Name: name, WithDecryption: true }));
-    const value = result.Parameter?.Value;
-    if (value) {
-      cache.set(name, value);
-      return value;
-    }
-  } catch (error) {
-    const code = (error as { name?: string }).name;
-    if (code !== 'ParameterNotFound') throw error;
-  }
-
-  const generated = randomBytes(32).toString('base64url');
-  try {
-    await ssm.send(
-      new PutParameterCommand({
-        Name: name,
-        Value: generated,
-        Type: 'SecureString',
-        Overwrite: false,
-        Description: 'Secret généré automatiquement par l\'application (ne pas committer).',
-      }),
-    );
-    cache.set(name, generated);
-    return generated;
-  } catch (error) {
-    // Course entre deux conteneurs froids : l'autre a gagné, on relit.
-    const result = await ssm.send(new GetParameterCommand({ Name: name, WithDecryption: true }));
-    const value = result.Parameter?.Value;
-    if (!value) throw error;
-    cache.set(name, value);
-    return value;
-  }
-}
-
-export async function jwtSecret(): Promise<string> {
-  return readParameter(config().jwtSecretParam);
-}
-
-export async function adminKey(): Promise<string> {
-  return readParameter(config().adminKeyParam);
-}
-
-function base64url(input: Buffer | string): string {
+function b64url(input: Buffer | string): string {
   return Buffer.from(input).toString('base64url');
 }
 
-function signature(payload: string, secret: string): string {
+function sign(payload: string, secret: string): string {
   return createHmac('sha256', secret).update(payload).digest('base64url');
 }
 
-export async function signSession(
-  identity: { email: string; name: string; role?: Role },
-  ttlSeconds = config().sessionTtlSeconds,
-): Promise<string> {
+export async function signSession(email: string, name: string, ttlSeconds?: number): Promise<string> {
+  const ttl = ttlSeconds ?? config().sessionTtlSeconds;
   const now = Math.floor(Date.now() / 1000);
-  const payload: Session = {
-    email: identity.email,
-    name: identity.name,
-    role: identity.role ?? 'editor',
-    iat: now,
-    exp: now + ttlSeconds,
-  };
-  const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const body = base64url(JSON.stringify(payload));
+  const session: Session = { email, name, iat: now, exp: now + ttl };
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = b64url(JSON.stringify(session));
   const secret = await jwtSecret();
-  return `${header}.${body}.${signature(`${header}.${body}`, secret)}`;
+  return `${header}.${body}.${sign(`${header}.${body}`, secret)}`;
 }
 
-export async function verifySession(token: string | undefined | null): Promise<Session> {
-  if (!token) throw unauthorized('MISSING_TOKEN', 'Jeton absent');
+export async function verifySession(token: string | undefined): Promise<Session> {
+  if (!token) throw unauthorized('Jeton absent');
   const parts = token.split('.');
-  if (parts.length !== 3) throw unauthorized('INVALID_TOKEN', 'Jeton malformé');
+  if (parts.length !== 3) throw unauthorized('Jeton malformé');
   const [header, body, mac] = parts;
+
   const secret = await jwtSecret();
-  const expected = signature(`${header}.${body}`, secret);
-  const macBuffer = Buffer.from(mac);
-  const expectedBuffer = Buffer.from(expected);
-  if (macBuffer.length !== expectedBuffer.length || !timingSafeEqual(macBuffer, expectedBuffer)) {
-    throw unauthorized('INVALID_TOKEN', 'Signature invalide');
+  const expected = sign(`${header}.${body}`, secret);
+  const received = Buffer.from(mac);
+  const reference = Buffer.from(expected);
+  if (received.length !== reference.length || !timingSafeEqual(received, reference)) {
+    throw unauthorized('Signature invalide');
   }
-  let payload: Session;
+
+  let session: Session;
   try {
-    payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as Session;
+    session = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as Session;
   } catch {
-    throw unauthorized('INVALID_TOKEN', 'Charge utile illisible');
+    throw unauthorized('Charge utile illisible');
   }
-  if (!payload.exp || payload.exp * 1000 <= Date.now()) {
-    throw unauthorized('TOKEN_EXPIRED', 'Session expirée, reconnectez-vous');
+  if (!session.exp || session.exp * 1000 <= Date.now()) {
+    throw unauthorized('Session expirée, reconnectez-vous');
   }
-  return payload;
+  return session;
+}
+
+/** Extrait le jeton de l'en-tête `Authorization: Bearer …`. */
+export function bearer(header: string | undefined): string | undefined {
+  if (!header) return undefined;
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match?.[1]?.trim();
 }

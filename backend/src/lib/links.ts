@@ -1,63 +1,72 @@
 /**
  * Liens de téléchargement et réservation d'exemplaire (C1, C3, C5, C6).
  *
- * Principe : un exemplaire est consommé **au claim**, pas au téléchargement.
- * Le décrément de `remaining` et la création du ticket sont dans une **seule**
- * transaction conditionnelle : jamais N+1, même sous forte concurrence.
+ * Deux mécanismes complémentaires :
+ *  - une **garde en mémoire** (compteur de jetons local) qui évite d'envoyer à
+ *    DynamoDB un pic de 500 claims simultanés que le service refuserait en
+ *    throttling — elle **n'est jamais l'autorité** ;
+ *  - une **transaction DynamoDB conditionnelle** (`remaining > 0` + création du
+ *    ticket), seule source de vérité : c'est elle qui garantit « jamais N+1 ».
+ *
+ * Un exemplaire est consommé **au claim**, pas au téléchargement du fichier.
  */
 import { config } from './config';
-import { getItem, putItem, query, transactWrite, updateItem } from './db';
-import { ApiError, badRequest, gone, notFound } from './errors';
-import { clampText, jitter, randomToken, utcDay } from './ids';
-import { getDocument } from './documents';
-import { presignedUrl, pdfKey } from './s3';
+import { db } from './db';
+import { gone, invalidInput, notFound, unavailable } from './errors';
+import { jitter, sleep } from './ids';
+import { randomToken } from './ids';
+import { jobQueue } from './queue';
+import { pdfKey, presignedUrl } from './s3';
 import type { LinkRow, PdfCacheRow, TicketRow } from './types';
 
-const MAX_RETRIES = 6;
-const PDF_TTL_SECONDS = 7 * 24 * 3600;
+const TICKET_TTL_SECONDS = 7 * 24 * 3600;
+const PDF_CACHE_TTL_SECONDS = 7 * 24 * 3600;
+const CLAIM_RETRIES = 5;
+const MAX_VISITOR_ID_LENGTH = 100;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export async function createLink(input: {
+export interface CreateLinkInput {
   docId: string;
+  docTitle: string;
   maxDownloads: number;
   createdByEmail: string;
   createdByName: string;
-}): Promise<LinkRow> {
-  const maxDownloads = Math.floor(Number(input.maxDownloads));
-  if (!Number.isFinite(maxDownloads) || maxDownloads < 1 || maxDownloads > 100000) {
-    throw badRequest('INVALID_MAX_DOWNLOADS', 'Le nombre de téléchargements doit être compris entre 1 et 100000');
+}
+
+export function validateMaxDownloads(raw: unknown): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 100_000) {
+    throw invalidInput('maxDownloads', 'Entrez un nombre entier entre 1 et 100 000.');
   }
-  const doc = await getDocument(input.docId);
+  return value;
+}
+
+export async function createLink(input: CreateLinkInput): Promise<LinkRow> {
   const link: LinkRow = {
     token: randomToken(16),
-    docId: doc.docId,
-    docTitle: doc.title,
+    docId: input.docId,
+    docTitle: input.docTitle,
     createdByEmail: input.createdByEmail,
     createdByName: input.createdByName,
-    maxDownloads,
-    remaining: maxDownloads,
+    maxDownloads: input.maxDownloads,
+    remaining: input.maxDownloads,
     status: 'ACTIVE',
     notified: false,
     createdAt: new Date().toISOString(),
   };
-  await putItem(config().linksTable, link as unknown as Record<string, unknown>, {
+  await db().put(config().linksTable, link as unknown as Record<string, unknown>, {
     condition: 'attribute_not_exists(token)',
   });
   return link;
 }
 
 export async function getLink(token: string): Promise<LinkRow> {
-  const link = await getItem<LinkRow>(config().linksTable, { token });
-  if (!link) throw notFound('LINK_NOT_FOUND', 'Lien inconnu ou supprimé');
+  const link = await db().get<LinkRow>(config().linksTable, { token });
+  if (!link) throw notFound('Ce lien n\'existe pas ou n\'est plus valide.');
   return link;
 }
 
-export async function listLinksForDocument(docId: string): Promise<LinkRow[]> {
-  const result = await query<LinkRow>({
-    table: config().linksTable,
+export async function listLinks(docId: string): Promise<LinkRow[]> {
+  const result = await db().query<LinkRow>(config().linksTable, {
     index: 'docId-index',
     keyCondition: 'docId = :docId',
     values: { ':docId': docId },
@@ -65,242 +74,273 @@ export async function listLinksForDocument(docId: string): Promise<LinkRow[]> {
   return result.items.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 }
 
+/**
+ * Garde en mémoire : plafond de claims simultanés par lien.
+ *
+ * Elle protège DynamoDB du pic sans jamais décider du quota : un claim refusé
+ * par la garde reçoit `waiting` (le visiteur patiente), jamais `exhausted`.
+ */
+class ClaimGate {
+  private readonly inFlight = new Map<string, number>();
+
+  tryAcquire(token: string): boolean {
+    const current = this.inFlight.get(token) ?? 0;
+    if (current >= config().maxClaimsInFlight) return false;
+    this.inFlight.set(token, current + 1);
+    return true;
+  }
+
+  release(token: string): void {
+    const current = this.inFlight.get(token) ?? 0;
+    if (current <= 1) this.inFlight.delete(token);
+    else this.inFlight.set(token, current - 1);
+  }
+}
+
+const gate = new ClaimGate();
+
 export interface VisitorStatus {
   status: 'active' | 'exhausted';
+  title: string;
   remaining: number;
-  maxDownloads: number;
-  docTitle: string;
-  updatedAt: string;
 }
 
 export async function linkStatus(token: string): Promise<VisitorStatus> {
   const link = await getLink(token);
-  // `remaining` fait foi : si le compteur est à 0, le lien est épuisé même si
-  // la transition de statut n'a pas encore été écrite (C6, sans faux positif).
+  // `remaining` fait foi : le statut stocké peut être en retard d'un instant.
   const exhausted = link.status === 'EXHAUSTED' || link.remaining <= 0;
   return {
     status: exhausted ? 'exhausted' : 'active',
+    title: link.docTitle,
     remaining: Math.max(0, link.remaining),
-    maxDownloads: link.maxDownloads,
-    docTitle: link.docTitle,
-    updatedAt: new Date().toISOString(),
   };
 }
 
 export interface ClaimResult {
-  state: 'ready' | 'waiting' | 'exhausted';
-  ticket?: TicketRow;
-  seqFrozen?: number;
-  url?: string;
-  retryAfter?: number;
-  remaining: number;
   status: number;
+  body:
+    | { state: 'ready'; url: string; expiresIn: number }
+    | { state: 'waiting'; retryAfter: number }
+    | { state: 'exhausted' };
+}
+
+export function validateVisitorId(raw: unknown): string {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (value.length < 8 || value.length > MAX_VISITOR_ID_LENGTH) {
+    throw invalidInput('visitorId', 'Identifiant de visiteur invalide.');
+  }
+  return value;
 }
 
 /**
- * Fixe la version du document au moment du claim : c'est la définition de T1.
- * Le PDF sera construit à partir de ce `seq` figé, jamais du texte courant au
- * moment où la Lambda de génération s'exécute.
+ * Réserve un exemplaire.
+ *
+ * Ordre **imposé** par la spécification (4.2) : on cherche le ticket **avant**
+ * le court-circuit `exhausted`. Sans cela, un visiteur qui possède déjà son
+ * exemplaire recevrait `410` après l'épuisement du lien.
  */
-export async function claimDownload(token: string, visitorId: string): Promise<ClaimResult> {
-  if (!visitorId || visitorId.length < 8 || visitorId.length > 100) {
-    throw badRequest('INVALID_VISITOR_ID', 'Identifiant de visiteur invalide');
-  }
+export async function claim(token: string, visitorId: string): Promise<ClaimResult> {
   const cfg = config();
   const link = await getLink(token);
 
-  // Court-circuit EXHAUSTED : aucun calcul, réponse immédiatement cachable (C6).
-  if (link.status === 'EXHAUSTED') {
-    const existing = await getItem<TicketRow>(cfg.ticketsTable, { token, visitorId });
-    if (existing) return resolvePdf(existing, link);
-    return { state: 'exhausted', remaining: 0, status: 410 };
+  // 1. Le visiteur a-t-il déjà un ticket ? (avanti tout court-circuit)
+  const existing = await db().get<TicketRow>(cfg.ticketsTable, { token, visitorId });
+  if (existing) return resolve(existing, link.docTitle);
+
+  // 2. Lien déjà épuisé : plus aucun travail (C6).
+  if (link.status === 'EXHAUSTED' || link.remaining <= 0) {
+    const late = await db().get<TicketRow>(cfg.ticketsTable, { token, visitorId });
+    if (late) return resolve(late, link.docTitle);
+    return { status: 410, body: { state: 'exhausted' } };
   }
 
-  // Idempotence : un retry renvoie le même ticket, sans consommer d'exemplaire.
-  const existing = await getItem<TicketRow>(cfg.ticketsTable, { token, visitorId });
-  if (existing) return resolvePdf(existing, link);
+  // 3. Garde mémoire : on ne noie pas DynamoDB sous le pic.
+  if (!gate.tryAcquire(token)) {
+    return { status: 202, body: { state: 'waiting', retryAfter: 1 } };
+  }
 
-  let lastReason: unknown = null;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    const current = attempt === 0 ? link : await getLink(token);
-    if (current.status === 'EXHAUSTED') {
-      const retryTicket = await getItem<TicketRow>(cfg.ticketsTable, { token, visitorId });
-      if (retryTicket) return resolvePdf(retryTicket, current);
-      return { state: 'exhausted', remaining: 0, status: 410 };
-    }
-
-    // T1 : lecture de `seq` au début du claim.
-    const doc = await getDocument(current.docId);
-    const ticket: TicketRow = {
-      token,
-      visitorId,
-      docId: current.docId,
-      seqFrozen: doc.seq,
-      createdAt: new Date().toISOString(),
-      ttl: Math.floor(Date.now() / 1000) + PDF_TTL_SECONDS,
-    };
-
-    const outcome = await transactWrite([
-      {
-        update: {
-          table: cfg.linksTable,
-          key: { token },
-          // Le statut n'est **pas** modifié ici : il dépend du `remaining`
-          // résultant, qui n'est connu de façon fiable qu'après le décrément.
-          update: 'ADD remaining :minusOne',
-          condition: 'remaining > :zero AND #status = :active',
-          names: { '#status': 'status' },
-          values: { ':minusOne': -1, ':zero': 0, ':active': 'ACTIVE' },
-        },
-      },
-      {
-        put: {
-          table: cfg.ticketsTable,
-          item: ticket as unknown as Record<string, unknown>,
-          condition: 'attribute_not_exists(visitorId)',
-        },
-      },
-    ]);
-
-    if (outcome.ok) {
-      // Transition monotone ACTIVE → EXHAUSTED, atomique et idempotente :
-      // seul le claim qui amène réellement `remaining` à 0 peut la poser.
-      await updateItem(
-        cfg.linksTable,
-        { token },
-        {
-          update: 'SET #status = :exhausted, exhaustedAt = :now',
-          condition: '#status = :active AND remaining = :zero',
-          names: { '#status': 'status' },
-          values: { ':exhausted': 'EXHAUSTED', ':active': 'ACTIVE', ':zero': 0, ':now': new Date().toISOString() },
-        },
-      ).catch(() => undefined);
-      return resolvePdf(ticket, current);
-    }
-
-    const ticketReason = outcome.reasons?.[1]?.code;
-    if (ticketReason === 'ConditionalCheckFailed') {
-      const retryTicket = await getItem<TicketRow>(cfg.ticketsTable, { token, visitorId });
-      if (retryTicket) return resolvePdf(retryTicket, await getLink(token));
-    }
-    const linkReason = outcome.reasons?.[0]?.code;
-    if (linkReason === 'ConditionalCheckFailed') {
-      const retryTicket = await getItem<TicketRow>(cfg.ticketsTable, { token, visitorId });
-      if (retryTicket) return resolvePdf(retryTicket, await getLink(token));
-      const fresh = await getLink(token);
-      if (fresh.status === 'EXHAUSTED' || fresh.remaining <= 0) {
-        return { state: 'exhausted', remaining: 0, status: 410 };
+  try {
+    for (let attempt = 0; attempt < CLAIM_RETRIES; attempt++) {
+      const current = attempt === 0 ? link : await getLink(token);
+      if (current.status === 'EXHAUSTED' || current.remaining <= 0) {
+        const late = await db().get<TicketRow>(cfg.ticketsTable, { token, visitorId });
+        if (late) return resolve(late, current.docTitle);
+        return { status: 410, body: { state: 'exhausted' } };
       }
-    }
-    lastReason = outcome.reasons;
-    await sleep(Math.min(300, 15 * 2 ** attempt) + jitter(40));
-  }
 
-  // Contention extrême : le visiteur n'est pas "jeté" (sujet), il patiente.
-  console.warn('Contention sur le claim', { token, attempts: MAX_RETRIES, lastReason });
-  return { state: 'waiting', remaining: Math.max(0, link.remaining), status: 202, retryAfter: 1 };
+      // T1 : la version est figée **ici**, en lisant le dernier `seq` écrit.
+      const seqFrozen = await lastWrittenSeq(current.docId);
+      const ticket: TicketRow = {
+        token,
+        visitorId,
+        docId: current.docId,
+        seqFrozen,
+        createdAt: new Date().toISOString(),
+        ttl: Math.floor(Date.now() / 1000) + TICKET_TTL_SECONDS,
+      };
+
+      const outcome = await db().transact([
+        {
+          Update: {
+            table: cfg.linksTable,
+            key: { token },
+            update: 'ADD remaining :minusOne',
+            condition: 'remaining > :zero AND #status = :active',
+            names: { '#status': 'status' },
+            values: { ':minusOne': -1, ':zero': 0, ':active': 'ACTIVE' },
+          },
+        },
+        {
+          Put: {
+            table: cfg.ticketsTable,
+            item: ticket as unknown as Record<string, unknown>,
+            condition: 'attribute_not_exists(visitorId)',
+          },
+        },
+      ]);
+
+      if (outcome.ok) {
+        // Transition monotone ACTIVE → EXHAUSTED, séparée et idempotente :
+        // seul le claim qui amène réellement `remaining` à 0 peut la poser.
+        await db()
+          .update(
+            cfg.linksTable,
+            { token },
+            {
+              update: 'SET #status = :exhausted, exhaustedAt = :now',
+              condition: '#status = :active AND remaining = :zero',
+              names: { '#status': 'status' },
+              values: { ':exhausted': 'EXHAUSTED', ':active': 'ACTIVE', ':zero': 0, ':now': new Date().toISOString() },
+            },
+          )
+          .catch(() => undefined);
+
+        return resolve(ticket, current.docTitle);
+      }
+
+      // Ticket créé par une requête concurrente du même visiteur ?
+      const retry = await db().get<TicketRow>(cfg.ticketsTable, { token, visitorId });
+      if (retry) return resolve(retry, current.docTitle);
+
+      const linkReason = outcome.reasons?.[0]?.code;
+      if (linkReason === 'ConditionalCheckFailed') {
+        const fresh = await getLink(token);
+        if (fresh.status === 'EXHAUSTED' || fresh.remaining <= 0) {
+          return { status: 410, body: { state: 'exhausted' } };
+        }
+      }
+
+      await sleep(20 * 2 ** attempt + jitter(30));
+    }
+
+    // Contention extrême : le visiteur n'est jamais jeté, il patiente.
+    return { status: 202, body: { state: 'waiting', retryAfter: 1 } };
+  } finally {
+    gate.release(token);
+  }
 }
 
-/** Résout le PDF d'un ticket : prêt, en construction, ou à construire. */
-export async function resolvePdf(ticket: TicketRow, link?: LinkRow): Promise<ClaimResult> {
+/** Reprise de polling : `GET /d/{token}/file?visitorId=…`. */
+export async function file(token: string, visitorId: string): Promise<ClaimResult> {
+  const cfg = config();
+  const ticket = await db().get<TicketRow>(cfg.ticketsTable, { token, visitorId });
+  if (!ticket) throw gone('NO_TICKET', 'Aucun exemplaire réservé pour ce visiteur.');
+  const link = await db().get<LinkRow>(cfg.linksTable, { token });
+  return resolve(ticket, link?.docTitle ?? 'document');
+}
+
+/** Résout le PDF d'un ticket : prêt, en génération, ou à générer. */
+export async function resolve(ticket: TicketRow, docTitle: string): Promise<ClaimResult> {
   const cfg = config();
   const cacheId = `${ticket.docId}#${ticket.seqFrozen}`;
-  const cache = await getItem<PdfCacheRow>(cfg.pdfCacheTable, { id: cacheId });
-  const remaining = link ? Math.max(0, link.remaining) : 0;
+  const cache = await db().get<PdfCacheRow>(cfg.pdfCacheTable, { id: cacheId });
 
   if (cache?.status === 'READY' && cache.s3Key) {
-    const url = await presignedUrl(cache.s3Key, `${slug(link?.docTitle ?? 'document')}.pdf`);
-    return { state: 'ready', ticket, seqFrozen: ticket.seqFrozen, url, remaining, status: 200 };
+    const url = await presignedUrl(cache.s3Key, `${slug(docTitle)}.pdf`, cfg.pdfUrlTtlSeconds);
+    return { status: 200, body: { state: 'ready', url, expiresIn: cfg.pdfUrlTtlSeconds } };
   }
 
-  // Échec précédent de génération : on relance plutôt que de laisser le visiteur
-  // attendre indéfiniment. Sans cela, un incident passager condamnerait tous les
-  // visiteurs de cette version, ce qui revient à les « jeter » (interdit).
-  if (cache?.status === 'FAILED') {
-    const attempts = Number(cache.attempts ?? 0);
-    if (attempts < 3) {
-      try {
-        await updateItem(
-          cfg.pdfCacheTable,
-          { id: cacheId },
-          {
-            update: 'SET #status = :building, attempts = :next',
-            condition: '#status = :failed',
-            names: { '#status': 'status' },
-            values: { ':building': 'BUILDING', ':failed': 'FAILED', ':next': attempts + 1 },
+  if (cache?.status === 'BUILDING') {
+    return { status: 202, body: { state: 'waiting', retryAfter: 2 } };
+  }
+
+  // Absent ou en échec : un seul claimant arme le verrou et publie le job.
+  const attempts = Number(cache?.attempts ?? 0);
+  if (cache?.status === 'FAILED' && attempts >= 3) {
+    // Trois échecs : on ne fait plus attendre le visiteur indéfiniment.
+    throw unavailable('PDF_UNAVAILABLE', 'La génération du document a échoué. Réessayez dans quelques instants.');
+  }
+
+  const leaseUntil = Date.now() + 120_000;
+  try {
+    if (cache) {
+      await db().update(
+        cfg.pdfCacheTable,
+        { id: cacheId },
+        {
+          update: 'SET #status = :building, attempts = :next, leaseUntil = :lease',
+          condition: '#status = :failed OR leaseUntil < :nowAbsent OR attribute_not_exists(leaseUntil)',
+          names: { '#status': 'status' },
+          values: {
+            ':building': 'BUILDING',
+            ':failed': 'FAILED',
+            ':next': attempts + 1,
+            ':lease': leaseUntil,
+            ':nowAbsent': 0,
           },
-        );
-        await triggerPdfBuild(ticket.docId, ticket.seqFrozen, cacheId);
-      } catch (error) {
-        if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
-      }
-      return { state: 'waiting', ticket, seqFrozen: ticket.seqFrozen, remaining, status: 202, retryAfter: 3 };
+        },
+      );
+    } else {
+      await db().put(
+        cfg.pdfCacheTable,
+        {
+          id: cacheId,
+          docId: ticket.docId,
+          seq: ticket.seqFrozen,
+          status: 'BUILDING',
+          attempts: 0,
+          leaseUntil,
+          createdAt: new Date().toISOString(),
+          ttl: Math.floor(Date.now() / 1000) + PDF_CACHE_TTL_SECONDS,
+        },
+        { condition: 'attribute_not_exists(id)' },
+      );
     }
-    throw new ApiError(
-      503,
-      'PDF_UNAVAILABLE',
-      'La génération du document a échoué plusieurs fois. Réessayez dans quelques instants.',
-      { retryAfter: 10 },
-    );
+    await jobQueue().enqueue({ docId: ticket.docId, seq: ticket.seqFrozen, cacheId });
+  } catch (error) {
+    if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
   }
 
-  if (!cache) {
-    const created: PdfCacheRow = {
-      id: cacheId,
-      docId: ticket.docId,
-      seq: ticket.seqFrozen,
-      status: 'BUILDING',
-      attempts: 0,
-      createdAt: new Date().toISOString(),
-      ttl: Math.floor(Date.now() / 1000) + PDF_TTL_SECONDS,
-    };
-    try {
-      // Un seul claimant obtient le verrou et déclenche la génération.
-      await putItem(cfg.pdfCacheTable, created as unknown as Record<string, unknown>, {
-        condition: 'attribute_not_exists(id)',
-      });
-      await triggerPdfBuild(ticket.docId, ticket.seqFrozen, cacheId);
-    } catch (error) {
-      if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
-    }
-  }
-
-  return { state: 'waiting', ticket, seqFrozen: ticket.seqFrozen, remaining, status: 202, retryAfter: 2 };
+  return { status: 202, body: { state: 'waiting', retryAfter: 2 } };
 }
 
-async function triggerPdfBuild(docId: string, seq: number, cacheId: string): Promise<void> {
-  const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
-  const cfg = config();
-  if (!cfg.pdfFunctionName) {
-    console.warn('PDF_FUNCTION_NAME absent : génération PDF non déclenchée');
-    return;
-  }
-  const client = new LambdaClient({ region: cfg.region });
-  await client.send(
-    new InvokeCommand({
-      FunctionName: cfg.pdfFunctionName,
-      InvocationType: 'Event',
-      Payload: Buffer.from(JSON.stringify({ docId, seq, cacheId })),
-    }),
-  );
+/**
+ * Dernier `seq` réellement écrit.
+ *
+ * Le hub temps réel garde cette valeur en mémoire ; sans hub (redémarrage,
+ * autre processus), on retombe sur la table `Documents`.
+ */
+let lastSeqReader: ((docId: string) => Promise<number>) | null = null;
+
+export function setLastSeqReader(reader: ((docId: string) => Promise<number>) | null): void {
+  lastSeqReader = reader;
 }
 
-/** `GET /d/{token}/file` : même logique que le claim, sans consommer. */
-export async function fileForVisitor(token: string, visitorId: string): Promise<ClaimResult> {
-  const ticket = await getItem<TicketRow>(config().ticketsTable, { token, visitorId });
-  if (!ticket) throw gone('NO_TICKET', 'Aucun exemplaire réservé pour ce visiteur');
-  const link = await getLink(token).catch(() => undefined);
-  return resolvePdf(ticket, link);
+async function lastWrittenSeq(docId: string): Promise<number> {
+  if (lastSeqReader) return lastSeqReader(docId);
+  const doc = await db().get<{ seq: number }>(config().documentsTable, { docId });
+  return doc?.seq ?? 0;
 }
 
 export function slug(title: string): string {
-  const clean = clampText(title, 80)
+  const clean = title
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-zA-Z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .toLowerCase();
+    .toLowerCase()
+    .slice(0, 80);
   return clean || 'document';
 }
 
-export { pdfKey, utcDay };
+export { pdfKey };

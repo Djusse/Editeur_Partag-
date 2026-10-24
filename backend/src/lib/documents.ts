@@ -1,20 +1,27 @@
-/** Gestion des documents et des membres (partage par e-mail). */
+/**
+ * Documents et partage.
+ *
+ * La table `Documents` ne se lit que par `docId` : pour lister les documents
+ * d'un rédacteur, on interroge la table `Members` (index `email-index`), ce que
+ * la spécification d'interface exige (section 4.1).
+ */
 import { config } from './config';
-import { getItem, putItem, query, transactWrite, updateItem, deleteItem, scan } from './db';
-import { badRequest, forbidden, notFound } from './errors';
-import { clampText, isValidEmail, randomToken } from './ids';
+import { db } from './db';
+import { forbidden, invalidInput, notFound } from './errors';
+import { clampText, isValidEmail, newDocId } from './ids';
 import type { DocumentRow, MemberRow } from './types';
 
-export function newDocId(): string {
-  return `doc_${randomToken(9)}`;
-}
+export const TITLE_MAX = 120;
+export const NAME_MAX = 60;
 
 export async function createDocument(input: {
   title: string;
   ownerEmail: string;
   ownerName: string;
 }): Promise<DocumentRow> {
-  const title = clampText(input.title, 200) || 'Document sans titre';
+  const title = clampText(input.title, TITLE_MAX);
+  if (!title) throw invalidInput('title', 'Donnez un titre au document.');
+
   const now = new Date().toISOString();
   const doc: DocumentRow = {
     docId: newDocId(),
@@ -27,116 +34,165 @@ export async function createDocument(input: {
     createdAt: now,
     updatedAt: now,
   };
-  await transactWrite([
-    { put: { table: config().documentsTable, item: doc as unknown as Record<string, unknown>, condition: 'attribute_not_exists(docId)' } },
+
+  await db().transact([
     {
-      put: {
+      Put: {
+        table: config().documentsTable,
+        item: doc as unknown as Record<string, unknown>,
+        condition: 'attribute_not_exists(docId)',
+      },
+    },
+    {
+      Put: {
         table: config().membersTable,
         item: {
           docId: doc.docId,
           email: input.ownerEmail,
-          role: 'owner',
           name: input.ownerName,
+          role: 'owner',
           addedAt: now,
         },
         condition: 'attribute_not_exists(email)',
       },
     },
   ]);
+
   return doc;
 }
 
 export async function getDocument(docId: string): Promise<DocumentRow> {
-  const doc = await getItem<DocumentRow>(config().documentsTable, { docId });
-  if (!doc) throw notFound('DOCUMENT_NOT_FOUND', 'Document introuvable');
+  const doc = await db().get<DocumentRow>(config().documentsTable, { docId });
+  if (!doc) throw notFound('Document introuvable.');
   return doc;
 }
 
-export async function assertMember(docId: string, email: string): Promise<MemberRow> {
-  const member = await getItem<MemberRow>(config().membersTable, { docId, email });
-  if (!member) throw forbidden('NOT_A_MEMBER', 'Vous n\'avez pas accès à ce document');
-  return member;
+export async function getMembership(docId: string, email: string): Promise<MemberRow | undefined> {
+  return db().get<MemberRow>(config().membersTable, { docId, email });
 }
 
-export async function requireDocumentAccess(docId: string, email: string): Promise<{ doc: DocumentRow; member: MemberRow }> {
+/** Vérifie l'appartenance ; renvoie le document et le membre. */
+export async function requireAccess(
+  docId: string,
+  email: string,
+): Promise<{ doc: DocumentRow; member: MemberRow }> {
   const doc = await getDocument(docId);
-  const member = await assertMember(docId, email);
+  const member = await getMembership(docId, email);
+  if (!member) throw forbidden('Vous n\'avez pas accès à ce document.');
   return { doc, member };
 }
 
-/** Liste les documents auxquels l'utilisateur a accès (GSI email-index). */
-export async function listDocumentsFor(email: string): Promise<Array<DocumentRow & { role: string }>> {
-  const memberships = await query<MemberRow>({
-    table: config().membersTable,
+export async function listDocumentsFor(email: string): Promise<
+  Array<{ id: string; title: string; ownerName: string; ownerEmail: string; updatedAt: string; role: string }>
+> {
+  const memberships = await db().query<MemberRow>(config().membersTable, {
     index: 'email-index',
     keyCondition: 'email = :email',
     values: { ':email': email },
   });
-  const docs: Array<DocumentRow & { role: string }> = [];
-  await Promise.all(
+
+  const docs = await Promise.all(
     memberships.items.map(async (member) => {
-      const doc = await getItem<DocumentRow>(config().documentsTable, { docId: member.docId });
-      if (doc) docs.push({ ...doc, role: member.role });
+      const doc = await db().get<DocumentRow>(config().documentsTable, { docId: member.docId });
+      if (!doc) return null;
+      return {
+        id: doc.docId,
+        title: doc.title,
+        ownerName: doc.ownerName,
+        ownerEmail: doc.ownerEmail,
+        updatedAt: doc.updatedAt,
+        role: member.role,
+      };
     }),
   );
-  return docs.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+
+  return docs
+    .filter((doc): doc is NonNullable<typeof doc> => doc !== null)
+    .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
 }
 
-export async function listMembers(docId: string): Promise<MemberRow[]> {
-  const result = await query<MemberRow>({
-    table: config().membersTable,
+export async function listMembers(docId: string): Promise<Array<{ email: string; name: string; role: string }>> {
+  const result = await db().query<MemberRow>(config().membersTable, {
     keyCondition: 'docId = :docId',
     values: { ':docId': docId },
   });
-  return result.items;
+  return result.items
+    .sort((a, b) => (a.role === 'owner' ? -1 : b.role === 'owner' ? 1 : a.email.localeCompare(b.email)))
+    .map((member) => ({ email: member.email, name: member.name, role: member.role }));
 }
 
-export async function addMember(input: {
-  docId: string;
-  email: string;
-  name: string;
-  addedBy: string;
-}): Promise<MemberRow> {
-  const email = input.email.trim().toLowerCase();
-  if (!isValidEmail(email)) throw badRequest('INVALID_EMAIL', 'Adresse e-mail invalide');
-  const member: MemberRow = {
-    docId: input.docId,
-    email,
-    role: 'editor',
-    name: clampText(input.name, 80) || email.split('@')[0],
-    addedAt: new Date().toISOString(),
-  };
-  await putItem(config().membersTable, member as unknown as Record<string, unknown>, {
-    condition: 'attribute_not_exists(email)',
-  }).catch((error: unknown) => {
-    if ((error as { name?: string }).name === 'ConditionalCheckFailedException') return;
+/** Ajoute un membre ; une personne déjà membre n'est pas une erreur bloquante. */
+export async function addMember(docId: string, rawEmail: string, addedBy: string): Promise<void> {
+  const email = rawEmail.trim().toLowerCase();
+  if (!isValidEmail(email)) throw invalidInput('email', 'Adresse e-mail invalide.');
+
+  const existing = await getMembership(docId, email);
+  if (existing) throw new AppErrorAlreadyMember(email);
+
+  await db().put(
+    config().membersTable,
+    {
+      docId,
+      email,
+      name: email.split('@')[0],
+      role: 'editor',
+      addedAt: new Date().toISOString(),
+    },
+    { condition: 'attribute_not_exists(email)' },
+  ).catch((error: unknown) => {
+    if ((error as { name?: string }).name === 'ConditionalCheckFailedException') {
+      throw new AppErrorAlreadyMember(email);
+    }
     throw error;
   });
-  return member;
+
+  void addedBy;
 }
 
-export async function renameDocument(docId: string, title: string): Promise<void> {
-  const nextTitle = clampText(title, 200);
-  if (!nextTitle) throw badRequest('INVALID_TITLE', 'Titre vide');
-  await updateItem(
+/** Signalée à part pour que la route réponde `409 ALREADY_MEMBER`. */
+export class AppErrorAlreadyMember extends Error {
+  readonly email: string;
+  constructor(email: string) {
+    super('Cette personne a déjà accès.');
+    this.name = 'AppErrorAlreadyMember';
+    this.email = email;
+  }
+}
+
+/** Met à jour les métadonnées de séquence d'un document (utilisé par le hub). */
+export async function touchDocument(
+  docId: string,
+  changes: { seq?: number; latestSnapshotSeq?: number; textLength?: number },
+): Promise<void> {
+  const sets: string[] = ['updatedAt = :now'];
+  const values: Record<string, unknown> = { ':now': new Date().toISOString() };
+
+  if (changes.seq !== undefined) {
+    sets.push('seq = :seq');
+    values[':seq'] = changes.seq;
+  }
+  if (changes.latestSnapshotSeq !== undefined) {
+    sets.push('latestSnapshotSeq = :snap');
+    values[':snap'] = changes.latestSnapshotSeq;
+  }
+  if (changes.textLength !== undefined) {
+    sets.push('textLength = :len');
+    values[':len'] = changes.textLength;
+  }
+
+  await db().update(
     config().documentsTable,
     { docId },
-    {
-      update: 'SET title = :title, updatedAt = :now',
-      condition: 'attribute_exists(docId)',
-      values: { ':title': nextTitle, ':now': new Date().toISOString() },
-    },
+    { update: `SET ${sets.join(', ')}`, values },
   );
 }
 
-export async function deleteDocument(docId: string): Promise<void> {
-  await deleteItem(config().documentsTable, { docId });
-  const members = await listMembers(docId);
-  await Promise.all(members.map((member) => deleteItem(config().membersTable, { docId, email: member.email })));
-}
-
-/** Vue de supervision : tous les documents (usage admin). */
-export async function scanDocuments(limit = 200): Promise<DocumentRow[]> {
-  const result = await scan<DocumentRow>({ table: config().documentsTable, limit });
-  return result.items;
+export async function renameDocument(docId: string, title: string): Promise<void> {
+  const next = clampText(title, TITLE_MAX);
+  if (!next) throw invalidInput('title', 'Donnez un titre au document.');
+  await db().update(
+    config().documentsTable,
+    { docId },
+    { update: 'SET title = :title, updatedAt = :now', values: { ':title': next, ':now': new Date().toISOString() } },
+  );
 }

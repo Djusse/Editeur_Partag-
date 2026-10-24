@@ -1,142 +1,168 @@
 /**
- * Génération du PDF (C3) : le document est reconstruit à partir de la version
- * figée dans le ticket (`snapshot + updates ≤ seqFrozen`), jamais du texte
- * courant. La génération est asynchrone : aucun visiteur n'attend dans la
- * requête HTTP (API Gateway couperait à 29 s).
+ * Génération du PDF (C3).
+ *
+ * Le document est reconstruit depuis le journal jusqu'à la `seq` **figée dans
+ * le ticket** (T1), jamais depuis le texte courant : c'est l'exigence exacte du
+ * sujet. La génération est **asynchrone** (worker SQS), donc aucun visiteur
+ * n'attend dans une requête HTTP.
+ *
+ * Dépendance volontairement simple : `pdfkit` en texte brut, sans navigateur
+ * headless (démarrage instantané, empreinte mémoire faible sur `t3.large`).
  */
+import PDFDocument from 'pdfkit';
 import * as Y from 'yjs';
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { config } from './config';
-import { getItem, updateItem } from './db';
-import { putObject, pdfKey } from './s3';
-import { loadDocumentState } from './updates';
-import { getDocument } from './documents';
-import type { PdfCacheRow } from './types';
+import { db } from './db';
+import { getObject, pdfKey, putObject, snapshotKey } from './s3';
+import type { DocumentRow, PdfCacheRow, UpdateRow } from './types';
 
-const PAGE_WIDTH = 595.28; // A4
-const PAGE_HEIGHT = 841.89;
-const MARGIN = 56;
+const PAGE_MARGIN = 56;
 const FONT_SIZE = 11;
-const LINE_HEIGHT = 16;
-const MAX_CHARS_WRAP = 200;
+const LINE_HEIGHT = 15;
 
-/** Reconstruit le texte du document à la version demandée. */
-export function textAtVersion(updates: Array<{ payload: Uint8Array }>, snapshot?: Uint8Array): string {
+/** Reconstruit le texte d'un document à une version donnée. */
+export function textAtVersion(state: Uint8Array | undefined, updates: UpdateRow[]): string {
   const doc = new Y.Doc();
-  if (snapshot) Y.applyUpdate(doc, snapshot);
-  for (const update of updates) {
-    Y.applyUpdate(doc, update.payload);
-  }
+  if (state) Y.applyUpdate(doc, state);
+  for (const update of updates) Y.applyUpdate(doc, update.payload);
   return doc.getText('content').toString();
 }
 
-/** Encode proprement le texte pour les polices standard (WinAnsi). */
+/** Charge l'état complet (snapshot + journal) jusqu'à `seq`. */
+export async function loadStateUpTo(docId: string, seq: number): Promise<{ snapshot?: Uint8Array; updates: UpdateRow[] }> {
+  const cfg = config();
+  const doc = await db().get<DocumentRow>(cfg.documentsTable, { docId });
+
+  let snapshot: Uint8Array | undefined;
+  let from = 0;
+  if (doc && doc.latestSnapshotSeq > 0 && doc.latestSnapshotSeq <= seq) {
+    try {
+      snapshot = await getObject(snapshotKey(docId, doc.latestSnapshotSeq));
+      from = doc.latestSnapshotSeq;
+    } catch {
+      snapshot = undefined;
+      from = 0;
+    }
+  }
+
+  // DynamoDB ne permet pas de borne haute dans une KeyCondition sur le tri :
+  // on lit depuis `from` et on filtre sur `seq <= seq` côté application.
+  const updates: UpdateRow[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  let pages = 0;
+  do {
+    const page = await db().query<UpdateRow>(cfg.updatesTable, {
+      keyCondition: 'docId = :docId AND seq > :from',
+      values: { ':docId': docId, ':from': from },
+      limit: 500,
+      scanForward: true,
+      exclusiveStartKey,
+    });
+    const reachedEnd = page.items.some((row) => row.seq > seq);
+    for (const row of page.items) {
+      if (row.seq > seq) break;
+      updates.push(row);
+    }
+    exclusiveStartKey = reachedEnd ? undefined : page.lastKey;
+    pages++;
+  } while (exclusiveStartKey && pages < 40);
+
+  return { snapshot, updates: updates.sort((a, b) => a.seq - b.seq) };
+}
+
 function sanitize(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\t/g, '    ').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
 }
 
-export async function renderPdf(title: string, text: string): Promise<Uint8Array> {
-  const pdf = await PDFDocument.create();
-  pdf.setTitle(title);
-  pdf.setCreator('Éditeur de documents partagé');
-  pdf.setProducer('pdf-lib');
-  const font = await pdf.embedFont(StandardFonts.Helvetica);
-  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+/** Rend le PDF en mémoire. */
+export function renderPdf(title: string, text: string): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: 'A4', margin: PAGE_MARGIN });
+      const chunks: Buffer[] = [];
+      doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+      doc.on('end', () => resolve(new Uint8Array(Buffer.concat(chunks))));
+      doc.on('error', reject);
 
-  let page = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-  let y = PAGE_HEIGHT - MARGIN;
+      doc.font('Helvetica-Bold').fontSize(18).fillColor('#111827').text(sanitize(title).slice(0, 200));
+      doc.moveDown(0.3);
+      doc
+        .font('Helvetica')
+        .fontSize(9)
+        .fillColor('#6B7280')
+        .text(`Généré le ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`);
+      doc.moveDown(1.2);
 
-  page.drawText(sanitize(title).slice(0, 200), {
-    x: MARGIN,
-    y,
-    size: 18,
-    font: bold,
-    color: rgb(0.08, 0.1, 0.15),
-  });
-  y -= 24;
-  page.drawText(`Généré le ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`, {
-    x: MARGIN,
-    y,
-    size: 9,
-    font,
-    color: rgb(0.45, 0.47, 0.5),
-  });
-  y -= 28;
+      doc.font('Helvetica').fontSize(FONT_SIZE).fillColor('#111827');
+      const paragraphs = sanitize(text).split('\n');
 
-  const maxWidth = PAGE_WIDTH - MARGIN * 2;
-  const paragraphs = sanitize(text).split('\n');
-
-  for (const paragraph of paragraphs) {
-    const words = paragraph.length > 0 ? paragraph.split(' ') : [''];
-    let line = '';
-    const flush = () => {
-      if (y < MARGIN + LINE_HEIGHT) {
-        page = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-        y = PAGE_HEIGHT - MARGIN;
+      for (const paragraph of paragraphs) {
+        if (paragraph.length === 0) {
+          doc.moveDown(0.5);
+          continue;
+        }
+        doc.text(paragraph, {
+          width: 483,
+          lineGap: LINE_HEIGHT - FONT_SIZE,
+          align: 'left',
+        });
       }
-      page.drawText(line, { x: MARGIN, y, size: FONT_SIZE, font, color: rgb(0.1, 0.1, 0.12) });
-      y -= LINE_HEIGHT;
-    };
-    for (const word of words) {
-      const candidate = line ? `${line} ${word}` : word;
-      if (font.widthOfTextAtSize(candidate.slice(0, MAX_CHARS_WRAP), FONT_SIZE) > maxWidth && line) {
-        flush();
-        line = word;
-      } else {
-        line = candidate;
-      }
+
+      doc.end();
+    } catch (error) {
+      reject(error);
     }
-    if (line) flush();
-    else {
-      // Ligne vide : on garde un espacement de paragraphe.
-      y -= LINE_HEIGHT / 2;
-      if (y < MARGIN) {
-        page = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-        y = PAGE_HEIGHT - MARGIN;
-      }
-    }
-  }
-
-  const bytes = await pdf.save();
-  return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  });
 }
 
-/** Handler asynchrone : construit le PDF d'une version figée et le dépose dans S3. */
-export async function buildPdfForVersion(input: { docId: string; seq: number; cacheId: string }): Promise<void> {
+export interface PdfJob {
+  docId: string;
+  seq: number;
+  cacheId: string;
+}
+
+/**
+ * Construit le PDF d'une version figée et le dépose dans S3.
+ * Idempotent : la clé S3 est déterministe (`pdf/{docId}/v{seq}.pdf`).
+ */
+export async function buildPdf(job: PdfJob): Promise<void> {
   const cfg = config();
   const started = Date.now();
-  try {
-    const doc = await getDocument(input.docId);
-    const state = await loadDocumentState(input.docId);
-    // On ne garde que les updates ≤ seq figée : c'est la garantie C3.
-    const updates = state.updates.filter((update) => update.seq <= input.seq);
-    const text = textAtVersion(updates, state.snapshot);
-    const bytes = await renderPdf(doc.title, text);
-    const key = pdfKey(input.docId, input.seq);
-    await putObject(key, bytes, 'application/pdf');
-    await updateItem(
-      cfg.pdfCacheTable,
-      { id: input.cacheId },
+
+  const doc = await db().get<DocumentRow>(cfg.documentsTable, { docId: job.docId });
+  if (!doc) throw new Error(`Document inconnu : ${job.docId}`);
+
+  const { snapshot, updates } = await loadStateUpTo(job.docId, job.seq);
+  const text = textAtVersion(snapshot, updates);
+  const bytes = await renderPdf(doc.title, text);
+
+  const key = pdfKey(job.docId, job.seq);
+  await putObject(key, bytes, 'application/pdf');
+
+  await db().update(
+    cfg.pdfCacheTable,
+    { id: job.cacheId },
+    {
+      update: 'SET #status = :ready, s3Key = :key, bytes = :bytes, buildMs = :ms',
+      names: { '#status': 'status' },
+      values: { ':ready': 'READY', ':key': key, ':bytes': bytes.length, ':ms': Date.now() - started },
+    },
+  );
+}
+
+/** Marque une génération en échec et libère le bail. */
+export async function markPdfFailed(cacheId: string, error: unknown): Promise<void> {
+  const existing = await db().get<PdfCacheRow>(config().pdfCacheTable, { id: cacheId });
+  if (!existing) return;
+  await db()
+    .update(
+      config().pdfCacheTable,
+      { id: cacheId },
       {
-        update: 'SET #status = :ready, s3Key = :key, bytes = :bytes, buildMs = :ms',
-        names: { '#status': 'status' },
-        values: { ':ready': 'READY', ':key': key, ':bytes': bytes.length, ':ms': Date.now() - started },
+        update: 'SET #status = :failed, #error = :error',
+        names: { '#status': 'status', '#error': 'error' },
+        values: { ':failed': 'FAILED', ':error': String((error as Error).message ?? error).slice(0, 400) },
       },
-    );
-  } catch (error) {
-    console.error('Échec de génération du PDF', { input, error });
-    const existing = await getItem<PdfCacheRow>(cfg.pdfCacheTable, { id: input.cacheId });
-    if (existing) {
-      await updateItem(
-        cfg.pdfCacheTable,
-        { id: input.cacheId },
-        {
-          update: 'SET #status = :failed, #error = :error',
-          names: { '#status': 'status', '#error': 'error' },
-          values: { ':failed': 'FAILED', ':error': (error as Error).message.slice(0, 500) },
-        },
-      ).catch(() => undefined);
-    }
-    throw error;
-  }
+    )
+    .catch(() => undefined);
 }

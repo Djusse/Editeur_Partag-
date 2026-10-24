@@ -1,20 +1,18 @@
 {
   "name": "editeur-partage-frontend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:local": "NEXT_PUBLIC_API_BASE=http://localhost:4000/api NEXT_PUBLIC_WS_BASE=ws://localhost:4000/ws next dev -p 3001",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
-    "typecheck": "tsc --noEmit",
-    "dev:local": "NEXT_PUBLIC_API_BASE=http://localhost:4000 NEXT_PUBLIC_WS_URL=ws://localhost:4000 next dev"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@codemirror/lang-markdown": "^6.3.1",
+    "@codemirror/commands": "^6.7.1",
     "@codemirror/state": "^6.5.0",
     "@codemirror/view": "^6.35.0",
-    "codemirror": "^6.0.1",
     "next": "14.2.20",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -23,7 +21,7 @@
     "yjs": "^13.6.20"
   },
   "devDependencies": {
-    "@types/node": "^20.17.6",
+    "@types/node": "^22.10.2",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "typescript": "^5.7.2"

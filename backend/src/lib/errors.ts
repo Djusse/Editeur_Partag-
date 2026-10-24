@@ -1,52 +1,54 @@
 /**
- * Erreurs applicatives. Chaque erreur porte un code stable, documenté dans la
- * description de l'API, afin que le client (et le jury) puisse réagir sans
- * analyser un message texte.
+ * Erreurs applicatives.
+ *
+ * L'interface exige des codes *texte* dans le champ `error` (`INVALID_INPUT`,
+ * `FORBIDDEN`, …) : c'est donc ce format que renvoie le serveur, avec un code
+ * HTTP cohérent.
  */
-export class ApiError extends Error {
+export class AppError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly field?: string;
   readonly details?: Record<string, unknown>;
 
-  constructor(status: number, code: string, message?: string, details?: Record<string, unknown>) {
-    super(message ?? code);
-    this.name = 'ApiError';
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    options: { field?: string; details?: Record<string, unknown> } = {},
+  ) {
+    super(message);
+    this.name = 'AppError';
     this.status = status;
     this.code = code;
-    this.details = details;
+    this.field = options.field;
+    this.details = options.details;
   }
 }
 
-export const badRequest = (code: string, message?: string, details?: Record<string, unknown>) =>
-  new ApiError(400, code, message, details);
+export const invalidInput = (field: string, message = 'Données invalides') =>
+  new AppError(400, 'INVALID_INPUT', message, { field });
 
-export const unauthorized = (code = 'UNAUTHENTICATED', message = 'Session invalide ou expirée') =>
-  new ApiError(401, code, message);
+export const unauthorized = (message = 'Session invalide ou expirée') =>
+  new AppError(401, 'UNAUTHORIZED', message);
 
-export const forbidden = (code = 'FORBIDDEN', message = 'Accès refusé') =>
-  new ApiError(403, code, message);
+export const forbidden = (message = 'Accès refusé') => new AppError(403, 'FORBIDDEN', message);
 
-export const notFound = (code = 'NOT_FOUND', message = 'Ressource introuvable') =>
-  new ApiError(404, code, message);
+export const notFound = (message = 'Ressource introuvable') => new AppError(404, 'NOT_FOUND', message);
 
-export const conflict = (code: string, message?: string, details?: Record<string, unknown>) =>
-  new ApiError(409, code, message, details);
+export const conflict = (code: string, message: string) => new AppError(409, code, message);
 
-export const gone = (code: string, message?: string, details?: Record<string, unknown>) =>
-  new ApiError(410, code, message, details);
+export const gone = (code: string, message: string) => new AppError(410, code, message);
 
-export const tooLarge = (code = 'PAYLOAD_TOO_LARGE', message = 'Charge utile trop volumineuse') =>
-  new ApiError(413, code, message);
+export const tooLarge = (message = 'Charge utile trop volumineuse') =>
+  new AppError(413, 'PAYLOAD_TOO_LARGE', message);
 
-export const tooManyRequests = (code = 'TOO_MANY_REQUESTS', message = 'Trop de requêtes') =>
-  new ApiError(429, code, message);
+export const unavailable = (code: string, message: string) => new AppError(503, code, message);
 
-/** Codes métier partagés entre REST et WebSocket. */
-export const ErrorCodes = {
+/** Codes utilisés par les messages WebSocket `error`. */
+export const WsErrorCodes = {
   creditExhausted: 'CREDIT_EXHAUSTED',
   blocked: 'BLOCKED',
-  exhausted: 'EXHAUSTED',
-  invalidUpdate: 'INVALID_UPDATE',
-  duplicateOpConflict: 'OP_ID_CONFLICT',
-  waiting: 'WAITING',
+  forbidden: 'FORBIDDEN',
+  payloadTooLarge: 'PAYLOAD_TOO_LARGE',
 } as const;

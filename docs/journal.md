@@ -1,86 +1,97 @@
 # Journal de décisions et de coûts
 
-Ce journal est alimenté au fil de l'eau : il sert de matière première au dossier de
-conception et au rapport de test.
+Alimenté au fil de l'eau : sert de matière première au dossier de conception et au
+rapport de test.
 
-## 2026-10-24 — Mise en place
+## 2026-10-24 — Socle serverless (v6, abandonné)
 
-| Heure (UTC) | Événement | Décision / preuve |
+| Heure (UTC) | Événement |
+| - | - |
+| 10:15 | Lecture du sujet et du plan v6 (Lambda + API Gateway) |
+| 10:23 | Parseur d'updates Yjs validé contre la vraie bibliothèque |
+| 10:45 | 26 tests unitaires verts (C1, C4) |
+| 11:00 | Mode local sans AWS : 17 points du parcours vérifiés |
+| 11:58 | Dépôt GitHub créé et poussé (`3aa88b3`, `e831f23`) |
+
+## 2026-10-24 — Bascule vers la v7 (EC2), décision structurante
+
+**Déclencheur :** le cours a couvert EC2 (TP 3 et 4), pas Lambda, API Gateway ni SAM.
+Les quotas mesurés dans le compte sont par ailleurs défavorables au serverless :
+
+| Quota mesuré (`eu-north-1`) | Valeur | Conséquence |
 | - | - | - |
-| 10:15 | Lecture du sujet et du plan v6 | Stack confirmée : Next.js export statique + Lambda TypeScript + SAM |
-| 10:18 | Dépendances backend installées (97 paquets) | `@aws-sdk/*`, `lib0`, `pdf-lib`, `yjs` (test) |
-| 10:23 | **Parseur d'updates Yjs validé** | 7 tests contre la vraie bibliothèque : insertions, suppressions, unicode, update corrompu |
-| 10:24 | Bibliothèques pures écrites | Claim, crédit, updates, PDF, versions, liens |
-| 10:29 | `tsc --noEmit` : 0 erreur | Aucune erreur de typage sur 22 fichiers backend |
-| 10:32 | Template SAM validé | 48 ressources, 18 fonctions, une seule région (`eu-west-3`) |
-| 10:39 | Build Next.js (export statique) | 8 pages pré-rendues, bundle éditeur 135 ko (Yjs + CodeMirror) |
-| 10:45 | Bundling esbuild des handlers | `ws.js` = 39,5 ko ; `pdf.js` = 1,2 Mo (pdf-lib), acceptable |
-| 10:45 | **26 tests unitaires passent** | C1 et C4 prouvés hors cloud |
-| 10:51 | Cohérence template ↔ bundles vérifiée | 19 fonctions, 19 handlers présents |
-| 10:54 | **33 tests unitaires passent** | Ajout de 7 tests sur la restauration de version |
+| Concurrence Lambda | 400 | partagée entre claims, polling et écritures : serré pour C5 |
+| vCPU EC2 (A, C, D, H, I, M, R, T, Z) | 16 | marge confortable pour une instance applicative |
 
-## Défauts trouvés par les tests (et corrigés)
+**Décision :** une instance EC2 (`t3.large`), Node.js 22, Fastify + `ws` + Yjs,
+derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remplace SAM.
 
-Ces anomalies sont documentées car elles sont la meilleure preuve que les tests servent à
-quelque chose.
+## Ce qui a été réécrit
 
-1. **Transition `EXHAUSTED` non atomique (C1).** Le statut était calculé à partir d'une
-   valeur lue avant la transaction ; sous 50 claims concurrents pour N=20, le lien restait
-   `ACTIVE` avec `remaining = 0`. *Correction* : le décrément est seul dans la transaction,
-   et la transition `ACTIVE → EXHAUSTED` est une écriture conditionnelle séparée
-   (`status = ACTIVE AND remaining = 0`), donc idempotente et monotone. `linkStatus` se
-   fie aussi à `remaining`.
-2. **Condition de crédit permissive sur un compteur absent (C4).**
-   `attribute_not_exists(used) OR used + :delta <= :limit` laissait passer une première
-   écriture supérieure au plafond. *Correction* : `(attribute_not_exists(used) AND :delta
-   <= :limit) OR (used + :delta <= :limit)`.
-3. **Format d'update Yjs mal décodé.** Le discriminant n'est pas le bit 128 mais
-   `info & 31` (0 = GC, 10 = Skip), et `parentInfo` vaut 1 pour une clé racine.
-   *Correction* : décodage aligné sur `yjs/src/utils/encoding.js`.
-4. **Restauration qui dupliquait le texte.** La différence était calculée sur un
-   `Y.Doc` vide, donc l'update ne contenait que des insertions : appliqué au vrai
-   document, il **ajoutait** le texte au lieu de le remplacer. *Correction* :
-   différence calculée sur l'état courant réel, préfixe/suffixe préservés ;
-   7 tests dédiés (`test/versions.test.ts`).
-5. **Journal tronqué (violation possible de C3).** `listUpdatesSince` s'arrêtait à
-   1 000 éléments et `maybeSnapshot` n'était jamais appelé : au-delà de 1 000
-   modifications, un PDF aurait été **incomplet** et `latestSnapshotSeq` serait resté
-   à 0. *Correction* : pagination jusqu'au bout (bornée par `maxPages`), appel de
-   `compactIfNeeded` après chaque écriture acceptée.
-6. **Yjs absent des bundles (échec au déploiement).** `stateFromJournal` chargeait
-   Yjs par `require()` dynamique : esbuild ne le résolvait pas, et `yjs` n'était
-   qu'une `devDependency`. En Lambda (seuls les bundles sont déployés), l'appel aurait
-   levé `MODULE_NOT_FOUND`. *Correction* : import statique + `yjs` en dépendance de
-   production. Vérifié : aucun `require("yjs")` non résolu dans `dist/handlers/`.
-7. **Template pointant vers des fonctions internes.** Les `Handler:` du template
-   visaient `documents.listHandler`, `links.createHandler`, `updates.postHandler`…
-   Ces noms **n'étaient pas exportés** par les bundles : toutes les routes HTTP
-   auraient renvoyé une erreur d'initialisation. *Correction* : chaque fichier de
-   handler exporte des handlers Lambda wrappés (`httpHandler`), et le template les
-   référence (`documents.list`, `links.create`, …).
-8. **`POST /documents`, `PATCH` et `DELETE` sur le handler de `GET`.** La création
-   d'un document aurait répondu comme une liste. *Correction* : trois fonctions
-   distinctes (`DocumentsCreateFunction`, `DocumentWriteFunction`,
-   `DocumentDeleteFunction`).
-9. **Écriture impossible en repli HTTP.** Le provider exigeait `synced` avant
-   d'envoyer quoi que ce soit ; comme ce drapeau n'était posé que par le WebSocket,
-   aucune modification ne partait lorsque le WebSocket était indisponible.
-   *Correction* : bascule immédiate en repli + envoi sans attendre `synced`.
+| Zone | Avant (v6) | Après (v7) |
+| - | - | - |
+| Calcul | 19 Lambda + API Gateway HTTP/WS | 1 instance, 1 processus Fastify + `ws`, 1 worker SQS |
+| Écriture | transaction par update | **lot par tick de 250 ms**, écrivain unique |
+| WebSocket | API Gateway (JSON + Base64, 16 Ko) | `ws` natif, JSON + Base64, **64 Ko** |
+| Temps réel en local | impossible (repli HTTP seulement) | **testable réellement** |
+| Présence, tickets ws | tables DynamoDB | **mémoire** (instance unique) |
+| Secrets | générés à la volée | créés par `deploy.sh` en SSM, lus par le rôle d'instance |
+| Front | thème sombre, styles inline | **thème clair**, jetons imposés, 3 modales, 5 pages |
+| Identifiants d'API | `docId` | `id` (contrat d'interface), `documentId` côté WebSocket |
+| Erreurs | `{error:{code,message}}` | `{error: "CODE", field?}` |
 
-Les défauts 7 à 9 ont été trouvés en construisant le **mode local**
-([`docs/developpement-local.md`](developpement-local.md)), qui exécute les vrais
-handlers sans AWS : 17 points du parcours vérifiés, dont le PDF réel.
+## Défauts trouvés et corrigés (les plus instructifs)
+
+1. **Template pointant vers des handlers inexistants (v6).** Toutes les routes HTTP
+   auraient échoué : les `Handler:` visaient des fonctions internes (`documents.listHandler`)
+   que les bundles n'exportaient pas.
+2. **`POST /documents` sur le handler de `GET`.** Créer un document aurait renvoyé
+   une liste.
+3. **Écriture impossible en repli HTTP (v6).** Le provider exigeait `synced` avant
+   d'envoyer ; ce drapeau n'était posé que par le WebSocket.
+4. **Transition `EXHAUSTED` non atomique.** Sous 50 claims concurrents pour N=20, le
+   lien restait `ACTIVE` avec `remaining = 0` : le statut était calculé sur une
+   lecture périmée. Corrigé par une écriture conditionnelle séparée, et les lectures
+   se fient au **compteur**.
+5. **Condition de crédit permissive.** `attribute_not_exists(used) OR …` laissait
+   passer une première écriture au-dessus du plafond. Corrigé par
+   `(attribute_not_exists(used) AND :chars <= :limit) OR (used + :chars <= :limit)`.
+6. **Restauration qui dupliquait le texte.** La différence était calculée sur un
+   `Y.Doc` vide, donc l'update ne contenait que des insertions. Corrigé : différence
+   calculée sur l'état courant réel, préfixe/suffixe préservés.
+7. **Un refus de crédit bloquait tout le lot.** Tous les auteurs étaient rejetés au
+   lieu du seul fautif. Corrigé : l'auteur de chaque élément `Credits` est mémorisé,
+   les `CancellationReasons` désignent l'indice fautif, les autres sont réécrits.
+8. **Routes visiteur sous `/api`.** nginx sert `/` (statique) et proxifie `/api/` :
+   les liens publics `/d?token=…` auraient renvoyé 404. Corrigé : le parcours visiteur
+   est enregistré à la racine.
+9. **Clé d'administration = secret JWT (mode local).** Les deux paramètres avaient le
+   même nom, donc `/admin` refusait systématiquement. Corrigé par des noms distincts.
+10. **`ADD` mal décodé dans le double en mémoire.** `[^S]` avec l'option `/i` excluait
+    la lettre « s » et tronquait `:minusOne` : le quota ne se décrémentait pas.
+
+## Preuves exécutées
+
+```
+typecheck backend ......... OK (0 erreur)
+tests unitaires .......... 29/29
+mode local (E2E) ......... 20/20 — WebSocket natif, PDF réel, quota, crédit
+typecheck frontend ....... OK
+build Next ............... 8 pages statiques
+template CloudFormation .. YAML valide, 20 ressources
+```
 
 ## Coûts
 
-À compléter à la fin des tests de charge, à partir de Cost Explorer **et** des métriques
-d'usage (les données de facturation ont jusqu'à 24 h de retard).
+À compléter après les tests de charge, à partir de Cost Explorer **et** des métriques
+d'usage (la facturation a ~24 h de retard).
 
 | Poste | Mesure | Estimation |
 | - | - | - |
-| Lambda (invocations × durée × mémoire) | à mesurer | — |
+| EC2 t3.large (heures) | à mesurer | — |
+| Elastic IP (IPv4 publique) | à mesurer | — |
 | DynamoDB (WRU/LRU à la demande) | à mesurer | — |
-| API Gateway (HTTP + WebSocket, messages) | à mesurer | — |
-| S3 (stockage PDF, requêtes) | à mesurer | — |
-| CloudFront (requêtes, transfert) | à mesurer | — |
+| S3 (stockage et requêtes) | à mesurer | — |
+| SQS (messages PDF) | à mesurer | — |
 | SES (e-mails) | quelques unités | négligeable |
+| Instance de charge k6 | à mesurer | — |

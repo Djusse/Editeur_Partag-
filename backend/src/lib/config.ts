@@ -1,54 +1,78 @@
 /**
- * Configuration de l'application, lue depuis les variables d'environnement
- * injectées par le template SAM. Aucune valeur secrète n'est stockée ici :
- * les secrets (JWT, clé admin) sont lus dans SSM Parameter Store.
+ * Configuration du serveur applicatif.
+ *
+ * Deux modes :
+ *  - **production** : EC2, les secrets sont lus dans SSM Parameter Store ;
+ *  - **local** : aucune ressource AWS, tout est en mémoire (voir `src/local`).
+ *
+ * Aucune valeur secrète n'est ici : uniquement des noms de paramètres et des
+ * réglages fonctionnels.
  */
 export interface AppConfig {
+  /** Mode d'exécution. `local` n'appelle jamais AWS. */
+  mode: 'production' | 'local';
   region: string;
+  port: number;
+  host: string;
+
+  /** Tables DynamoDB. */
   documentsTable: string;
-  updatesTable: string;
   membersTable: string;
-  connectionsTable: string;
+  updatesTable: string;
   creditsTable: string;
   opIdsTable: string;
   abuseTable: string;
   linksTable: string;
   ticketsTable: string;
-  wsTicketsTable: string;
   pdfCacheTable: string;
   versionsTable: string;
-  pdfBucket: string;
-  wsEndpoint: string;
+
+  /** Stockage objet (PDF et snapshots). */
+  bucket: string;
+
+  /** SQS : génération PDF. */
+  pdfQueueUrl: string;
+
+  /** SES et supervision. */
+  sesSender: string;
   jwtSecretParam: string;
   adminKeyParam: string;
-  sesSender: string;
-  webOrigin: string;
-  pdfFunctionName: string;
-  snapshotFunctionName: string;
+
+  /** Réglages métier. */
   creditPerDay: number;
+  /** Plafond d'un update binaire (64 Ko, exigence de l'interface). */
   maxUpdateBytes: number;
+  /** Nombre de refus pour crédit épuisé avant blocage. */
   blockAfterRefusals: number;
+  /** Durée de validité d'une URL S3 présignée. */
   pdfUrlTtlSeconds: number;
-  snapshotInterval: number;
+  /** Regroupement des frappes côté client. */
+  batchMs: number;
+  /** Période du tick d'écriture serveur. */
+  tickMs: number;
+  /** Snapshot automatique toutes les N entrées de journal. */
+  snapshotEveryEntries: number;
+  /** Snapshot automatique toutes les N millisecondes d'activité. */
+  snapshotEveryMs: number;
+  /** Durée de vie d'un ticket WebSocket. */
+  wsTicketTtlSeconds: number;
+  /** Durée de vie d'une session JWT. */
   sessionTtlSeconds: number;
-  ticketTtlSeconds: number;
+  /** Limite de transactions de claim en vol (garde en mémoire). */
+  maxClaimsInFlight: number;
+  /** Délai d'inactivité avant de décharger un document de la mémoire. */
+  idleDocMs: number;
+  /** Dossier du front statique. */
+  staticDir: string;
 }
 
 let cached: AppConfig | null = null;
 
-function need(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Configuration manquante : variable d'environnement ${name}`);
-  }
-  return value;
-}
-
-function optional(name: string, fallback: string): string {
+function str(name: string, fallback = ''): string {
   return process.env[name] ?? fallback;
 }
 
-function numberVar(name: string, fallback: number): number {
+function int(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
   const value = Number(raw);
@@ -58,34 +82,41 @@ function numberVar(name: string, fallback: number): number {
 export function config(): AppConfig {
   if (cached) return cached;
   cached = {
-    region: optional('AWS_REGION', 'eu-west-3'),
-    documentsTable: need('DOCUMENTS_TABLE'),
-    updatesTable: need('UPDATES_TABLE'),
-    membersTable: need('MEMBERS_TABLE'),
-    connectionsTable: need('CONNECTIONS_TABLE'),
-    creditsTable: need('CREDITS_TABLE'),
-    opIdsTable: need('OPIDS_TABLE'),
-    abuseTable: need('ABUSE_TABLE'),
-    linksTable: need('LINKS_TABLE'),
-    ticketsTable: need('TICKETS_TABLE'),
-    wsTicketsTable: need('WSTICKETS_TABLE'),
-    pdfCacheTable: need('PDFCACHE_TABLE'),
-    versionsTable: need('VERSIONS_TABLE'),
-    pdfBucket: need('PDF_BUCKET'),
-    wsEndpoint: optional('WS_ENDPOINT', ''),
-    jwtSecretParam: need('JWT_SECRET_PARAM'),
-    adminKeyParam: need('ADMIN_KEY_PARAM'),
-    sesSender: need('SES_SENDER'),
-    webOrigin: optional('WEB_ORIGIN', '*'),
-    pdfFunctionName: optional('PDF_FUNCTION_NAME', ''),
-    snapshotFunctionName: optional('SNAPSHOT_FUNCTION_NAME', ''),
-    creditPerDay: numberVar('CREDIT_PER_DAY', 10000),
-    maxUpdateBytes: numberVar('MAX_UPDATE_BYTES', 16 * 1024),
-    blockAfterRefusals: numberVar('BLOCK_AFTER_REFUSALS', 4),
-    pdfUrlTtlSeconds: numberVar('PDF_URL_TTL_SECONDS', 60),
-    snapshotInterval: numberVar('SNAPSHOT_INTERVAL', 50),
-    sessionTtlSeconds: numberVar('SESSION_TTL_SECONDS', 7 * 24 * 3600),
-    ticketTtlSeconds: numberVar('TICKET_TTL_SECONDS', 60),
+    mode: str('APP_MODE', 'production') === 'local' ? 'local' : 'production',
+    region: str('AWS_REGION', 'eu-north-1'),
+    port: int('PORT', 3000),
+    host: str('HOST', '0.0.0.0'),
+
+    documentsTable: str('DOCUMENTS_TABLE', 'Documents'),
+    membersTable: str('MEMBERS_TABLE', 'Members'),
+    updatesTable: str('UPDATES_TABLE', 'Updates'),
+    creditsTable: str('CREDITS_TABLE', 'Credits'),
+    opIdsTable: str('OPIDS_TABLE', 'OpIds'),
+    abuseTable: str('ABUSE_TABLE', 'Abuse'),
+    linksTable: str('LINKS_TABLE', 'Links'),
+    ticketsTable: str('TICKETS_TABLE', 'Tickets'),
+    pdfCacheTable: str('PDFCACHE_TABLE', 'PdfCache'),
+    versionsTable: str('VERSIONS_TABLE', 'Versions'),
+
+    bucket: str('BUCKET', 'editeur-pdf'),
+    pdfQueueUrl: str('PDF_QUEUE_URL', ''),
+    sesSender: str('SES_SENDER', ''),
+    jwtSecretParam: str('JWT_SECRET_PARAM', '/editeur/jwt-secret'),
+    adminKeyParam: str('ADMIN_KEY_PARAM', '/editeur/admin-key'),
+
+    creditPerDay: int('CREDIT_PER_DAY', 10000),
+    maxUpdateBytes: int('MAX_UPDATE_BYTES', 64 * 1024),
+    blockAfterRefusals: int('BLOCK_AFTER_REFUSALS', 4),
+    pdfUrlTtlSeconds: int('PDF_URL_TTL_SECONDS', 60),
+    batchMs: int('BATCH_MS', 300),
+    tickMs: int('TICK_MS', 250),
+    snapshotEveryEntries: int('SNAPSHOT_EVERY_ENTRIES', 50),
+    snapshotEveryMs: int('SNAPSHOT_EVERY_MS', 120_000),
+    wsTicketTtlSeconds: int('WS_TICKET_TTL_SECONDS', 60),
+    sessionTtlSeconds: int('SESSION_TTL_SECONDS', 7 * 24 * 3600),
+    maxClaimsInFlight: int('MAX_CLAIMS_IN_FLIGHT', 50),
+    idleDocMs: int('IDLE_DOC_MS', 30 * 60_000),
+    staticDir: str('STATIC_DIR', './public'),
   };
   return cached;
 }
@@ -93,4 +124,15 @@ export function config(): AppConfig {
 /** Réservé aux tests : force la relecture des variables d'environnement. */
 export function resetConfigCache(): void {
   cached = null;
+}
+
+/** Réglages exposés au front par `GET /config` (aucun secret). */
+export function publicConfig() {
+  const cfg = config();
+  return {
+    batchMs: cfg.batchMs,
+    creditPerDay: cfg.creditPerDay,
+    maxUpdateBytes: cfg.maxUpdateBytes,
+    wsTicketTtlSeconds: cfg.wsTicketTtlSeconds,
+  };
 }

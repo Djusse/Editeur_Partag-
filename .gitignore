@@ -1,27 +1,27 @@
 # Dépendances
 node_modules/
-.pnp/
-.pnp.js
 
 # Builds
 backend/dist/
+build/
+app.tar.gz
 frontend/.next/
 frontend/out/
 *.tsbuildinfo
+
+# Paire de clés SSH (jamais dans le dépôt)
+*.pem
 
 # Environnement / secrets
 .env
 .env.*
 !.env.example
-aws-sam/
-.aws-sam/
 samconfig.local.toml
 
 # Tests et artefacts
-tests/results/*.json
-tests/results/*.log
-coverage/
+tests/results/
 
 # Divers
 .DS_Store
 *.swp
+*.log

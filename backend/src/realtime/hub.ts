@@ -1,0 +1,436 @@
+/**
+ * Hub temps réel — **écrivain unique par document**.
+ *
+ * C'est le cœur du choix EC2 : un seul processus détient chaque document en
+ * mémoire. Trois propriétés en découlent :
+ *
+ *  1. **séquence sans contention** : un seul écrivain fait avancer `seq`, donc
+ *     aucun conflit n'est possible. La condition `seq = :s` reste une garde
+ *     contre un second processus, pas une source de retry ;
+ *  2. **diffusion groupée** : un tick de 250 ms fusionne les updates de tous les
+ *     rédacteurs en **un seul message**. Sans cela, le fan-out serait
+ *     quadratique (300 rédacteurs × 1 update/s × 300 destinataires) ;
+ *  3. **acquittement après durabilité** : un update n'est acquitté qu'une fois
+ *     écrit dans DynamoDB — c'est ce qui garantit C2 même après un plantage,
+ *     puisque les clients renvoient alors les updates non acquittés.
+ */
+import { WebSocket } from 'ws';
+import * as Y from 'yjs';
+import { config } from '../lib/config';
+import { db } from '../lib/db';
+import { WsErrorCodes } from '../lib/errors';
+import { sha256Hex, sleep, utcDay } from '../lib/ids';
+import { recordCreditRefusal } from '../lib/credits';
+import { putObject, snapshotKey } from '../lib/s3';
+import type { OpIdRow } from '../lib/types';
+
+export interface Client {
+  id: string;
+  socket: WebSocket;
+  email: string;
+  name: string;
+  color: string;
+  docId: string;
+  /** Dernier `seq` connu de ce client. */
+  seq: number;
+  cursor: number | null;
+  awareness?: string;
+}
+
+export interface IncomingUpdate {
+  client: Client;
+  opId: string;
+  payload: Uint8Array;
+  chars: number;
+  inserted: number;
+  deleted: number;
+  hash: string;
+}
+
+export function hashOf(payload: Uint8Array): string {
+  return sha256Hex(payload);
+}
+
+/** État d'un document, entièrement en mémoire. */
+export class DocumentState {
+  readonly docId: string;
+  readonly ydoc: Y.Doc;
+  readonly clients = new Set<Client>();
+  seq: number;
+  latestSnapshotSeq: number;
+  textLength: number;
+  lastActivity: number;
+
+  private queue: IncomingUpdate[] = [];
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private committing = false;
+  private lastSnapshotAt = Date.now();
+  private entriesSinceSnapshot = 0;
+
+  constructor(docId: string, seq: number, state: Uint8Array | undefined, latestSnapshotSeq: number, textLength: number) {
+    this.docId = docId;
+    this.ydoc = new Y.Doc();
+    if (state) Y.applyUpdate(this.ydoc, state);
+    this.seq = seq;
+    this.latestSnapshotSeq = latestSnapshotSeq;
+    this.textLength = textLength;
+    this.lastActivity = Date.now();
+  }
+
+  enqueue(update: IncomingUpdate): void {
+    this.queue.push(update);
+    this.lastActivity = Date.now();
+    this.ensureTimer();
+  }
+
+  /** Remet un lot non écrit en tête de file (crédit refusé, conflit, etc.). */
+  replay(updates: IncomingUpdate[]): void {
+    this.queue.unshift(...updates);
+    this.ensureTimer();
+  }
+
+  pendingCount(): number {
+    return this.queue.length;
+  }
+
+  private ensureTimer(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      void this.tick();
+    }, config().tickMs);
+    this.timer.unref?.();
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  private async tick(): Promise<void> {
+    if (this.committing || this.queue.length === 0) {
+      if (this.queue.length === 0 && this.clients.size === 0) this.stop();
+      return;
+    }
+
+    this.committing = true;
+    const batch = this.queue.splice(0, this.queue.length);
+    try {
+      await commitBatch(this, batch);
+    } catch (error) {
+      console.error('Échec du tick d\'écriture', { docId: this.docId, error });
+      this.replay(batch);
+    } finally {
+      this.committing = false;
+    }
+  }
+
+  /** Force l'écriture immédiate (tests, arrêt propre). */
+  async flush(): Promise<void> {
+    while (this.committing) await sleep(20);
+    if (this.queue.length === 0) return;
+    this.committing = true;
+    const batch = this.queue.splice(0, this.queue.length);
+    try {
+      await commitBatch(this, batch);
+    } finally {
+      this.committing = false;
+    }
+  }
+
+  markSnapshot(seq: number): void {
+    this.latestSnapshotSeq = seq;
+    this.lastSnapshotAt = Date.now();
+    this.entriesSinceSnapshot = 0;
+  }
+
+  noteEntry(): void {
+    this.entriesSinceSnapshot++;
+  }
+
+  shouldSnapshot(): boolean {
+    const cfg = config();
+    if (this.entriesSinceSnapshot >= cfg.snapshotEveryEntries) return true;
+    return this.entriesSinceSnapshot > 0 && Date.now() - this.lastSnapshotAt >= cfg.snapshotEveryMs;
+  }
+}
+
+/** Envoie un message JSON à un client si la connexion est ouverte. */
+export function send(client: Client, message: unknown): void {
+  if (client.socket.readyState === WebSocket.OPEN) {
+    client.socket.send(JSON.stringify(message));
+  }
+}
+
+async function currentCreditRemaining(email: string): Promise<number> {
+  const cfg = config();
+  const row = await db().get<{ used: number; limit: number }>(cfg.creditsTable, { id: `${email}#${utcDay()}` });
+  const limit = row?.limit ?? cfg.creditPerDay;
+  return Math.max(0, limit - (row?.used ?? 0));
+}
+
+/**
+ * Écrit un lot d'updates dans **une seule** transaction atomique.
+ *
+ * Éléments (tous distincts, condition d'atomicité) :
+ *  1. `Documents`   : `SET seq = :next`, condition `seq = :current`
+ *  2. `Updates`     : Put du journal (updates fusionnés), condition `attribute_not_exists`
+ *  3. `Credits`     : un élément **par expéditeur**, `ADD used :chars`
+ *  4. `OpIds[OP#]`  : un marqueur par update, condition `attribute_not_exists`
+ *  5. `OpIds[HASH#]`: un marqueur par contenu, condition `attribute_not_exists`
+ *
+ * Tout réussit ou rien n'est appliqué : ni trou de `seq`, ni crédit débité pour
+ * un update non persisté, ni marqueur sans update.
+ */
+export async function commitBatch(state: DocumentState, batch: IncomingUpdate[]): Promise<void> {
+  const cfg = config();
+  const day = utcDay();
+  const ttl = Math.floor(Date.now() / 1000) + 48 * 3600;
+
+  // Doublons dans un même lot : ils casseraient la transaction (même clé).
+  const seenOp = new Set<string>();
+  const seenHash = new Set<string>();
+  const unique: IncomingUpdate[] = [];
+  for (const update of batch) {
+    const opKey = `OP#${update.client.email}#${update.opId}`;
+    if (seenOp.has(opKey) || seenHash.has(update.hash)) continue;
+    seenOp.add(opKey);
+    seenHash.add(update.hash);
+    unique.push(update);
+  }
+  if (unique.length === 0) return;
+
+  const byAuthor = new Map<string, IncomingUpdate[]>();
+  for (const update of unique) {
+    const list = byAuthor.get(update.client.email) ?? [];
+    list.push(update);
+    byAuthor.set(update.client.email, list);
+  }
+
+  const nextSeq = state.seq + 1;
+  const merged = Y.mergeUpdates(unique.map((update) => update.payload));
+  const insertedTotal = unique.reduce((sum, update) => sum + update.inserted, 0);
+  const deletedTotal = unique.reduce((sum, update) => sum + update.deleted, 0);
+
+  const entries: Parameters<ReturnType<typeof db>['transact']>[0] = [
+    {
+      Update: {
+        table: cfg.documentsTable,
+        key: { docId: state.docId },
+        update: 'SET seq = :next, updatedAt = :now, textLength = :len',
+        condition: 'seq = :current',
+        values: {
+          ':next': nextSeq,
+          ':current': state.seq,
+          ':now': new Date().toISOString(),
+          ':len': Math.max(0, state.textLength + insertedTotal - deletedTotal),
+        },
+      },
+    },
+    {
+      Put: {
+        table: cfg.updatesTable,
+        item: {
+          docId: state.docId,
+          seq: nextSeq,
+          payload: merged,
+          chars: insertedTotal + deletedTotal,
+          ops: unique.map((update) => ({
+            opId: update.opId,
+            authorEmail: update.client.email,
+            chars: update.chars,
+          })),
+          createdAt: new Date().toISOString(),
+        },
+        condition: 'attribute_not_exists(seq)',
+      },
+    },
+  ];
+
+  // On retient l'auteur de chaque élément `Credits` : l'indice dans
+  // `CancellationReasons` permet ensuite d'identifier **le seul** fautif.
+  const creditAuthorByIndex = new Map<number, string>();
+
+  for (const [email, updates] of byAuthor) {
+    const chars = updates.reduce((sum, update) => sum + update.chars, 0);
+    creditAuthorByIndex.set(entries.length, email);
+    entries.push({
+      Update: {
+        table: cfg.creditsTable,
+        key: { id: `${email}#${day}` },
+        update: 'ADD used :chars SET email = :email, #day = :day, #limit = :limit, #ttl = :ttl',
+        // Sur un compteur absent, `attribute_not_exists(used)` seul laisserait
+        // passer une première écriture supérieure au plafond.
+        condition: '(attribute_not_exists(used) AND :chars <= :limit) OR (used + :chars <= :limit)',
+        names: { '#day': 'day', '#limit': 'limit', '#ttl': 'ttl' },
+        values: {
+          ':chars': chars,
+          ':email': email,
+          ':day': day,
+          ':limit': cfg.creditPerDay,
+          ':ttl': ttl,
+        },
+      },
+    });
+  }
+
+  for (const update of unique) {
+    entries.push({
+      Put: {
+        table: cfg.opIdsTable,
+        item: {
+          id: `OP#${update.client.email}#${update.opId}`,
+          hash: update.hash,
+          seq: nextSeq,
+          email: update.client.email,
+          docId: state.docId,
+          ttl,
+        },
+        condition: 'attribute_not_exists(id)',
+      },
+    });
+    entries.push({
+      Put: {
+        table: cfg.opIdsTable,
+        item: {
+          id: `HASH#${state.docId}#${update.hash}`,
+          hash: update.hash,
+          seq: nextSeq,
+          email: update.client.email,
+          docId: state.docId,
+          ttl,
+        },
+        condition: 'attribute_not_exists(id)',
+      },
+    });
+  }
+
+  const outcome = await db().transact(entries);
+
+  if (outcome.ok) {
+    applyAndBroadcast(state, merged, nextSeq, unique);
+    return;
+  }
+
+  const reasons = outcome.reasons ?? [];
+
+  // Quels expéditeurs ont réellement échoué sur le crédit ?
+  const rejected = new Set<string>();
+  for (const [index, email] of creditAuthorByIndex) {
+    if (reasons[index]?.code === 'ConditionalCheckFailed') rejected.add(email);
+  }
+
+  const opConflict =
+    rejected.size === 0 && reasons.some((reason) => reason.code === 'ConditionalCheckFailed');
+
+  if (rejected.size > 0) {
+    // Un seul refus ne doit pas bloquer les autres rédacteurs du même tick :
+    // on retire les fautifs et on relance immédiatement les survivants.
+    for (const email of rejected) {
+      const own = unique.filter((update) => update.client.email === email);
+      if (own.length === 0) continue;
+      const refusal = await recordCreditRefusal(email, own[0].opId);
+      const remaining = await currentCreditRemaining(email);
+      for (const update of own) {
+        send(update.client, {
+          type: 'error',
+          code: WsErrorCodes.creditExhausted,
+          opId: update.opId,
+          creditRemaining: remaining,
+          ...(refusal.blockedUntil ? { blockedUntil: refusal.blockedUntil } : {}),
+        });
+      }
+    }
+
+    const survivors = unique.filter((update) => !rejected.has(update.client.email));
+    if (survivors.length > 0) await commitBatch(state, survivors);
+    return;
+  }
+
+  if (opConflict) {
+    // Idempotence : un opId (ou un contenu) déjà accepté renvoie l'ack d'origine.
+    const duplicates: IncomingUpdate[] = [];
+    const fresh: IncomingUpdate[] = [];
+    for (const update of unique) {
+      const marker =
+        (await db().get<OpIdRow>(cfg.opIdsTable, { id: `OP#${update.client.email}#${update.opId}` })) ??
+        (await db().get<OpIdRow>(cfg.opIdsTable, { id: `HASH#${state.docId}#${update.hash}` }));
+      if (marker) duplicates.push(update);
+      else fresh.push(update);
+    }
+
+    for (const update of duplicates) {
+      send(update.client, {
+        type: 'ack',
+        opIds: [update.opId],
+        seq: state.seq,
+        creditRemaining: await currentCreditRemaining(update.client.email),
+      });
+    }
+    if (fresh.length > 0) state.replay(fresh);
+    return;
+  }
+
+  // Conflit de séquence (autre processus, ou redémarrage) : on rejoue le lot.
+  state.replay(unique);
+}
+
+/** Applique l'update fusionné en mémoire et diffuse **un seul** message. */
+function applyAndBroadcast(
+  state: DocumentState,
+  merged: Uint8Array,
+  seq: number,
+  accepted: IncomingUpdate[],
+): void {
+  Y.applyUpdate(state.ydoc, merged);
+  state.seq = seq;
+  state.textLength = state.ydoc.getText('content').length;
+  state.noteEntry();
+
+  const payload = Buffer.from(merged).toString('base64');
+  for (const client of state.clients) {
+    if (client.socket.readyState !== WebSocket.OPEN) continue;
+    client.seq = seq;
+    client.socket.send(JSON.stringify({ type: 'update', seq, documentId: state.docId, payload }));
+  }
+
+  // Un `ack` par expéditeur, avec la liste de ses `opIds` acquittés.
+  const byClient = new Map<Client, string[]>();
+  for (const update of accepted) {
+    const list = byClient.get(update.client) ?? [];
+    list.push(update.opId);
+    byClient.set(update.client, list);
+  }
+
+  void (async () => {
+    for (const [client, opIds] of byClient) {
+      send(client, {
+        type: 'ack',
+        opIds,
+        seq,
+        creditRemaining: await currentCreditRemaining(client.email),
+      });
+    }
+    await maybeSnapshot(state);
+  })();
+}
+
+/** Snapshot S3 : borne la taille du rattrapage et sert de base au PDF. */
+async function maybeSnapshot(state: DocumentState): Promise<void> {
+  if (!state.shouldSnapshot()) return;
+  try {
+    const snapshot = Y.encodeStateAsUpdate(state.ydoc);
+    await putObject(snapshotKey(state.docId, state.seq), snapshot, 'application/octet-stream');
+    await db().update(
+      config().documentsTable,
+      { docId: state.docId },
+      {
+        update: 'SET latestSnapshotSeq = :seq',
+        condition: 'attribute_not_exists(latestSnapshotSeq) OR latestSnapshotSeq < :seq',
+        values: { ':seq': state.seq },
+      },
+    );
+    state.markSnapshot(state.seq);
+  } catch (error) {
+    console.warn('Snapshot ignoré', { docId: state.docId, error });
+  }
+}

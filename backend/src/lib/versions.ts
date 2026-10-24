@@ -1,132 +1,159 @@
 /**
- * Versions consultables et restauration.
+ * Versions et restauration.
  *
- * Une version = un snapshot S3 (`snapshots/{docId}/{seq}`) + le `seq` associé.
- * La restauration est compatible CRDT : on **applique un nouvel update** qui
- * remplace le texte courant par celui de la version choisie, l'historique est
- * conservé et la restauration est gratuite côté crédit (update système).
+ * Règle du plan v7 (correction 4.2-3) : une version est créée
+ * **automatiquement** (toutes les 50 entrées de journal ou toutes les 2 minutes
+ * d'activité), et **un snapshot du texte courant est pris avant chaque
+ * restauration**. Sans ce second point, la phrase « le texte actuel reste dans
+ * l'historique » serait fausse.
+ *
+ * L'interface n'expose donc **aucun bouton de création manuelle** de version.
  */
 import * as Y from 'yjs';
 import { config } from './config';
-import { getItem, putItem, query } from './db';
-import { badRequest, notFound } from './errors';
+import { db } from './db';
+import { invalidInput, notFound } from './errors';
 import { getObject, putObject, snapshotKey } from './s3';
-import { commitUpdate, loadDocumentState } from './updates';
+import { manager } from '../realtime/manager';
+import { hashOf } from '../realtime/hub';
 import { randomToken } from './ids';
 import type { VersionRow } from './types';
 
 export interface VersionSummary {
   n: number;
-  chars: number;
   createdAt: string;
   authorName: string;
-  label: string;
+  chars: number;
 }
 
 export async function listVersions(docId: string): Promise<VersionSummary[]> {
-  const result = await query<VersionRow>({
-    table: config().versionsTable,
+  const result = await db().query<VersionRow>(config().versionsTable, {
     keyCondition: 'docId = :docId',
     values: { ':docId': docId },
     scanForward: false,
     limit: 100,
   });
-  return result.items.map((row, index) => ({
+  return result.items.map((row) => ({
     n: row.n,
-    chars: row.chars,
     createdAt: row.createdAt,
     authorName: row.authorName,
-    label: index === 0 ? 'Version la plus récente' : `Version ${row.n}`,
+    chars: row.chars,
   }));
 }
 
-/**
- * Crée une version nommée (snapshot explicite) à partir du journal courant.
- * Appelée par le handler `POST /documents/{id}/versions`.
- */
-export async function createVersion(input: {
+/** Enregistre une version (snapshot S3 + ligne `Versions`). Idempotent. */
+export async function saveVersion(input: {
   docId: string;
   seq: number;
   state: Uint8Array;
+  chars: number;
   authorEmail: string;
   authorName: string;
-  chars: number;
-}): Promise<VersionRow> {
+}): Promise<void> {
   const key = snapshotKey(input.docId, input.seq);
   await putObject(key, input.state, 'application/octet-stream');
-  const row: VersionRow = {
-    docId: input.docId,
-    n: input.seq,
-    s3Key: key,
-    authorEmail: input.authorEmail,
-    authorName: input.authorName,
-    chars: input.chars,
-    createdAt: new Date().toISOString(),
-  };
-  await putItem(config().versionsTable, row as unknown as Record<string, unknown>, {
-    condition: 'attribute_not_exists(n)',
-  }).catch((error: unknown) => {
-    if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
-  });
-  return row;
-}
-
-/** Texte d'une version : snapshot demandé + updates jusqu'à `n`. */
-export async function versionText(docId: string, n: number): Promise<string> {
-  const row = await getItem<VersionRow>(config().versionsTable, { docId, n });
-  if (!row) throw notFound('VERSION_NOT_FOUND', 'Version inconnue');
-  const snapshot = await getObject(row.s3Key);
-  const updates = await query<{ seq: number; payload: Uint8Array }>({
-    table: config().updatesTable,
-    keyCondition: 'docId = :docId AND seq > :n',
-    values: { ':docId': docId, ':n': n },
-    scanForward: true,
-  });
-  // Le snapshot `n` contient déjà tout l'état ≤ n : rien à rejouer.
-  const doc = new Y.Doc();
-  Y.applyUpdate(doc, snapshot);
-  return doc.getText('content').toString();
+  await db()
+    .put(
+      config().versionsTable,
+      {
+        docId: input.docId,
+        n: input.seq,
+        s3Key: key,
+        authorEmail: input.authorEmail,
+        authorName: input.authorName,
+        chars: input.chars,
+        createdAt: new Date().toISOString(),
+      },
+      { condition: 'attribute_not_exists(n)' },
+    )
+    .catch((error: unknown) => {
+      if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
+    });
 }
 
 /**
- * Restauration : produit un update Yjs qui remplace le texte courant par celui
- * de la version choisie. Appliqué comme un update normal (mais gratuit).
+ * Restaure une version.
  *
- * Point crucial : l'update est calculé sur un `Y.Doc` qui contient **l'état
- * courant réel**. Calculer la différence sur un document vide produirait des
- * insertions sans suppression, qui s'ajouteraient au texte existant chez les
- * autres clients au lieu de le remplacer.
+ * 1. Snapshot du texte **courant** (pour qu'il reste dans l'historique).
+ * 2. Application d'un **nouvel update** qui remplace le texte par celui de la
+ *    version choisie : compatible CRDT, historique conservé, **gratuit** en
+ *    crédit (update système).
  */
-export async function buildRestoreUpdate(docId: string, n: number): Promise<Uint8Array> {
-  const row = await getItem<VersionRow>(config().versionsTable, { docId, n });
-  if (!row) throw notFound('VERSION_NOT_FOUND', 'Version inconnue');
-  const snapshot = await getObject(row.s3Key);
+export async function restoreVersion(
+  docId: string,
+  n: number,
+  authorEmail: string,
+  authorName: string,
+): Promise<number> {
+  if (!Number.isInteger(n) || n <= 0) throw invalidInput('n', 'Numéro de version invalide.');
 
+  const version = await db().get<VersionRow>(config().versionsTable, { docId, n });
+  if (!version) throw notFound('Version inconnue.');
+
+  const state = await manager.load(docId);
+
+  // 1. Sauvegarde de l'état courant avant écrasement.
+  const currentSnapshot = Y.encodeStateAsUpdate(state.ydoc);
+  await saveVersion({
+    docId,
+    seq: state.seq,
+    state: currentSnapshot,
+    chars: state.ydoc.getText('content').length,
+    authorEmail: 'system',
+    authorName: 'Sauvegarde automatique',
+  });
+
+  // 2. Texte cible.
+  const archived = await getObject(version.s3Key);
   const target = new Y.Doc();
-  Y.applyUpdate(target, snapshot);
+  Y.applyUpdate(target, archived);
   const targetText = target.getText('content').toString();
+  target.destroy();
 
-  const current = new Y.Doc();
-  const state = await loadDocumentState(docId);
-  if (state.snapshot) Y.applyUpdate(current, state.snapshot);
-  for (const update of state.updates) Y.applyUpdate(current, update.payload);
+  // 3. Différence calculée sur l'état **courant réel** : calculer sur un
+  // document vide produirait des insertions sans suppression, donc une
+  // duplication chez les autres clients au lieu d'un remplacement.
+  const update = buildReplacementUpdate(state.ydoc, targetText);
+  if (update.length === 0) return state.seq;
 
-  return buildReplacementUpdate(current, targetText);
+  const systemClient = {
+    id: `system_restore_${randomToken(6)}`,
+    socket: { readyState: 1, send: () => undefined } as never,
+    email: authorEmail,
+    name: authorName,
+    color: '#2563EB',
+    docId,
+    seq: state.seq,
+    cursor: null,
+  };
+
+  state.enqueue({
+    client: systemClient,
+    opId: `restore_${randomToken(10)}`,
+    payload: update,
+    // Restauration gratuite : aucun caractère facturé.
+    chars: 0,
+    inserted: 0,
+    deleted: 0,
+    hash: hashOf(update),
+  });
+
+  await state.flush();
+  return state.seq;
 }
 
-/** Produit un update unique qui remplace le contenu par `targetText`. */
-function buildReplacementUpdate(current: Y.Doc, targetText: string): Uint8Array {
-  const text = current.getText('content');
+/** Produit un update qui remplace le texte courant par `targetText`. */
+export function buildReplacementUpdate(ydoc: Y.Doc, targetText: string): Uint8Array {
+  const text = ydoc.getText('content');
   const captured: Uint8Array[] = [];
   const origin = Symbol('restore');
   const listener = (update: Uint8Array, updateOrigin: unknown) => {
     if (updateOrigin === origin) captured.push(update);
   };
-  current.on('update', listener);
+
+  ydoc.on('update', listener);
   try {
-    current.transact(() => {
-      // Différences de préfixe/suffixe : on ne touche qu'à la partie qui change,
-      // ce qui préserve les identifiants CRDT du texte commun.
+    ydoc.transact(() => {
       const existing = text.toString();
       let start = 0;
       const maxStart = Math.min(existing.length, targetText.length);
@@ -134,7 +161,11 @@ function buildReplacementUpdate(current: Y.Doc, targetText: string): Uint8Array 
 
       let endExisting = existing.length;
       let endTarget = targetText.length;
-      while (endExisting > start && endTarget > start && existing[endExisting - 1] === targetText[endTarget - 1]) {
+      while (
+        endExisting > start &&
+        endTarget > start &&
+        existing[endExisting - 1] === targetText[endTarget - 1]
+      ) {
         endExisting--;
         endTarget--;
       }
@@ -143,32 +174,8 @@ function buildReplacementUpdate(current: Y.Doc, targetText: string): Uint8Array 
       if (endTarget > start) text.insert(start, targetText.slice(start, endTarget));
     }, origin);
   } finally {
-    current.off('update', listener);
+    ydoc.off('update', listener);
   }
-  return Y.mergeUpdates(captured);
-}
 
-/** Applique la restauration en tant qu'update système (crédit non débité). */
-export async function restoreVersion(input: {
-  docId: string;
-  n: number;
-  authorEmail: string;
-  authorName: string;
-}): Promise<{ seq: number }> {
-  const update = await buildRestoreUpdate(input.docId, input.n);
-  const result = await commitUpdate({
-    docId: input.docId,
-    authorEmail: input.authorEmail,
-    authorName: input.authorName,
-    opId: `restore_${randomToken(8)}`,
-    payload: update,
-    chargeCredit: false,
-  });
-  return { seq: result.seq };
-}
-
-export function validateVersionNumber(raw: unknown): number {
-  const n = Math.floor(Number(raw));
-  if (!Number.isFinite(n) || n <= 0) throw badRequest('INVALID_VERSION', 'Numéro de version invalide');
-  return n;
+  return captured.length > 0 ? Y.mergeUpdates(captured) : new Uint8Array();
 }

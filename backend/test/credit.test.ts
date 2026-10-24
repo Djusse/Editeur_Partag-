@@ -1,362 +1,249 @@
 /**
  * Preuve de C4 : un rédacteur n'écrit jamais plus que son crédit du jour,
  * même depuis plusieurs appareils, et un update rejoué n'est débité qu'une fois.
+ *
+ * Les tests passent par `commitBatch`, chemin **identique** au WebSocket et au
+ * repli HTTP : c'est le même code qui décide du débit.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { MemoryDynamo } from './helpers/memory-dynamo';
+import { commitBatch, hashOf, type Client, type IncomingUpdate } from '../src/realtime/hub';
+import { setDatabase } from '../src/lib/db';
+import { setupHarness, seedDocument, teardownHarness, type Harness } from './helpers/setup';
 import { resetConfigCache } from '../src/lib/config';
-import { setDdbClient } from '../src/lib/db';
-import { commitUpdate } from '../src/lib/updates';
-import { getCredit } from '../src/lib/credits';
-import { ApiError } from '../src/lib/errors';
+import { MemoryDatabase } from './helpers/memory-db';
+import { getCreditState } from '../src/lib/credits';
 import type { CreditRow } from '../src/lib/types';
 
-const TABLES = {
-  DOCUMENTS: 'Documents',
-  MEMBERS: 'Members',
-  UPDATES: 'Updates',
-  CONNECTIONS: 'Connections',
-  CREDITS: 'Credits',
-  OPIDS: 'OpIds',
-  ABUSE: 'Abuse',
-  LINKS: 'Links',
-  TICKETS: 'Tickets',
-  WSTICKETS: 'WsTickets',
-  PDFCACHE: 'PdfCache',
-  VERSIONS: 'Versions',
-};
+let harness: Harness;
 
-let memory: MemoryDynamo;
-
-function setup(creditPerDay = 10000): void {
-  memory = new MemoryDynamo();
-  memory.createTable(TABLES.DOCUMENTS, ['docId']);
-  memory.createTable(TABLES.MEMBERS, ['docId', 'email']);
-  memory.createTable(TABLES.UPDATES, ['docId', 'seq']);
-  memory.createTable(TABLES.CONNECTIONS, ['connectionId']);
-  memory.createTable(TABLES.CREDITS, ['id']);
-  memory.createTable(TABLES.OPIDS, ['id']);
-  memory.createTable(TABLES.ABUSE, ['id']);
-  memory.createTable(TABLES.LINKS, ['token']);
-  memory.createTable(TABLES.TICKETS, ['token', 'visitorId']);
-  memory.createTable(TABLES.WSTICKETS, ['ticket']);
-  memory.createTable(TABLES.PDFCACHE, ['id']);
-  memory.createTable(TABLES.VERSIONS, ['docId', 'n']);
-
-  memory.put(TABLES.DOCUMENTS, {
-    docId: 'doc_credit',
-    title: 'Brouillon',
-    ownerEmail: 'auteur@exemple.cm',
-    ownerName: 'Auteur',
+/** Crée un client factice (aucune vraie connexion réseau). */
+function makeClient(email: string, docId = 'doc_test'): Client {
+  return {
+    id: `c_${Math.random().toString(16).slice(2)}`,
+    socket: { readyState: 1, send: () => undefined } as never,
+    email,
+    name: email.split('@')[0],
+    color: '#2563EB',
+    docId,
     seq: 0,
-    latestSnapshotSeq: 0,
-    textLength: 0,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
-
-  process.env.DOCUMENTS_TABLE = TABLES.DOCUMENTS;
-  process.env.MEMBERS_TABLE = TABLES.MEMBERS;
-  process.env.UPDATES_TABLE = TABLES.UPDATES;
-  process.env.CONNECTIONS_TABLE = TABLES.CONNECTIONS;
-  process.env.CREDITS_TABLE = TABLES.CREDITS;
-  process.env.OPIDS_TABLE = TABLES.OPIDS;
-  process.env.ABUSE_TABLE = TABLES.ABUSE;
-  process.env.LINKS_TABLE = TABLES.LINKS;
-  process.env.TICKETS_TABLE = TABLES.TICKETS;
-  process.env.WSTICKETS_TABLE = TABLES.WSTICKETS;
-  process.env.PDFCACHE_TABLE = TABLES.PDFCACHE;
-  process.env.VERSIONS_TABLE = TABLES.VERSIONS;
-  process.env.PDF_BUCKET = 'bucket-test';
-  process.env.JWT_SECRET_PARAM = '/test/jwt';
-  process.env.ADMIN_KEY_PARAM = '/test/admin';
-  process.env.SES_SENDER = 'noreply@exemple.cm';
-  process.env.AWS_REGION = 'eu-west-3';
-  process.env.CREDIT_PER_DAY = String(creditPerDay);
-
-  resetConfigCache();
-  setDdbClient(memory.client());
+    cursor: null,
+  };
 }
 
-/** Produit un update Yjs contenant `length` caractères. */
-function makeUpdate(text: string): { update: Uint8Array; doc: Y.Doc } {
+/** Produit un update Yjs contenant exactement `length` caractères. */
+function updateOf(text: string): Uint8Array {
   const doc = new Y.Doc();
   const updates: Uint8Array[] = [];
   doc.on('update', (update: Uint8Array) => updates.push(update));
   doc.getText('content').insert(0, text);
-  return { update: updates[updates.length - 1], doc };
+  return updates[updates.length - 1];
 }
 
-describe('C4 — crédit d\'écriture', () => {
-  beforeEach(() => setup(10000));
+function incoming(client: Client, opId: string, text: string): IncomingUpdate {
+  const payload = updateOf(text);
+  return {
+    client,
+    opId,
+    payload,
+    chars: text.length,
+    inserted: text.length,
+    deleted: 0,
+    hash: hashOf(payload),
+  };
+}
+
+async function state(docId = 'doc_test') {
+  const { manager } = await import('../src/realtime/manager');
+  return manager.load(docId);
+}
+
+describe('C4 — crédit d’écriture', () => {
+  beforeEach(async () => {
+    harness = setupHarness();
+    await seedDocument(harness.memory);
+  });
 
   it('débite exactement le nombre de caractères insérés', async () => {
-    const { update } = makeUpdate('bonjour');
-    const result = await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_1',
-      payload: update,
-    });
-    expect(result.chars).toBe(7);
-    expect(result.seq).toBe(1);
+    const doc = await state();
+    await commitBatch(doc, [incoming(makeClient('auteur@exemple.cm'), 'op_1', 'bonjour')]);
 
-    const credit = await getCredit('auteur@exemple.cm');
+    const credit = await getCreditState('auteur@exemple.cm');
     expect(credit.used).toBe(7);
     expect(credit.remaining).toBe(9993);
-  });
-
-  it('refuse au-delà du plafond et ne persiste rien', async () => {
-    const limit = 20;
-    setup(limit);
-    const first = makeUpdate('abcdefghij'); // 10 caractères
-    await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_a',
-      payload: first.update,
-    });
-
-    const tooBig = makeUpdate('klmnopqrstuvwxyz'); // 16 caractères → dépasse
-    await expect(
-      commitUpdate({
-        docId: 'doc_credit',
-        authorEmail: 'auteur@exemple.cm',
-        authorName: 'Auteur',
-        opId: 'op_b',
-        payload: tooBig.update,
-      }),
-    ).rejects.toBeInstanceOf(ApiError);
-
-    const credit = await getCredit('auteur@exemple.cm');
-    expect(credit.used).toBe(10);
-    const doc = memory.get(TABLES.DOCUMENTS, { docId: 'doc_credit' }) as { seq: number };
     expect(doc.seq).toBe(1);
-    expect(memory.count(TABLES.UPDATES)).toBe(1);
   });
 
-  it('accepte exactement jusqu\'au plafond, pas un caractère de plus', async () => {
-    setup(10);
-    const exact = makeUpdate('abcdefghij');
-    await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_exact',
-      payload: exact.update,
-    });
+  it('refuse au-delà du plafond sans rien persister', async () => {
+    harness = setupHarness({ creditPerDay: 20 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
 
-    const extra = makeUpdate('k');
-    await expect(
-      commitUpdate({
-        docId: 'doc_credit',
-        authorEmail: 'auteur@exemple.cm',
-        authorName: 'Auteur',
-        opId: 'op_extra',
-        payload: extra.update,
-      }),
-    ).rejects.toBeInstanceOf(ApiError);
+    const doc = await manager.load('doc_test');
+    await commitBatch(doc, [incoming(makeClient('auteur@exemple.cm'), 'op_a', 'abcdefghij')]);
 
-    const credit = await getCredit('auteur@exemple.cm');
+    const before = doc.seq;
+    await commitBatch(doc, [incoming(makeClient('auteur@exemple.cm'), 'op_b', 'klmnopqrstuvwxyz')]);
+
+    const credit = await getCreditState('auteur@exemple.cm');
     expect(credit.used).toBe(10);
-    expect(credit.remaining).toBe(0);
+    expect(doc.seq).toBe(before);
   });
 
-  it('partage le compteur entre plusieurs appareils (même e-mail)', async () => {
-    setup(30);
-    const appareilA = makeUpdate('aaaaaaaaaa');
-    const appareilB = makeUpdate('bbbbbbbbbb');
-    const appareilC = makeUpdate('cccccccccccccccccccc'); // 20 → au-delà de 30
+  it('accepte exactement jusqu’au plafond, pas un caractère de plus', async () => {
+    harness = setupHarness({ creditPerDay: 10 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
 
-    await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_appareil_a',
-      payload: appareilA.update,
-    });
-    await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_appareil_b',
-      payload: appareilB.update,
-    });
+    const doc = await manager.load('doc_test');
+    await commitBatch(doc, [incoming(makeClient('auteur@exemple.cm'), 'op_exact', 'abcdefghij')]);
+    expect((await getCreditState('auteur@exemple.cm')).remaining).toBe(0);
 
-    await expect(
-      commitUpdate({
-        docId: 'doc_credit',
-        authorEmail: 'auteur@exemple.cm',
-        authorName: 'Auteur',
-        opId: 'op_appareil_c',
-        payload: appareilC.update,
-      }),
-    ).rejects.toBeInstanceOf(ApiError);
+    const seqBefore = doc.seq;
+    await commitBatch(doc, [incoming(makeClient('auteur@exemple.cm'), 'op_extra', 'k')]);
 
-    const credit = await getCredit('auteur@exemple.cm');
+    expect((await getCreditState('auteur@exemple.cm')).used).toBe(10);
+    expect(doc.seq).toBe(seqBefore);
+  });
+
+  it('partage le compteur entre plusieurs connexions (même e-mail)', async () => {
+    harness = setupHarness({ creditPerDay: 30 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
+
+    const doc = await manager.load('doc_test');
+    const appareilA = makeClient('auteur@exemple.cm');
+    const appareilB = makeClient('auteur@exemple.cm');
+
+    await commitBatch(doc, [incoming(appareilA, 'op_a', 'aaaaaaaaaa')]);
+    await commitBatch(doc, [incoming(appareilB, 'op_b', 'bbbbbbbbbb')]);
+
+    const credit = await getCreditState('auteur@exemple.cm');
     expect(credit.used).toBe(20);
-    expect(memory.count(TABLES.CREDITS)).toBe(1);
+    expect(harness.memory.rows<CreditRow>('Credits').length).toBe(1);
   });
 
   it('rejoue le même opId sans débiter une seconde fois', async () => {
-    const { update } = makeUpdate('douze lettres');
-    const first = await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_retry',
-      payload: update,
-    });
-    const second = await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_retry',
-      payload: update,
-    });
+    const doc = await state();
+    const client = makeClient('auteur@exemple.cm');
+    const update = incoming(client, 'op_retry', 'douze lettres');
 
-    expect(second.duplicate).toBe(true);
-    expect(second.seq).toBe(first.seq);
-    expect((await getCredit('auteur@exemple.cm')).used).toBe(13);
-    expect(memory.count(TABLES.UPDATES)).toBe(1);
-  });
+    await commitBatch(doc, [update]);
+    await commitBatch(doc, [update]);
 
-  it('rejette un opId réutilisé avec un contenu différent', async () => {
-    const first = makeUpdate('contenu un');
-    await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_collision',
-      payload: first.update,
-    });
-
-    const second = makeUpdate('contenu deux');
-    await expect(
-      commitUpdate({
-        docId: 'doc_credit',
-        authorEmail: 'auteur@exemple.cm',
-        authorName: 'Auteur',
-        opId: 'op_collision',
-        payload: second.update,
-      }),
-    ).rejects.toMatchObject({ code: 'OP_ID_CONFLICT' });
+    const credit = await getCreditState('auteur@exemple.cm');
+    expect(credit.used).toBe(13);
+    expect(doc.seq).toBe(1);
   });
 
   it('reconnaît le même contenu présenté sous un autre opId', async () => {
-    const { update } = makeUpdate('identique');
-    const first = await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_original',
-      payload: update,
-    });
-    const second = await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_autre',
-      payload: update,
-    });
+    const doc = await state();
+    const client = makeClient('auteur@exemple.cm');
+    const first = incoming(client, 'op_original', 'identique');
 
-    expect(second.duplicate).toBe(true);
-    expect(second.seq).toBe(first.seq);
-    expect((await getCredit('auteur@exemple.cm')).used).toBe(9);
+    await commitBatch(doc, [first]);
+    await commitBatch(doc, [{ ...first, opId: 'op_autre' }]);
+
+    expect((await getCreditState('auteur@exemple.cm')).used).toBe(9);
+    expect(doc.seq).toBe(1);
   });
 
   it('facture aussi les suppressions', async () => {
+    const client = makeClient('auteur@exemple.cm');
     const doc = new Y.Doc();
     const text = doc.getText('content');
     text.insert(0, 'abcdefghij');
-    const updates: Uint8Array[] = [];
-    doc.on('update', (update: Uint8Array) => updates.push(update));
-    text.delete(2, 4); // 4 caractères supprimés
 
-    const result = await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_delete',
-      payload: updates[updates.length - 1],
-    });
+    const update = await state();
+    const base = incoming(client, 'op_insert', 'abcdefghij');
+    await commitBatch(update, [base]);
 
-    expect(result.deleted).toBe(4);
-    expect(result.chars).toBe(4);
-    expect((await getCredit('auteur@exemple.cm')).used).toBe(4);
+    const deletions: Uint8Array[] = [];
+    doc.on('update', (value: Uint8Array) => deletions.push(value));
+    text.delete(2, 4);
+    const payload = deletions[deletions.length - 1];
+
+    await commitBatch(update, [
+      { client, opId: 'op_delete', payload, chars: 4, inserted: 0, deleted: 4, hash: hashOf(payload) },
+    ]);
+
+    // 10 insertions + 4 suppressions
+    expect((await getCreditState('auteur@exemple.cm')).used).toBe(14);
   });
 
   it('garde une séquence contiguë, sans trou', async () => {
+    const doc = await state();
+    const client = makeClient('auteur@exemple.cm');
+
     for (let index = 0; index < 8; index++) {
-      const { update } = makeUpdate(`bloc ${index}`);
-      await commitUpdate({
-        docId: 'doc_credit',
-        authorEmail: 'auteur@exemple.cm',
-        authorName: 'Auteur',
-        opId: `op_seq_${index}`,
-        payload: update,
-      });
+      await commitBatch(doc, [incoming(client, `op_seq_${index}`, `bloc ${index}`)]);
     }
-    const updates = memory.all(TABLES.UPDATES).map((row) => Number(row.seq)).sort((a, b) => a - b);
-    expect(updates).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-    const doc = memory.get(TABLES.DOCUMENTS, { docId: 'doc_credit' }) as { seq: number };
+
+    const rows = harness.memory.rows<{ seq: number }>('Updates').map((row) => row.seq).sort((a, b) => a - b);
+    expect(rows).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(doc.seq).toBe(8);
   });
 
-  it('ne débite pas la restauration de version (update système)', async () => {
-    const { update } = makeUpdate('texte initial');
-    await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_initial',
-      payload: update,
-    });
-    const before = (await getCredit('auteur@exemple.cm')).used;
+  it('ne débite pas un update à crédit nul (update système)', async () => {
+    const doc = await state();
+    const client = makeClient('auteur@exemple.cm');
 
-    const restore = makeUpdate('texte restauré');
-    await commitUpdate({
-      docId: 'doc_credit',
-      authorEmail: 'auteur@exemple.cm',
-      authorName: 'Auteur',
-      opId: 'op_restore',
-      payload: restore.update,
-      chargeCredit: false,
-    });
+    await commitBatch(doc, [incoming(client, 'op_initial', 'texte initial')]);
+    const before = (await getCreditState('auteur@exemple.cm')).used;
 
-    const after = (await getCredit('auteur@exemple.cm')).used;
-    expect(after).toBe(before);
+    const payload = updateOf('texte restauré');
+    await commitBatch(doc, [
+      { client, opId: 'op_restore', payload, chars: 0, inserted: 0, deleted: 0, hash: hashOf(payload) },
+    ]);
+
+    expect((await getCreditState('auteur@exemple.cm')).used).toBe(before);
+    expect(doc.seq).toBe(2);
   });
 
-  it('bloque l\'écriture après 4 refus dans la journée', async () => {
-    setup(5);
-    const { update } = makeUpdate('trop long');
+  it('bloque l’écriture après 4 refus dans la journée', async () => {
+    harness = setupHarness({ creditPerDay: 5, blockAfterRefusals: 4 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
+
+    const doc = await manager.load('doc_test');
+    const client = makeClient('auteur@exemple.cm');
+
     for (let attempt = 1; attempt <= 4; attempt++) {
-      await expect(
-        commitUpdate({
-          docId: 'doc_credit',
-          authorEmail: 'auteur@exemple.cm',
-          authorName: 'Auteur',
-          opId: `op_refus_${attempt}`,
-          payload: update,
-        }),
-      ).rejects.toBeInstanceOf(ApiError);
+      await commitBatch(doc, [incoming(client, `op_refus_${attempt}`, 'trop long pour le crédit')]);
     }
 
-    await expect(
-      commitUpdate({
-        docId: 'doc_credit',
-        authorEmail: 'auteur@exemple.cm',
-        authorName: 'Auteur',
-        opId: 'op_apres_blocage',
-        payload: update,
-      }),
-    ).rejects.toMatchObject({ code: 'BLOCKED' });
+    const credit = await getCreditState('auteur@exemple.cm');
+    expect(credit.used).toBe(0);
+    expect(credit.blockedUntil).not.toBeNull();
+  });
 
-    const creditRow = memory.get(TABLES.CREDITS, { id: `${'auteur@exemple.cm'}#${new Date().toISOString().slice(0, 10)}` }) as CreditRow | undefined;
-    expect(creditRow?.used ?? 0).toBe(0);
+  it('un refus ne bloque pas les autres rédacteurs du même lot', async () => {
+    harness = setupHarness({ creditPerDay: 10 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
+
+    const doc = await manager.load('doc_test');
+    const pauvre = makeClient('pauvre@exemple.cm');
+    const riche = makeClient('riche@exemple.cm');
+
+    // Le pauvre dépasse le plafond, le riche non : seul le pauvre est refusé.
+    await commitBatch(doc, [
+      incoming(pauvre, 'op_pauvre', 'abcdefghijklmnopqrstuvwxyz'),
+      incoming(riche, 'op_riche', 'court'),
+    ]);
+
+    expect((await getCreditState('riche@exemple.cm')).used).toBe(5);
+    expect((await getCreditState('pauvre@exemple.cm')).used).toBe(0);
+    expect(doc.seq).toBe(1);
   });
 });

@@ -1,11 +1,19 @@
 /**
- * Utilitaires d'identifiants, d'horloge UTC et de couleurs de présence.
- * Toutes les dates métier (crédit, blocage) sont calculées en UTC.
+ * Identifiants, horloge UTC, couleurs de présence.
+ *
+ * Les couleurs suivent **exactement** la palette de la spécification
+ * d'interface (hash de l'e-mail modulo 8) : le front calcule la même chose
+ * pour ses pastilles, donc les deux affichages concordent.
  */
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 export function randomToken(bytes = 18): string {
   return randomBytes(bytes).toString('base64url');
+}
+
+/** Identifiant de document, court et lisible. */
+export function newDocId(): string {
+  return `doc_${randomToken(9)}`;
 }
 
 export function sha256Hex(data: Uint8Array | string): string {
@@ -19,20 +27,29 @@ export function utcDay(date: Date = new Date()): string {
 
 /** Prochain minuit UTC (instant de recharge du crédit). */
 export function nextUtcMidnight(date: Date = new Date()): Date {
-  const next = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, 0, 0, 0, 0));
-  return next;
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, 0, 0, 0, 0));
 }
 
 export function secondsUntilUtcMidnight(date: Date = new Date()): number {
   return Math.max(1, Math.floor((nextUtcMidnight(date).getTime() - date.getTime()) / 1000));
 }
 
-const PALETTE = ['#2563eb', '#db2777', '#16a34a', '#f59e0b', '#7c3aed', '#0891b2', '#dc2626', '#65a30d', '#c026d3', '#ea580c'];
+/** Palette imposée par la spécification d'interface (section 1.2). */
+export const PRESENCE_COLORS = [
+  '#2563EB',
+  '#DB2777',
+  '#059669',
+  '#D97706',
+  '#7C3AED',
+  '#0891B2',
+  '#DC2626',
+  '#4D7C0F',
+] as const;
 
-/** Couleur stable par rédacteur, pour les curseurs distants. */
-export function colorFor(identity: string): string {
-  const digest = createHash('sha1').update(identity).digest();
-  return PALETTE[digest[0] % PALETTE.length];
+/** Couleur stable par e-mail : hash modulo 8, comme le front. */
+export function colorFor(email: string): string {
+  const digest = createHash('sha1').update(email.toLowerCase()).digest();
+  return PRESENCE_COLORS[digest[0] % PRESENCE_COLORS.length];
 }
 
 export function clampText(value: unknown, maxLength: number): string {
@@ -46,7 +63,11 @@ export function isValidEmail(value: unknown): value is string {
   return typeof value === 'string' && value.length <= 254 && EMAIL_RE.test(value);
 }
 
-/** Aléa borné, utilisé pour les backoffs avec jitter. */
+/** Aléa borné, pour les backoffs avec gigue. */
 export function jitter(maxMs: number): number {
   return Math.floor(Math.random() * maxMs);
+}
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

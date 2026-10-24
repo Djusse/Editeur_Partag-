@@ -1,35 +1,30 @@
-/** Accès S3 : PDF, snapshots CRDT et URL présignées courtes (60 s). */
+/**
+ * Stockage objet : PDF et snapshots.
+ *
+ * Bucket **privé**, chiffré, accès public bloqué. Les téléchargements passent
+ * par une URL présignée de 60 secondes.
+ *
+ * Un magasin en mémoire est injectable (tests et mode local), ce qui permet de
+ * vérifier le parcours PDF complet sans compte AWS.
+ */
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { config } from './config';
 
-let client: S3Client | null = null;
-
-/** Réservé aux tests : remplace la signature d'URL (aucun appel AWS). */
-let presignerOverride: ((key: string, filename: string, ttlSeconds: number) => Promise<string>) | null = null;
-
-export function setPresignerOverride(
-  override: ((key: string, filename: string, ttlSeconds: number) => Promise<string>) | null,
-): void {
-  presignerOverride = override;
-}
-
-/**
- * Réservé au mode local : remplace le stockage objet par une implémentation en
- * mémoire. Permet de tester le parcours PDF complet sans compte AWS.
- */
 export interface ObjectStore {
   put(key: string, body: Uint8Array, contentType: string): Promise<void>;
   get(key: string): Promise<Uint8Array>;
+  presign(key: string, filename: string, ttlSeconds: number): Promise<string>;
 }
 
-let objectStoreOverride: ObjectStore | null = null;
+let storeOverride: ObjectStore | null = null;
+let client: S3Client | null = null;
 
 export function setObjectStore(store: ObjectStore | null): void {
-  objectStoreOverride = store;
+  storeOverride = store;
 }
 
-export function s3(): S3Client {
+function s3(): S3Client {
   if (!client) client = new S3Client({ region: config().region });
   return client;
 }
@@ -43,10 +38,10 @@ export function snapshotKey(docId: string, seq: number): string {
 }
 
 export async function putObject(key: string, body: Uint8Array, contentType: string): Promise<void> {
-  if (objectStoreOverride) return objectStoreOverride.put(key, body, contentType);
+  if (storeOverride) return storeOverride.put(key, body, contentType);
   await s3().send(
     new PutObjectCommand({
-      Bucket: config().pdfBucket,
+      Bucket: config().bucket,
       Key: key,
       Body: body,
       ContentType: contentType,
@@ -56,21 +51,25 @@ export async function putObject(key: string, body: Uint8Array, contentType: stri
 }
 
 export async function getObject(key: string): Promise<Uint8Array> {
-  if (objectStoreOverride) return objectStoreOverride.get(key);
-  const out = await s3().send(new GetObjectCommand({ Bucket: config().pdfBucket, Key: key }));
+  if (storeOverride) return storeOverride.get(key);
+  const out = await s3().send(new GetObjectCommand({ Bucket: config().bucket, Key: key }));
   return (await out.Body!.transformToByteArray()) as Uint8Array;
 }
 
-/** URL présignée de courte durée : un exemplaire = un lien temporaire. */
-export async function presignedUrl(key: string, filename: string, ttlSeconds = config().pdfUrlTtlSeconds): Promise<string> {
-  if (presignerOverride) return presignerOverride(key, filename, ttlSeconds);
+/** URL de téléchargement de courte durée : un exemplaire = un lien temporaire. */
+export async function presignedUrl(
+  key: string,
+  filename: string,
+  ttlSeconds = config().pdfUrlTtlSeconds,
+): Promise<string> {
+  if (storeOverride) return storeOverride.presign(key, filename, ttlSeconds);
   return getSignedUrl(
     s3(),
     new GetObjectCommand({
-      Bucket: config().pdfBucket,
+      Bucket: config().bucket,
       Key: key,
       ResponseContentType: 'application/pdf',
-      ResponseContentDisposition: `attachment; filename="${filename.replace(/"/g, '')}"`,
+      ResponseContentDisposition: `attachment; filename="${filename.replace(/["\\]/g, '')}"`,
     }),
     { expiresIn: ttlSeconds },
   );

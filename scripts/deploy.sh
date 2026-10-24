@@ -1,94 +1,147 @@
 #!/usr/bin/env bash
-# Déploiement complet : infra SAM → build front → envoi S3 → invalidation CloudFront.
+# Déploiement complet.
+#
+#  1. crée (si besoin) la paire de clés et les secrets SSM ;
+#  2. déploie la pile CloudFormation (EC2 + nginx + Node, DynamoDB, S3, SQS) ;
+#  3. construit l'application (backend + front statique) et l'archive ;
+#  4. pousse l'archive dans S3 puis demande à l'instance de l'installer (SSM) ;
+#  5. vérifie que /health répond.
 #
 # Usage :
-#   ./scripts/deploy.sh                      # premier déploiement (interactif)
-#   ./scripts/deploy.sh --guided-off         # redéploiement sans prompt
+#   KEY_NAME=cle-christian SES_SENDER="vous@gmail.com" ADMIN_CIDR="82.1.2.3/32" ./scripts/deploy.sh
 #
-# Variables : STACK_NAME (défaut), AWS_REGION (défaut eu-west-3), SES_SENDER (obligatoire).
+# Aucune clé d'accès n'est nécessaire : `aws login` (ou un profil SSO) suffit.
 set -euo pipefail
 
-STACK_NAME="${STACK_NAME:-editeur-documents}"
-AWS_REGION="${AWS_REGION:-eu-west-3}"
+STACK_NAME="${STACK_NAME:-editeur}"
+AWS_REGION="${AWS_REGION:-eu-north-1}"
+KEY_NAME="${KEY_NAME:-cle-christian}"
 SES_SENDER="${SES_SENDER:-}"
-GUIDED="${GUIDED:-false}"
-
-if [[ "${1:-}" == "--guided-off" ]]; then
-  GUIDED="false"
-else
-  GUIDED="true"
-fi
-
-if [[ -z "$SES_SENDER" ]]; then
-  echo "ERREUR : renseignez SES_SENDER (adresse vérifiée dans SES), par exemple :"
-  echo "  SES_SENDER=\"vous@gmail.com\" ./scripts/deploy.sh"
-  exit 1
-fi
+ADMIN_CIDR="${ADMIN_CIDR:-0.0.0.0/0}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-echo "==> 1/6 Vérification de l'outillage"
-for tool in node npm aws sam; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "Outil manquant : $tool"
-    exit 1
-  fi
+if [[ -z "$SES_SENDER" ]]; then
+  echo "ERREUR : renseignez SES_SENDER (adresse vérifiée dans SES)."
+  echo "  KEY_NAME=... SES_SENDER=\"vous@gmail.com\" ./scripts/deploy.sh"
+  exit 1
+fi
+
+for tool in node npm aws; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "Outil manquant : $tool"; exit 1; }
 done
 
-echo "==> 2/6 Installation des dépendances"
-(cd backend && npm ci --no-audit --no-fund)
-(cd frontend && npm ci --no-audit --no-fund)
+echo "==> 1/6 Région et identité AWS"
+aws sts get-caller-identity --region "$AWS_REGION" --output text >/dev/null
+ACCOUNT_ID="$(aws sts get-caller-identity --region "$AWS_REGION" --query Account --output text)"
+echo "    compte $ACCOUNT_ID en $AWS_REGION"
 
-echo "==> 3/6 Compilation du backend (handlers bundlés)"
-(cd backend && npm run bundle)
-
-echo "==> 4/6 Déploiement de l'infrastructure (SAM)"
-SAM_ARGS=(
-  deploy
-  --template-file infra/template.yaml
-  --stack-name "$STACK_NAME"
-  --region "$AWS_REGION"
-  --capabilities CAPABILITY_IAM
-  --resolve-s3
-  --parameter-overrides "SesSenderEmail=$SES_SENDER WebOrigin=*"
-  --no-fail-on-empty-changeset
-)
-if [[ "$GUIDED" == "true" ]]; then
-  SAM_ARGS+=(--guided)
+echo "==> 2/6 Paire de clés et secrets"
+if ! aws ec2 describe-key-pairs --key-names "$KEY_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+  echo "    création de la paire $KEY_NAME (fichier $KEY_NAME.pem dans le dossier courant)"
+  aws ec2 create-key-pair --key-name "$KEY_NAME" --region "$AWS_REGION" \
+    --query KeyMaterial --output text > "$KEY_NAME.pem"
+  chmod 400 "$KEY_NAME.pem"
+  echo "    ATTENTION : conservez $KEY_NAME.pem, il ne sera plus téléchargeable."
 fi
-sam "${SAM_ARGS[@]}"
 
-echo "==> 5/6 Build du front statique et envoi vers S3"
-API_URL="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)"
-WS_URL="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='WebSocketUrl'].OutputValue" --output text)"
-FRONT_BUCKET="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='FrontBucketName'].OutputValue" --output text)"
-DISTRIBUTION_ID="$(aws cloudformation describe-stack-resource --stack-name "$STACK_NAME" --region "$AWS_REGION" \
-  --logical-resource-id FrontDistribution --query "StackResourceDetail.PhysicalResourceId" --output text)"
+# Secrets : créés une seule fois, jamais présents dans le dépôt ni le template.
+if ! aws ssm get-parameter --name /editeur/jwt-secret --region "$AWS_REGION" >/dev/null 2>&1; then
+  aws ssm put-parameter --name /editeur/jwt-secret --type SecureString \
+    --value "$(openssl rand -base64 48)" --region "$AWS_REGION" >/dev/null
+  echo "    /editeur/jwt-secret créé"
+fi
+if ! aws ssm get-parameter --name /editeur/admin-key --region "$AWS_REGION" >/dev/null 2>&1; then
+  aws ssm put-parameter --name /editeur/admin-key --type SecureString \
+    --value "$(openssl rand -hex 16)" --region "$AWS_REGION" >/dev/null
+  echo "    /editeur/admin-key créé"
+fi
 
-(
-  cd frontend
-  NEXT_PUBLIC_API_BASE="$API_URL" NEXT_PUBLIC_WS_URL="$WS_URL" npm run build
-)
-aws s3 sync frontend/out "s3://$FRONT_BUCKET" --delete --region "$AWS_REGION"
+echo "==> 3/6 Déploiement de la pile CloudFormation"
+aws cloudformation deploy \
+  --template-file infra/template.yaml \
+  --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+      KeyName="$KEY_NAME" \
+      AdminCidr="$ADMIN_CIDR" \
+      InstanceType="$INSTANCE_TYPE" \
+      SesSenderEmail="$SES_SENDER" \
+  --no-fail-on-empty-changeset
 
-echo "==> 6/6 Invalidation CloudFront"
-aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*" >/dev/null
+INSTANCE_ID="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)"
+BUCKET="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)"
+PUBLIC_IP="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" --output text)"
+echo "    instance $INSTANCE_ID — $PUBLIC_IP — bucket $BUCKET"
 
-# La variable WebOrigin est mise à jour avec l'URL réelle du front.
-FRONT_URL="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='FrontDistributionDomain'].OutputValue" --output text)"
-echo "==> Mise à jour de l'origine CORS : https://$FRONT_URL"
-sam deploy --template-file infra/template.yaml --stack-name "$STACK_NAME" --region "$AWS_REGION" \
-  --capabilities CAPABILITY_IAM --resolve-s3 --no-fail-on-empty-changeset \
-  --parameter-overrides "SesSenderEmail=$SES_SENDER WebOrigin=https://$FRONT_URL"
+echo "==> 4/6 Construction de l'application"
+(cd backend && npm ci --no-audit --no-fund && npm run build)
+(cd frontend && npm ci --no-audit --no-fund && npm run build)
 
+rm -rf build && mkdir -p build
+cp -r backend/dist build/dist
+cp backend/package.json build/package.json
+# Dépendances de production uniquement (pdfkit, ws, yjs, SDK AWS…).
+(cd build && npm install --omit=dev --no-audit --no-fund --ignore-scripts)
+cp -r frontend/out build/public
+tar -czf app.tar.gz -C build .
+
+echo "==> 5/6 Envoi vers S3 et installation sur l'instance (SSM)"
+aws s3 cp app.tar.gz "s3://$BUCKET/artifacts/app.tar.gz" --region "$AWS_REGION" >/dev/null
+
+COMMAND_ID="$(aws ssm send-command \
+  --instance-ids "$INSTANCE_ID" \
+  --region "$AWS_REGION" \
+  --document-name AWS-RunShellScript \
+  --comment "Deploiement editeur" \
+  --parameters 'commands=[
+    "set -e",
+    "rm -rf /opt/editeur/dist /opt/editeur/public /opt/editeur/node_modules",
+    "aws s3 cp s3://'"$BUCKET"'/artifacts/app.tar.gz /tmp/app.tar.gz --region '"$AWS_REGION"'",
+    "cd /opt/editeur && tar -xzf /tmp/app.tar.gz",
+    "chown -R ec2-user:ec2-user /opt/editeur",
+    "systemctl restart editeur-app editeur-worker",
+    "sleep 2",
+    "systemctl is-active editeur-app editeur-worker"
+  ]' \
+  --query "Command.CommandId" --output text)"
+
+echo "    commande SSM $COMMAND_ID"
+for _ in $(seq 1 30); do
+  STATUS="$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+    --region "$AWS_REGION" --query Status --output text 2>/dev/null || echo Pending)"
+  [[ "$STATUS" == "Success" ]] && break
+  [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" ]] && {
+    aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+      --region "$AWS_REGION" --query StandardErrorContent --output text
+    exit 1
+  }
+  sleep 5
+done
+
+echo "==> 6/6 Vérification"
+for _ in $(seq 1 20); do
+  if curl -fsS "http://$PUBLIC_IP/health" >/dev/null 2>&1; then
+    echo "    /health répond"
+    break
+  fi
+  sleep 5
+done
+
+ADMIN_KEY="$(aws ssm get-parameter --name /editeur/admin-key --with-decryption \
+  --region "$AWS_REGION" --query Parameter.Value --output text)"
+
+rm -f app.tar.gz
 echo
 echo "Déploiement terminé."
-echo "  Front        : https://$FRONT_URL"
-echo "  API          : $API_URL"
-echo "  WebSocket    : $WS_URL"
-echo "  Bucket front : $FRONT_BUCKET"
+echo "  Application  : http://$PUBLIC_IP"
+echo "  Supervision  : http://$PUBLIC_IP/admin   (clé : $ADMIN_KEY)"
+echo "  Instance     : $INSTANCE_ID"
+echo
+echo "Journaux : sudo tail -f /var/log/editeur/app.log (via SSH ou Session Manager)"

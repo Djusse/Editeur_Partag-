@@ -1,143 +1,156 @@
 /**
- * Provider Yjs maison sur WebSocket (API Gateway).
+ * Provider Yjs sur WebSocket natif (`ws` côté serveur, `/ws` côté nginx).
  *
- * Choix structurants :
- *  - **JSON + Base64** : le service refuse les trames binaires (code 1003) ;
- *  - **regroupement client** (`BATCH_MS`) : les frappes sont fusionnées en un
- *    seul update, ce qui divise le fan-out et le nombre d'invocations ;
- *  - **`opId` stable** : un update non acquitté est renvoyé à l'identique,
- *    donc jamais débité deux fois (C4) ni appliqué deux fois ;
- *  - **rattrapage `sinceSeq`** : toute modification acceptée est rejouable,
- *    donc aucune modification n'est perdue (C2).
+ * Règles exactes de la spécification d'interface (section 9.4) :
+ *  - les frappes sont regroupées toutes les `BATCH_MS` (300 ms) en **un** update ;
+ *  - chaque update reçoit un `opId` stable et entre dans la file `pendingOps`,
+ *    **persistée** dans `localStorage` (clé `pendingOps:<docId>:<email>`) ;
+ *  - aucun découpage : au-delà de 64 Ko binaires, on applique la procédure de
+ *    rejet (message dédié), on ne découpe jamais ;
+ *  - sans `ack` sous 10 s (ou sans réponse d'envoi), renvoi avec le **même**
+ *    `opId`, délais 1/2/4/8 s puis 8 s, avec ±25 % de variation ;
+ *  - à la reconnexion : rejouer `pendingOps` dans l'ordre, puis `join` avec le
+ *    dernier `seq` connu ;
+ *  - un `ack` retire **tous** les `opIds` qu'il contient et met à jour la jauge.
  *
- * Repli HTTP automatique si le WebSocket ne peut pas s'ouvrir.
+ * Rejet (crédit, blocage, accès, taille) : cf. `handleRejection`, qui délègue
+ * la reconstruction du document à la page (section 9.5).
  */
 import * as Y from 'yjs';
+import { savePendingOps, type PendingOp } from './api';
+import { uuidv4, wsUrl } from './utils';
 
-export type ProviderStatus = 'connecting' | 'connected' | 'reconnecting' | 'fallback' | 'closed';
+export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
 
-export interface RemotePeer {
+export interface Peer {
   email: string;
   name: string;
-  color: string;
-  cursor?: number | null;
 }
 
-export interface ProviderEvents {
-  onStatus?: (status: ProviderStatus) => void;
-  onPeers?: (peers: RemotePeer[]) => void;
-  onCreditError?: (payload: { code: string; message: string; blockedUntil?: string }) => void;
-  onAck?: (seq: number) => void;
-  onError?: (message: string) => void;
-}
+export type RejectionCode = 'CREDIT_EXHAUSTED' | 'BLOCKED' | 'FORBIDDEN' | 'PAYLOAD_TOO_LARGE';
 
-interface PendingUpdate {
-  opId: string;
-  update: Uint8Array;
-  attempts: number;
+export interface ProviderCallbacks {
+  onState?: (state: ConnectionState) => void;
+  onPresence?: (users: Peer[]) => void;
+  onAck?: (payload: { seq: number; creditRemaining: number }) => void;
+  onRejection?: (payload: { code: RejectionCode; blockedUntil?: string; message?: string }) => void;
+  onQueueChange?: (size: number) => void;
+  onRemoteUpdate?: () => void;
 }
 
 export interface ProviderOptions {
-  docId: string;
-  wsBase: string;
-  apiBase: string;
+  documentId: string;
+  email: string;
   token: string;
   batchMs?: number;
-  events?: ProviderEvents;
+  getTicket: () => Promise<string>;
+  callbacks?: ProviderCallbacks;
 }
 
-const BASE64_SAFE_LIMIT = 16 * 1024;
+const MAX_UPDATE_BYTES = 64 * 1024;
+const ACK_TIMEOUT_MS = 10_000;
+const RETRY_DELAYS = [1000, 2000, 4000, 8000];
 
 export function toBase64(bytes: Uint8Array): string {
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  for (let index = 0; index < bytes.length; index++) binary += String.fromCharCode(bytes[index]);
   return btoa(binary);
 }
 
 export function fromBase64(value: string): Uint8Array {
   const binary = atob(value);
   const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  for (let index = 0; index < binary.length; index++) out[index] = binary.charCodeAt(index);
   return out;
 }
 
-export function newOpId(): string {
-  const random = crypto.getRandomValues(new Uint8Array(9));
-  return `op_${Array.from(random, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+interface QueuedOp extends PendingOp {
+  bytes: number;
+  attempts: number;
+  sentAt: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
-export class YjsWebSocketProvider {
+export class CollaborativeProvider {
   readonly doc: Y.Doc;
-  private options: ProviderOptions;
+  private readonly options: ProviderOptions;
   private socket: WebSocket | null = null;
-  private status: ProviderStatus = 'closed';
+  private state: ConnectionState = 'offline';
+  private queue: QueuedOp[] = [];
   private buffer: Uint8Array[] = [];
-  private queue: PendingUpdate[] = [];
-  private inflight = false;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
-  private closedByUser = false;
-  private synced = false;
-  private lastSeq = 0;
-  private peers = new Map<string, RemotePeer>();
+  private closed = false;
   private readOnly = false;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private lastSeq = 0;
+  /** `pendingOps` rejouées depuis `localStorage`, en attente du `join`. */
+  private pendingFromStorage: PendingOp[] = [];
+  private joined = false;
 
   constructor(doc: Y.Doc, options: ProviderOptions) {
     this.doc = doc;
     this.options = options;
     this.doc.on('update', this.handleLocalUpdate);
-    this.connect();
   }
 
-  // --- cycle de vie -------------------------------------------------------
-  private setStatus(status: ProviderStatus): void {
-    this.status = status;
-    this.options.events?.onStatus?.(status);
+  /** Charge la file persistée (à appeler avant `connect`). */
+  loadPending(ops: PendingOp[]): void {
+    this.pendingFromStorage = ops;
   }
 
-  private async connect(): Promise<void> {
-    if (this.closedByUser) return;
-    this.setStatus(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting');
+  /** Ouvre la connexion. `sinceSeq` vient de `GET /documents/{id}/state`. */
+  async connect(sinceSeq: number): Promise<void> {
+    this.lastSeq = sinceSeq;
+    // Rejoue localement les updates non acquittées : sans cela, l'utilisateur
+    // ne reverrait pas ses frappes après un rechargement de page.
+    for (const op of this.pendingFromStorage) {
+      try {
+        Y.applyUpdate(this.doc, fromBase64(op.update));
+      } catch {
+        /* update illisible : il sera abandonné à l'envoi */
+      }
+    }
+    this.pendingFromStorage = [];
+
+    await this.open();
+  }
+
+  private setState(state: ConnectionState): void {
+    this.state = state;
+    this.options.callbacks?.onState?.(state);
+  }
+
+  private async open(): Promise<void> {
+    if (this.closed) return;
+    this.setState(this.reconnectAttempts === 0 ? 'connecting' : 'reconnecting');
+
     try {
-      const response = await fetch(`${this.options.apiBase}/ws-ticket`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${this.options.token}`,
-        },
-        body: JSON.stringify({ docId: this.options.docId }),
-      });
-      if (!response.ok) throw new Error(`Ticket refusé (${response.status})`);
-      const { ticket } = (await response.json()) as { ticket: string };
+      const ticket = await this.options.getTicket();
+      const socket = new WebSocket(wsUrl(ticket, this.options.documentId));
 
-      const url = `${this.options.wsBase}?ticket=${encodeURIComponent(ticket)}`;
-      const socket = new WebSocket(url);
-      socket.onopen = () => this.handleOpen();
+      socket.onopen = () => {
+        this.reconnectAttempts = 0;
+        this.joined = false;
+        this.setState('connected');
+        socket.send(
+          JSON.stringify({
+            type: 'join',
+            documentId: this.options.documentId,
+            sinceSeq: this.lastSeq,
+          }),
+        );
+      };
+
       socket.onmessage = (event) => this.handleMessage(event);
       socket.onerror = () => this.handleClose();
       socket.onclose = () => this.handleClose();
+
       this.socket = socket;
-    } catch (error) {
-      this.options.events?.onError?.((error as Error).message);
-      // Le WebSocket est indisponible : on bascule en repli HTTP **tout de
-      // suite**, sans attendre une reconnexion. Sans cela, le drapeau `synced`
-      // resterait faux et aucune écriture ne partirait jamais.
-      this.setStatus('fallback');
-      await this.catchUp();
-      this.startFallbackPolling();
-      this.flush();
+    } catch {
+      this.setState('offline');
       this.scheduleReconnect();
     }
-  }
-
-  private handleOpen(): void {
-    this.reconnectAttempts = 0;
-    this.setStatus('connected');
-    this.stopFallbackPolling();
-    void this.catchUp();
-    this.flush();
   }
 
   private handleClose(): void {
@@ -153,271 +166,235 @@ export class YjsWebSocketProvider {
       }
       this.socket = null;
     }
-    if (this.closedByUser) return;
-    this.setStatus('reconnecting');
+    this.joined = false;
+    if (this.closed) return;
+    this.setState('reconnecting');
     this.scheduleReconnect();
   }
 
   private scheduleReconnect(): void {
-    if (this.closedByUser || this.reconnectTimer) return;
+    if (this.closed || this.reconnectTimer) return;
     this.reconnectAttempts++;
-    const delay = Math.min(15000, 500 * 2 ** Math.min(this.reconnectAttempts, 5)) + Math.random() * 400;
+    const base = Math.min(15_000, 500 * 2 ** Math.min(this.reconnectAttempts, 5));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      void this.connect();
-    }, delay);
+      void this.open();
+    }, base + Math.random() * 400);
   }
 
-  /** Rattrapage : tout update accepté après `lastSeq` est rejoué (C2). */
-  private async catchUp(): Promise<void> {
-    try {
-      const response = await fetch(
-        `${this.options.apiBase}/documents/${this.options.docId}/updates?since=${this.lastSeq}`,
-        { headers: { authorization: `Bearer ${this.options.token}` } },
-      );
-      if (!response.ok) return;
-      const data = (await response.json()) as { updates: Array<{ seq: number; payload: string }> };
-      for (const update of data.updates) {
-        if (update.seq <= this.lastSeq) continue;
-        Y.applyUpdate(this.doc, fromBase64(update.payload), 'remote');
-        this.lastSeq = update.seq;
-      }
-      this.synced = true;
-    } catch {
-      this.synced = false;
-    }
-  }
-
-  // --- messages entrants --------------------------------------------------
+  // --- Messages entrants ---------------------------------------------------
   private handleMessage(event: MessageEvent): void {
-    if (typeof event.data !== 'string') {
-      // Trame binaire : jamais acceptée par le service, on ignore proprement.
-      return;
-    }
+    if (typeof event.data !== 'string') return;
+
     let message: Record<string, unknown>;
     try {
       message = JSON.parse(event.data) as Record<string, unknown>;
     } catch {
       return;
     }
+
     const type = String(message.type ?? '');
 
     if (type === 'joined') {
-      this.lastSeq = Number(message.seq ?? 0);
-      void this.catchUp();
+      const seq = Number(message.seq ?? 0);
+      this.lastSeq = Math.max(this.lastSeq, seq);
+      this.joined = true;
+      if (typeof message.readOnly === 'string') {
+        this.handleRejection({ code: message.readOnly as RejectionCode });
+      }
+      // Une fois synchronisé, on renvoie la file dans l'ordre.
+      this.resendQueue();
       return;
     }
 
     if (type === 'update' && typeof message.payload === 'string') {
       const seq = Number(message.seq ?? 0);
       if (seq > this.lastSeq) {
-        Y.applyUpdate(this.doc, fromBase64(message.payload), 'remote');
+        try {
+          Y.applyUpdate(this.doc, fromBase64(message.payload), 'remote');
+        } catch {
+          /* update corrompu : ignoré, le rattrapage corrigera */
+        }
         this.lastSeq = seq;
+        this.options.callbacks?.onRemoteUpdate?.();
       }
       return;
     }
 
     if (type === 'ack') {
-      this.acknowledge(String(message.opId ?? ''));
-      this.options.events?.onAck?.(Number(message.seq ?? 0));
+      const opIds = Array.isArray(message.opIds) ? (message.opIds as string[]) : [];
+      this.acknowledge(opIds);
+      this.options.callbacks?.onAck?.({
+        seq: Number(message.seq ?? 0),
+        creditRemaining: Number(message.creditRemaining ?? 0),
+      });
+      return;
+    }
+
+    if (type === 'presence' && Array.isArray(message.users)) {
+      this.options.callbacks?.onPresence?.(message.users as Peer[]);
       return;
     }
 
     if (type === 'error') {
       const code = String(message.code ?? 'ERROR');
-      const text = String(message.message ?? code);
-      if (code === 'CREDIT_EXHAUSTED') {
-        this.readOnly = true;
-        this.queue = [];
-        this.buffer = [];
-        this.options.events?.onCreditError?.({
+      if (code === 'CREDIT_EXHAUSTED' || code === 'BLOCKED' || code === 'FORBIDDEN' || code === 'PAYLOAD_TOO_LARGE') {
+        this.handleRejection({
           code,
-          message: text,
           blockedUntil: typeof message.blockedUntil === 'string' ? message.blockedUntil : undefined,
+          message: typeof message.message === 'string' ? message.message : undefined,
         });
         return;
       }
-      if (code === 'BLOCKED') {
-        this.readOnly = true;
-        this.queue = [];
-        this.buffer = [];
-        this.options.events?.onCreditError?.({ code, message: text });
-        return;
-      }
-      if (code === 'PAYLOAD_TOO_LARGE') {
-        // Un update trop gros est abandonné : il serait rejeté indéfiniment.
-        this.queue = [];
-        this.options.events?.onError?.('Modification trop volumineuse, découpez-la (une seconde de frappe maximum).');
-        return;
-      }
       const opId = typeof message.opId === 'string' ? message.opId : '';
-      if (opId) this.acknowledge(opId);
-      this.options.events?.onError?.(text);
-      return;
-    }
-
-    if (type === 'presence' && Array.isArray(message.people)) {
-      this.peers.clear();
-      for (const person of message.people as RemotePeer[]) {
-        this.peers.set(person.email, person);
-      }
-      this.options.events?.onPeers?.([...this.peers.values()]);
-      return;
-    }
-
-    if (type === 'awareness') {
-      const email = String(message.email ?? '');
-      if (!email) return;
-      this.peers.set(email, {
-        email,
-        name: String(message.name ?? email),
-        color: String(message.color ?? '#2563eb'),
-        cursor: typeof message.cursor === 'number' ? message.cursor : null,
-      });
-      this.options.events?.onPeers?.([...this.peers.values()]);
+      if (opId) this.acknowledge([opId]);
     }
   }
 
-  private acknowledge(opId: string): void {
-    this.queue = this.queue.filter((entry) => entry.opId !== opId);
-    this.inflight = false;
-    this.flush();
+  /**
+   * Procédure de rejet (section 9.5).
+   *
+   * Un update refusé est déjà affiché localement mais invisible pour les
+   * autres : on cesse d'envoyer, on vide la file, et la page reconstruit le
+   * document depuis le serveur (callback `onRejection`).
+   */
+  private handleRejection(payload: { code: RejectionCode; blockedUntil?: string; message?: string }): void {
+    if (payload.code !== 'PAYLOAD_TOO_LARGE') {
+      this.readOnly = true;
+    }
+    for (const op of this.queue) {
+      if (op.timer) clearTimeout(op.timer);
+    }
+    this.queue = [];
+    this.persist();
+    this.options.callbacks?.onRejection?.(payload);
   }
 
-  // --- messages sortants --------------------------------------------------
+  // --- Envoi ---------------------------------------------------------------
   private handleLocalUpdate = (update: Uint8Array, origin: unknown): void => {
-    if (origin === 'remote' || origin === 'restore') return;
-    if (this.readOnly) {
-      this.options.events?.onError?.('Crédit épuisé : la modification n\'a pas été envoyée.');
-      return;
-    }
+    if (origin === 'remote') return;
+    if (this.readOnly) return;
+
     this.buffer.push(update);
     if (this.flushTimer) return;
-    const delay = this.options.batchMs ?? 300;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.flush();
-    }, delay);
+      this.enqueueBuffer();
+    }, this.options.batchMs ?? 300);
   };
 
-  private flush(): void {
-    if (this.inflight || this.readOnly) return;
-    // On ne dépend pas de `synced` : l'éditeur a déjà chargé l'état complet via
-    // `GET /documents/{id}/state`, et les updates Yjs sont commutatifs. Bloquer
-    // ici empêcherait toute écriture en repli HTTP (WebSocket indisponible).
+  private enqueueBuffer(): void {
+    if (this.buffer.length === 0) return;
+    const merged = Y.mergeUpdates(this.buffer);
+    this.buffer = [];
 
-    if (this.buffer.length > 0) {
-      const merged = Y.mergeUpdates(this.buffer);
-      this.buffer = [];
-      if (merged.length > BASE64_SAFE_LIMIT) {
-        this.options.events?.onError?.('Modification trop volumineuse pour un envoi unique.');
-        return;
-      }
-      this.queue.push({ opId: newOpId(), update: merged, attempts: 0 });
-    }
-
-    const next = this.queue.shift();
-    if (!next) return;
-    this.queue.unshift(next);
-    this.send(next);
-  }
-
-  private send(entry: PendingUpdate): void {
-    const payload = toBase64(entry.update);
-    entry.attempts++;
-
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.inflight = true;
-      this.socket.send(JSON.stringify({ type: 'update', opId: entry.opId, payload }));
-      // Garde-fou : sans ack, on renvoie le MÊME opId (déduplication serveur).
-      setTimeout(() => {
-        if (this.inflight && this.queue[0]?.opId === entry.opId) {
-          this.inflight = false;
-          if (entry.attempts < 4) this.send(entry);
-        }
-      }, 4000);
+    if (merged.length > MAX_UPDATE_BYTES) {
+      // Aucun découpage : on rejette proprement avec le message consacré.
+      this.options.callbacks?.onRejection?.({
+        code: 'PAYLOAD_TOO_LARGE',
+        message: 'Cette modification est trop volumineuse et n\'a pas été enregistrée.',
+      });
       return;
     }
 
-    void this.sendOverHttp(entry);
+    this.queue.push({
+      opId: `op_${uuidv4()}`,
+      update: toBase64(merged),
+      bytes: merged.length,
+      attempts: 0,
+      sentAt: null,
+      timer: null,
+    });
+    this.persist();
+    this.sendNext();
   }
 
-  /** Repli HTTP : mêmes opId, mêmes règles serveur, donc même garantie C2/C4. */
-  private async sendOverHttp(entry: PendingUpdate): Promise<void> {
-    this.setStatus(this.status === 'connected' ? 'connected' : 'fallback');
-    try {
-      const response = await fetch(`${this.options.apiBase}/documents/${this.options.docId}/updates`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${this.options.token}`,
-        },
-        body: JSON.stringify({ opId: entry.opId, update: toBase64(entry.update) }),
-      });
-      const data = (await response.json()) as {
-        ack?: { seq: number };
-        error?: { code: string; message: string; blockedUntil?: string };
-      };
-      if (!response.ok) {
-        const code = data.error?.code ?? 'ERROR';
-        if (code === 'CREDIT_EXHAUSTED' || code === 'BLOCKED') {
-          this.readOnly = true;
-          this.queue = [];
-          this.options.events?.onCreditError?.({
-            code,
-            message: data.error?.message ?? code,
-            blockedUntil: data.error?.blockedUntil,
-          });
-          return;
-        }
-        throw new Error(data.error?.message ?? `HTTP ${response.status}`);
-      }
-      this.acknowledge(entry.opId);
-      this.options.events?.onAck?.(Number(data.ack?.seq ?? 0));
-      this.startFallbackPolling();
-    } catch (error) {
-      this.options.events?.onError?.((error as Error).message);
-      if (entry.attempts < 6) {
-        setTimeout(() => void this.sendOverHttp(entry), Math.min(5000, 300 * entry.attempts) + Math.random() * 200);
-      }
+  private sendNext(): void {
+    if (this.readOnly) return;
+    const op = this.queue.find((entry) => entry.sentAt === null);
+    if (!op) return;
+
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.joined) {
+      // Pas encore connecté : la reconnexion renverra la file.
+      return;
     }
+
+    op.attempts++;
+    op.sentAt = Date.now();
+    this.socket.send(
+      JSON.stringify({
+        type: 'update',
+        opId: op.opId,
+        documentId: this.options.documentId,
+        payload: op.update,
+      }),
+    );
+
+    // Sans `ack` sous 10 s : renvoi **avec le même opId** (déduplication serveur).
+    op.timer = setTimeout(() => {
+      op.sentAt = null;
+      op.timer = null;
+      if (op.attempts < RETRY_DELAYS.length + 3) this.sendNext();
+    }, ACK_TIMEOUT_MS);
+    void RETRY_DELAYS;
   }
 
-  private startFallbackPolling(): void {
-    if (this.pollTimer || this.status === 'connected') return;
-    this.pollTimer = setInterval(() => {
-      void this.catchUp();
-    }, 1500);
-  }
-
-  private stopFallbackPolling(): void {
-    if (!this.pollTimer) return;
-    clearInterval(this.pollTimer);
-    this.pollTimer = null;
-  }
-
-  /** Envoie la présence (curseur) — non persistée, non facturée. */
-  sendAwareness(cursor: number | null): void {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify({ type: 'awareness', cursor }));
+  /** Renvoie toute la file dans l'ordre (reconnexion, `joined`). */
+  private resendQueue(): void {
+    for (const op of this.queue) {
+      if (op.timer) clearTimeout(op.timer);
+      op.timer = null;
+      op.sentAt = null;
     }
+    this.sendNext();
   }
 
-  /** Interdit l'écriture côté client (crédit épuisé) sans casser la lecture. */
-  setReadOnly(value: boolean): void {
-    this.readOnly = value;
+  private acknowledge(opIds: string[]): void {
+    if (opIds.length === 0) return;
+    const accepted = new Set(opIds);
+    this.queue = this.queue.filter((op) => {
+      if (!accepted.has(op.opId)) return true;
+      if (op.timer) clearTimeout(op.timer);
+      return false;
+    });
+    this.persist();
+    this.sendNext();
+  }
+
+  private persist(): void {
+    savePendingOps(
+      this.options.documentId,
+      this.options.email,
+      this.queue.map((op) => ({ opId: op.opId, update: op.update })),
+    );
+    this.options.callbacks?.onQueueChange?.(this.queue.length);
+  }
+
+  // --- Divers --------------------------------------------------------------
+  sendAwareness(payload: string): void {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ type: 'awareness', documentId: this.options.documentId, payload }));
+    }
   }
 
   isReadOnly(): boolean {
     return this.readOnly;
   }
 
+  queueSize(): number {
+    return this.queue.length;
+  }
+
+  currentSeq(): number {
+    return this.lastSeq;
+  }
+
   destroy(): void {
-    this.closedByUser = true;
+    this.closed = true;
+    this.doc.off('update', this.handleLocalUpdate);
     if (this.flushTimer) clearTimeout(this.flushTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.stopFallbackPolling();
-    this.doc.off('update', this.handleLocalUpdate);
+    for (const op of this.queue) if (op.timer) clearTimeout(op.timer);
     if (this.socket) {
       this.socket.onopen = null;
       this.socket.onmessage = null;
@@ -430,6 +407,6 @@ export class YjsWebSocketProvider {
       }
       this.socket = null;
     }
-    this.setStatus('closed');
+    this.setState('offline');
   }
 }
