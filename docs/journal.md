@@ -143,6 +143,19 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     classes `.topbar` / `.doc-toolbar` avec points de rupture à 768 px (identité et
     lien « Supervision » masqués, jauge compactée, actions en ligne défilante,
     colonne de présence masquée, `overflow-x: hidden` sur `body`).
+22. **Téléchargement du PDF en 404.** Le bouton apparaissait, puis
+    `GET http://localhost:3000/files/pdf/{docId}/v{seq}.pdf` renvoyait 404, alors
+    que le même chemin sur le port 4000 répondait 200. Le magasin d'objets local
+    renvoyait une URL **relative** (`/files/...`) : le navigateur la résolvait sur
+    l'origine de la page, c'est-à-dire le front (3000), qui ne sert pas les PDF.
+    En production, S3 renvoie toujours une URL absolue — le bouchon ne respectait
+    donc pas le contrat `ObjectStore.presign`. *Correction* : `LocalStore` reçoit
+    `baseUrl = http://localhost:{PORT}` et construit une URL absolue.
+    Vérifié par `backend/test-link-real.mjs`, qui contrôle explicitement
+    `^https?://` sur l'URL renvoyée, puis la télécharge réellement (13/13).
+    **Leçon, la même que pour le défaut 20** : un bouchon local qui ne respecte pas
+    le contrat de l'implémentation réelle fabrique de faux bugs — et mes tests
+    validaient le serveur, pas l'usage que le navigateur fait de la réponse.
 
 ## Preuves exécutées
 
