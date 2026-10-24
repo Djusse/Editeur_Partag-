@@ -39,13 +39,24 @@ async function json(path, opts = {}) {
   return { status: response.status, body };
 }
 
-async function write(auth, docId, opId, text) {
+/**
+ * Écrit du texte dans le document.
+ *
+ * `suffix` rend l'`opId` unique à chaque exécution : le serveur déduplique
+ * (`OpIds`), donc un `opId` constant serait considéré comme rejoué au deuxième
+ * passage et l'update ne serait pas appliqué — le test échouait alors sans
+ * qu'aucun code ne soit en cause.
+ */
+async function write(auth, docId, suffix, text) {
   const doc = new Y.Doc();
   doc.getText('content').insert(0, text);
   return json(`/api/documents/${docId}/updates`, {
     method: 'POST',
     headers: auth,
-    body: JSON.stringify({ opId, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') }),
+    body: JSON.stringify({
+      opId: `op_${suffix}_${RUN}`,
+      update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'),
+    }),
   });
 }
 
@@ -57,9 +68,14 @@ async function readText(auth, docId) {
 }
 
 // --- Preparation -----------------------------------------------------------
+// Identifiant unique par exécution : le mode local persiste sur disque, donc
+// une adresse fixe réutiliserait les crédits et les `opId` des passages
+// précédents.
+const RUN = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+
 const session = await json('/api/session', {
   method: 'POST',
-  body: JSON.stringify({ name: 'Versions', email: 'versions@exemple.cm' }),
+  body: JSON.stringify({ name: 'Versions', email: `versions-${RUN}@exemple.cm` }),
 });
 const auth = { authorization: `Bearer ${session.body.token}` };
 

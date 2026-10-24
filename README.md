@@ -193,9 +193,37 @@ est généré puis téléchargé.
 ```bash
 # Vérification automatisée du parcours (20 points), serveur local démarré
 cd backend && node e2e-local.mjs
+
+# Scénario d'épuisement du crédit (19 points) : C4 et sections 9.4 à 9.6
+cd backend && node test-credit-exhaustion.mjs
+
+# Le bundle client vise-t-il la bonne API ? (le serveur peut être sain et le
+# client faux : c'est arrivé trois fois, voir le journal)
+node tests/node/verify-client-bundle.mjs --dev
 ```
 
 Ce qui n'est **pas** testable en local : le pic de charge (C5), SES et nginx.
+
+#### Outils de développement (mode local uniquement)
+
+Le crédit est quotidien et un blocage dure jusqu'à minuit UTC : après avoir testé
+le scénario d'épuisement, le compte reste bloqué pour la journée. Pour rejouer le
+parcours sans attendre :
+
+```bash
+# Crédit et blocage d'une adresse
+curl -X POST http://localhost:4000/__reset-credit \
+  -H 'content-type: application/json' -d '{"email":"vous@exemple.cm"}'
+
+# Toutes les adresses du jour
+curl -X POST http://localhost:4000/__reset-credit
+```
+
+Ces routes ne sont enregistrées que par [`src/local/main.ts`](backend/src/local/main.ts:205) ;
+`src/server/main.ts` (production) ne les connaît pas.
+
+Le diagnostic complet est sur `GET http://localhost:4000/__debug` : clé
+d'administration et nombre de lignes par table.
 
 ### Test manuel sur le déploiement
 
