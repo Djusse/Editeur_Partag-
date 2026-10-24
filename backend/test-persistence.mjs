@@ -9,11 +9,16 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
 
-const API = 'http://localhost:4000';
+// Le test tourne sur un port et un fichier **dédiés**. Il supprime son fichier
+// de données pour partir d'un état vierge ; pointer sur le `.local-data.json`
+// partagé effaçait donc les documents de développement en cours — constaté en
+// essai (huit documents réduits à deux après une exécution).
+const PORT = Number(process.env.TEST_PERSISTENCE_PORT ?? 4100);
+const API = `http://localhost:${PORT}`;
 // `URL.pathname` laisse les caractères non ASCII encodés (`%C3%A9` pour « é »),
 // ce qui casse le `cwd` du processus enfant. `fileURLToPath` décode correctement.
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
-const DATA = fileURLToPath(new URL('.local-data.json', import.meta.url));
+const DATA = fileURLToPath(new URL('.local-data.test-persistence.json', import.meta.url));
 let ok = 0;
 let ko = 0;
 
@@ -46,9 +51,10 @@ async function json(path, opts = {}) {
 
 function stopServer() {
   try {
-    execSync("PID=$(ss -lptnH 'sport = :4000' | grep -oP 'pid=\\K[0-9]+' | head -1); [ -n \"$PID\" ] && kill $PID", {
-      shell: '/bin/bash',
-    });
+    execSync(
+      `PID=$(ss -lptnH 'sport = :${PORT}' | grep -oP 'pid=\\K[0-9]+' | head -1); [ -n "$PID" ] && kill $PID`,
+      { shell: '/bin/bash' },
+    );
   } catch {
     /* déjà arrêté */
   }
@@ -64,7 +70,7 @@ async function startServer() {
     cwd: ROOT,
     detached: true,
     stdio: 'ignore',
-    env: process.env,
+    env: { ...process.env, PORT: String(PORT), LOCAL_DATA_FILE: DATA },
   });
   child.unref();
 

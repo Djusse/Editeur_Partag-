@@ -21,6 +21,8 @@ samconfig.local.toml
 # Données du mode local (documents, liens, PDF simulés)
 .local-data.json
 .local-data.json.tmp
+.local-data.test-persistence.json
+.local-data.test-persistence.json.tmp
 
 # Tests et artefacts
 tests/results/
