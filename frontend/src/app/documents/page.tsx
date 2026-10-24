@@ -43,6 +43,13 @@ export default function DocumentsPage() {
         ]);
         setDocuments(list.documents);
         setCredit(creditInfo);
+        // Bloqué jusqu'à minuit UTC : on affiche la page dédiée plutôt que de
+        // laisser l'utilisateur cliquer des documents où il ne pourra pas écrire
+        // (C4 : 4 refus pour crédit épuisé). La lecture reste accessible en
+        // passant outre, la page de blocage propose « Continuer en lecture seule ».
+        if (creditInfo.blockedUntil && new Date(creditInfo.blockedUntil).getTime() > Date.now()) {
+          router.replace('/bloque');
+        }
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           clearSession();

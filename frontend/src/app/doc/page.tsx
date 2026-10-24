@@ -219,6 +219,15 @@ function EditorScreen() {
             setReadOnlyReason('blocked');
             if (payload.blockedUntil) setBlockedUntil(payload.blockedUntil);
             pushToast('Vos dernières modifications n\'ont pas été enregistrées.', 'error');
+            // 4ᵉ refus : l'écriture est suspendue jusqu'à minuit UTC (C4). On
+            // montre la page qui explique la cause et le terme, plutôt que de
+            // laisser l'utilisateur devant un éditeur inerte.
+            //
+            // On ne **déconnecte** pas : la session reste valable et la lecture
+            // est explicitement autorisée (spec 9.6). Couper la session
+            // obligerait à ressaisir son identité pour relire un document.
+            router.push('/bloque');
+            return;
           } else if (payload.code === 'FORBIDDEN') {
             setReadOnlyReason('forbidden');
             pushToast('Vous n\'avez plus accès à ce document.', 'error');

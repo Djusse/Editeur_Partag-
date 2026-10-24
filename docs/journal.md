@@ -210,6 +210,22 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     `slug()` conserve désormais accents et casse (`Rapport final — Été 2026.pdf`)
     au lieu de tout réduire en minuscules sans accents.
 
+26. **Le blocage n'existait que côté serveur.** Le compteur de refus et le
+    verrou (`4 refus → BLOCKED jusqu'à minuit UTC`, C4) fonctionnaient et étaient
+    testés depuis le début : `recordCreditRefusal` incrémente `Abuse[email#jour]`
+    avec un marqueur `REFUSED#` par `opId`, donc un `opId` rejoué ne compte
+    qu'une fois. Mais **rien ne l'annonçait** : l'utilisateur bloqué voyait un
+    éditeur inerte et un bandeau discret. *Correction* : page `/bloque` dédiée
+    (cause, terme exact, compte à rebours, « Continuer en lecture seule »,
+    « Changer d'identité »), vers laquelle on redirige dans trois cas —
+    connexion avec crédit déjà bloqué, ouverture de la liste des documents, et
+    4ᵉ refus pendant l'édition. Le blocage expire seul : la page se rafraîchit et
+    se redirige vers `/documents` sans action serveur.
+    **On ne déconnecte pas.** La spécification (9.6) autorise explicitement la
+    lecture pendant le blocage ; couper la session obligerait à ressaisir son
+    identité pour relire un document, ce qui n'apporte aucune sécurité
+    supplémentaire (aucun mot de passe, l'identité est déclarative).
+
 ## Preuves exécutées
 
 ```
@@ -220,10 +236,11 @@ persistance locale ....... 7/7   — document, texte, lien, session, clé admin
 versions ................. 11/11 — enregistrement, liste, restauration gratuite
 routes visiteur .......... 7/7   — /d/... à la racine, /api/d/... en 404
 lien réel (bout en bout) .. 13/13 — statut, claim, PDF, URL absolue, quota
+épuisement crédit ........ 19/19 — décompte exact, refus, non-journalisation, blocage
 bundle client (dev) ....... 8/8   — base API et WebSocket inlinées, routes réelles
 bundle client (prod) ...... 4/4   — chemin relatif /api, aucune URL localhost
 typecheck frontend ....... OK
-build Next ............... 8 pages statiques
+build Next ............... 8 pages statiques (dont /bloque)
 template CloudFormation .. YAML valide, 20 ressources
 ```
 

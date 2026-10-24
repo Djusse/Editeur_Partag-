@@ -40,7 +40,15 @@ export default function EntryPage() {
     try {
       const result = await api.createSession(trimmedName, trimmedEmail);
       saveSession({ token: result.token, name: result.user.name, email: result.user.email });
-      router.push('/documents');
+      // Crédit déjà épuisé ou écriture bloquée : la session reste valable (la
+      // lecture est permise), mais l'utilisateur doit savoir tout de suite qu'il
+      // ne pourra pas écrire. On l'envoie sur la page qui l'explique.
+      const blocked = result.credit.blockedUntil;
+      if (blocked && new Date(blocked).getTime() > Date.now()) {
+        router.push('/bloque');
+      } else {
+        router.push('/documents');
+      }
     } catch (error) {
       const message =
         error instanceof ApiError ? error.message : 'Connexion impossible. Réessayez dans un instant.';
