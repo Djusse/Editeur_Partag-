@@ -41,6 +41,12 @@ class LocalStore implements ObjectStore {
   readonly objects = new Map<string, { body: Uint8Array; type: string }>();
   /** Appelé après chaque écriture, pour la sauvegarde sur disque. */
   onChange: (() => void) | null = null;
+  /** Origine de l'API locale, utilisée pour construire des URL absolues. */
+  readonly baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+  }
 
   async put(key: string, body: Uint8Array, contentType: string): Promise<void> {
     this.objects.set(key, { body: new Uint8Array(body), type: contentType });
@@ -53,8 +59,16 @@ class LocalStore implements ObjectStore {
     return object.body;
   }
 
+  /**
+   * URL « présignée » du mode local.
+   *
+   * Elle doit être **absolue**. Un chemin relatif (`/files/...`) serait résolu
+   * par le navigateur sur l'origine de la page — c'est-à-dire le front
+   * (`localhost:3000`), qui ne sert pas les PDF, d'où un 404 au téléchargement.
+   * En production, S3 renvoie une URL absolue : on reproduit ce comportement.
+   */
   async presign(key: string, filename: string, ttl: number): Promise<string> {
-    return `/files/${key}?filename=${encodeURIComponent(filename)}&ttl=${ttl}`;
+    return `${this.baseUrl}/files/${key}?filename=${encodeURIComponent(filename)}&ttl=${ttl}`;
   }
 
   has(key: string): boolean {
@@ -100,7 +114,7 @@ async function main(): Promise<void> {
   resetConfigCache();
 
   const memory = new MemoryDatabase(TABLES);
-  const store = new LocalStore();
+  const store = new LocalStore(`http://localhost:${port}`);
 
   // --- Persistance sur disque ---------------------------------------------
   // Sans elle, chaque redémarrage effaçait liens, documents **et sessions** :

@@ -107,9 +107,17 @@ for (let attempt = 0; attempt < 10; attempt++) {
 }
 check('file -> PDF prêt', file.status === 200 && file.body.state === 'ready', file.body.url ?? '');
 
-// 5. Téléchargement réel
+// 5. Téléchargement réel.
+// L'URL doit être ABSOLUE : un chemin relatif serait résolu par le navigateur
+// sur l'origine de la page (le front, port 3000), qui ne sert pas les PDF.
 if (file.body.url) {
-  const pdf = await fetch(API + file.body.url);
+  check(
+    'URL du PDF absolue (pas un chemin relatif)',
+    /^https?:\/\//.test(file.body.url),
+    file.body.url.slice(0, 48),
+  );
+
+  const pdf = await fetch(file.body.url);
   const buffer = Buffer.from(await pdf.arrayBuffer());
   check('PDF téléchargeable', buffer.subarray(0, 5).toString() === '%PDF-', `${buffer.length} octets`);
 }
