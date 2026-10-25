@@ -489,7 +489,21 @@ Resources:
           # délai de la `CreationPolicy`. Les paquets utiles sont installés
           # nommément juste après. Réactiver si l'on veut une AMI à jour.
           step "installation-des-paquets"
-          dnf install -y nginx nodejs22 || { echo "ECHEC installation paquets"; exit 2; }
+          # `install_weak_deps=False` économise ~18 Mio (nodejs22-docs et
+          # nodejs22-full-i18n), inutiles au runtime et longs à télécharger.
+          dnf install -y nginx nodejs22 --setopt=install_weak_deps=False \
+            || { echo "ECHEC installation paquets"; exit 2; }
+
+          step "preparation-cache-nginx"
+          # `/var/cache/nginx` **n'existe pas** sur AL2023 : le paquet nginx ne
+          # le crée pas, et `proxy_cache_path` ne le crée pas non plus de façon
+          # fiable. Sans ce répertoire, `nginx -t` échoue avec :
+          #   nginx: [emerg] mkdir() "/var/cache/nginx/editeur" failed
+          #          (2: No such file or directory)
+          # L'image `nginx:alpine` le fournit, ce qui masquait le défaut en test.
+          mkdir -p /var/cache/nginx/editeur
+          chown -R nginx:nginx /var/cache/nginx 2>/dev/null || chown -R nginx:root /var/cache/nginx
+          chmod 700 /var/cache/nginx/editeur
 
           step "configuration-systeme"
 
@@ -608,6 +622,11 @@ Resources:
             sendfile on;
             keepalive_timeout 65;
             access_log /var/log/nginx/access.log;
+            # AL2023 émet un avertissement `types_hash` avec les valeurs par
+            # défaut ; on les relève, c'est gratuit et cela évite un warn à
+            # chaque `nginx -t` et à chaque rechargement.
+            types_hash_max_size 2048;
+            types_hash_bucket_size 128;
             proxy_cache_path /var/cache/nginx/editeur levels=1:2 keys_zone=MYCACHE:10m max_size=200m inactive=10m use_temp_path=off;
             include /etc/nginx/conf.d/*.conf;
           }
