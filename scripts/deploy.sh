@@ -181,24 +181,39 @@ echo "==> 4/6 Construction de l'application"
 rm -rf frontend/.next frontend/out backend/dist backend/node_modules frontend/node_modules build app.tar.gz
 
 # --- Contrôle d'espace ---------------------------------------------------
-# CloudShell ne dispose que d'environ 1 Gio dans `$HOME`. Le pic mesuré sur ce
-# dépôt est ~730 Mio (node_modules des deux projets + .next). On échoue tôt,
-# avec un message actionnable, plutôt qu'au milieu d'un `npm ci`.
-NEED_MB=800
+# CloudShell ne dispose que d'environ 1 Gio dans `$HOME`. On échoue tôt, avec
+# un message actionnable, plutôt qu'au milieu d'un `npm ci`.
+#
+# Le pic réel a été mesuré à ~880 Mio (backend 166 + frontend 448 + .next 105
+# + build 70 + sources), ce qui dépassait une première estimation à 800 : le
+# déploiement échouait en `ENOSPC` juste après le `next build`. D'où le seuil
+# relevé et, surtout, la suppression des `node_modules` **au fur et à mesure**.
+NEED_MB=900
 AVAIL_MB="$(df -Pm "$ROOT" | awk 'NR==2 {print $4}')"
 echo "    espace libre : ${AVAIL_MB} Mio (requis ~${NEED_MB} Mio)"
 if [[ -n "$AVAIL_MB" && "$AVAIL_MB" -lt "$NEED_MB" ]]; then
   echo "ERREUR : espace insuffisant dans $ROOT (${AVAIL_MB} Mio libres, ~${NEED_MB} requis)."
   echo "  Options :"
-  echo "    - libérer de la place : rm -rf ~/Editeur_Partag-/build ~/Editeur_Partag-/app.tar.gz"
-  echo "    - ou travailler dans /tmp :"
-  echo "        mkdir -p /tmp/build && cd /tmp/build"
-  echo "        git clone <url-du-depot> && cd Editeur_Partag-"
-  echo "        ./scripts/deploy.sh"
+  echo "    - libérer de la place : rm -rf ~/Editeur_Partag-/{build,app.tar.gz,backend/node_modules,frontend/node_modules,frontend/.next}"
+  echo "    - CloudShell plafonne le home à 1 Gio : un second déploiement dans le"
+  echo "      même home est donc limite. Le script nettoie normalement derrière lui."
   exit 1
 fi
 
+# --- Backend : build puis libération immédiate de ses dépendances ------------
 (cd backend && npm ci --no-audit --no-fund && npm run build)
+dist_ok=0
+[[ -f backend/dist/server/main.mjs && -f backend/dist/server/worker.mjs ]] && dist_ok=1
+if [[ "$dist_ok" -ne 1 ]]; then
+  echo "ERREUR : backend/dist/server/{main,worker}.mjs absents — le build a échoué."
+  exit 1
+fi
+# 166 Mio rendus au disque : ils ne servent plus, le bundle est autonome
+# (`--packages=external`, les dépendances sont réinstallées dans build/ plus bas).
+rm -rf backend/node_modules
+echo "    backend : dist construit, node_modules libéré"
+
+# --- Frontend : build puis libération immédiate ------------------------------
 (cd frontend && npm ci --no-audit --no-fund && npm run build)
 
 # Garde-fou : sans export statique, nginx n'aurait aucun fichier à servir.
@@ -215,12 +230,19 @@ if grep -rq "localhost:4000" frontend/out 2>/dev/null; then
   exit 1
 fi
 
+# `out/` est copié d'abord dans build/, puis les 448 Mio de dépendances de
+# build (Next.js, TypeScript…) sont libérés : le reste du script n'en a plus
+# besoin, et c'est ce qui permet de tenir dans le gigaoctet de CloudShell.
 rm -rf build && mkdir -p build
 cp -r backend/dist build/dist
 cp backend/package.json build/package.json
+cp -r frontend/out build/public
+
+rm -rf frontend/node_modules frontend/.next
+echo "    frontend : out/ copié, node_modules libéré"
+
 # Dépendances de production uniquement (pdfkit, ws, yjs, SDK AWS…).
 (cd build && npm install --omit=dev --no-audit --no-fund --ignore-scripts)
-cp -r frontend/out build/public
 tar -czf app.tar.gz -C build .
 
 # --- Libération de l'espace -------------------------------------------------
