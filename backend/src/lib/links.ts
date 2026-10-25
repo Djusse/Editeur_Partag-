@@ -55,7 +55,10 @@ export async function createLink(input: CreateLinkInput): Promise<LinkRow> {
     createdAt: new Date().toISOString(),
   };
   await db().put(config().linksTable, link as unknown as Record<string, unknown>, {
-    condition: 'attribute_not_exists(token)',
+    // `token` est un **mot réservé** DynamoDB : sans alias, l'expression est
+    // rejetée avec « Attribute name is a reserved keyword; reserved keyword: token ».
+    condition: 'attribute_not_exists(#token)',
+    names: { '#token': 'token' },
   });
   return link;
 }

@@ -125,7 +125,9 @@ code sous forme de commentaire.
 | 6 | `ENOSPC: no space left on device` en fin de build | CloudShell plafonne `$HOME` à 1 Gio ; `node_modules` et le cache npm s'y accumulaient | libération au fur et à mesure dans `deploy.sh` (pic ramené de ~880 à 665 Mio) + purge du cache npm |
 | 7 | `X-Cache-Status` absent au diagnostic | `add_header` ne s'applique pas aux 404 sans le mot-clé `always` | `add_header … always` |
 | 8 | « N modifications en attente » sans fin, « Connecté », crédit intact | `used + :chars <= :limit` dans une `ConditionExpression` : **DynamoDB refuse l'arithmétique entre deux valeurs** (`Syntax error; token: "+"`). Le double en mémoire, lui, l'évaluait → **42 tests verts et aucune écriture possible** | contrôle du plafond par **lecture préalable** ; le double de test lève désormais sur cette forme |
-| 9 | Le client reste silencieux malgré l'échec serveur | `commitBatch` lève, `tick` journalise et **rejoue indéfiniment** sans prévenir personne | à traiter : envoyer un message `error` au client plutôt que boucler |
+| 9 | Le client reste silencieux malgré l'échec serveur | `commitBatch` lève, `tick` journalise et **rejoue indéfiniment** sans prévenir personne | message `WRITE_FAILED` envoyé au client, toast « Enregistrement impossible » |
+| 10 | `500` sur `POST /api/documents/:id/links` | `attribute_not_exists(token)` : **`token` est un mot réservé DynamoDB** (`Attribute name is a reserved keyword`) | alias `#token` ; le double de test rejette désormais les mots réservés non aliasés |
+| 11 | (latent) écriture du document après la correction 8 | `seq = :current` : `seq` est **aussi** un mot réservé | alias `#seq` dans `SET` et la condition |
 
 Les défauts 3, 4 et 8 sont les plus instructifs.
 

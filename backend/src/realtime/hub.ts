@@ -299,8 +299,11 @@ export async function commitBatch(
       Update: {
         table: cfg.documentsTable,
         key: { docId: state.docId },
-        update: 'SET seq = :next, updatedAt = :now, textLength = :len',
-        condition: 'seq = :current',
+        update: 'SET #seq = :next, updatedAt = :now, textLength = :len',
+        // `seq` est un **mot réservé** DynamoDB : alias obligatoire, sinon
+        // « Attribute name is a reserved keyword; reserved keyword: seq ».
+        condition: '#seq = :current',
+        names: { '#seq': 'seq' },
         values: {
           ':next': nextSeq,
           ':current': state.seq,

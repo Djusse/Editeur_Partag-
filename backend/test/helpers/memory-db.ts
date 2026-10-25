@@ -352,6 +352,41 @@ function splitTopLevelOperator(expression: string, operator: string): string[] {
   return parts;
 }
 
+/**
+ * Mots réservés DynamoDB apparaissant dans les noms d'attributs du projet.
+ *
+ * DynamoDB les refuse dans une expression, sauf s'ils sont aliasés par
+ * `#nom` + `ExpressionAttributeNames`. Le double **doit** les rejeter aussi,
+ * sinon un test peut passer sur une expression que le service refuse —
+ * exactement ce qui est arrivé avec `attribute_not_exists(token)` et
+ * `seq = :current` (500 sur la création de lien, écriture des documents
+ * silencieusement cassée).
+ */
+const RESERVED = new Set([
+  'token', 'seq', 'status', 'size', 'action', 'data', 'name', 'role', 'type',
+  'state', 'value', 'values', 'date', 'time', 'timestamp', 'key', 'count',
+  'limit', 'order', 'source', 'target', 'region', 'connection', 'identity',
+  'owner', 'group', 'user', 'path', 'percent', 'range', 'read', 'write',
+]);
+
+/** Rejette un attribut non aliasé qui serait un mot réservé. */
+function assertNotReserved(expression: string, names: Record<string, string>): void {
+  // On retire d'abord les alias `#xxx` (ils rendent l'expression valide quel
+  // que soit le nom réel) **et** les valeurs `:xxx` (ce ne sont pas des
+  // attributs : `:limit` ne déclenche pas le contrôle des mots réservés).
+  const stripped = expression.replace(/#\w+/g, '').replace(/:\w+/g, '');
+  for (const word of stripped.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) {
+    // Noms de fonctions DynamoDB : jamais des attributs.
+    if (/^(attribute_exists|attribute_not_exists|begins_with|contains|AND|OR|NOT)$/i.test(word)) continue;
+    if (RESERVED.has(word.toLowerCase())) {
+      throw new Error(
+        `Invalid ConditionExpression: Attribute name is a reserved keyword; reserved keyword: ${word} — ${expression}`,
+      );
+    }
+  }
+  void names;
+}
+
 /** Évalue une condition DynamoDB (sous-ensemble réellement utilisé). */
 function evaluate(
   expression: string,
@@ -359,6 +394,7 @@ function evaluate(
   values: Record<string, unknown>,
   names: Record<string, string>,
 ): boolean {
+  assertNotReserved(expression, names);
   const trimmed = stripOuterParens(expression.trim());
 
   if (splitTopLevelOperator(trimmed, ' AND ').length > 1) {
