@@ -4,35 +4,39 @@
  *
  * Objectif du plan v7 : montée 50 → 100 → 300 rédacteurs.
  *
- * Ce que k6 peut mesurer correctement ici :
- *   - le nombre d'updates **acquittés** (`ack` reçu avec l'`opId` émis) ;
- *   - l'absence d'updates sans acquittement après le délai de garde ;
+ * ── Ce que k6 mesure ici ────────────────────────────────────────────────────
+ *   - le nombre d'updates **acquittés** (`ack` reçu pour l'`opId` émis) ;
+ *   - l'absence d'updates sans acquittement après le sursis laissé aux `ack` ;
  *   - la latence d'acquittement sous charge.
  *
- * Ce qu'il ne mesure pas : la **contiguïté du journal** et la convergence du
- * **contenu**. k6 ne peut pas faire tourner un vrai client Yjs (moteur JS
- * embarqué, sans `Buffer` ni modules Node). Ces deux preuves sont apportées par
- * `tests/node/verify-convergence.mjs`, exécuté après S2 : il reconstruit le
- * document depuis le journal, vérifie que les `seq` sont contigus et que
- * insertions − suppressions = longueur finale.
+ * ── Ce que k6 ne peut pas mesurer ──────────────────────────────────────────
+ * La contiguïté du journal et la convergence du **contenu**. k6 ne fait pas
+ * tourner de client Yjs (moteur JS embarqué, sans `Buffer` ni modules Node).
+ * Une version précédente prétendait vérifier la contiguïté du `seq` depuis k6 :
+ * c'était faux, le `seq` est **global au document** et chaque VU n'en voit
+ * qu'une tranche. Une suite « 41, 42, 43 » par VU est normale et ne dit rien
+ * sur l'absence de trous.
  *
- * ⚠️ Une version précédente de ce fichier prétendait vérifier la contiguïté
- * depuis k6. C'était faux : le `seq` est **global au document**, et chaque VU ne
- * voit que les `seq` émis pendant que sa propre connexion était ouverte. Des
- * suites « 41, 42, 43 » par VU sont parfaitement normales et ne disent rien sur
- * l'absence de trous. La vérification a donc été retirée d'ici plutôt que
- * laissée en place avec un résultat qui ne prouvait rien.
+ * Ces deux preuves sont apportées par `tests/node/verify-convergence.mjs`,
+ * exécuté après S2 : il reconstruit le document depuis le journal, vérifie les
+ * `seq` contigus et compare deux reconstructions indépendantes.
  *
- * ⚠️ Contrainte de crédit : 10 000 caractères par jour et par **e-mail**. Un
- * jeton unique est donc partagé par tous les VUs. À 300 rédacteurs, il faut
- * plusieurs jetons ou une durée courte — voir `TOKENS` ci-dessous.
+ * ── Profil de charge ───────────────────────────────────────────────────────
+ * Connexion **persistante**, un update toutes les `PACE_MS` pendant `DURATION`.
+ * Une version antérieure ouvrait une connexion par update : au banc, 110
+ * itérations par seconde et par VU, soit 220 caractères/s — le quota de
+ * 10 000 caractères partait en 45 s et le test mesurait le blocage de crédit.
+ *
+ * ── Crédit ─────────────────────────────────────────────────────────────────
+ * 10 000 caractères par jour et par **e-mail**. Budget par VU :
+ * `DURATION / PACE_MS` caractères. À 4 jetons, `ceil(WRITERS / 4)` VUs
+ * partagent chaque quota : vérifier
+ * `ceil(WRITERS/4) × (DURATION/1000) / (PACE_MS/1000) < 10000`.
+ * À 50 rédacteurs, 1 s de cadence, 45 s : 50 caractères par compte.
  *
  * Usage :
- *   k6 run -e API_URL=http://<ip> -e TOKEN=<jwt> -e DOC_ID=<doc> \
- *          -e WRITERS=100 -e DURATION=45s tests/k6/s2-convergence.js
- *
- *   # plusieurs jetons (un par groupe de VUs), séparés par des virgules
- *   k6 run -e TOKEN=a,b,c -e WRITERS=300 …
+ *   k6 run -e API_URL=http://<ip> -e TOKEN=<jwt1,jwt2,…> -e DOC_ID=<doc> \
+ *          -e WRITERS=100 -e DURATION=45s -e PACE_MS=1000 tests/k6/s2-convergence.js
  */
 import http from 'k6/http';
 import { check, sleep } from 'k6';
@@ -42,10 +46,12 @@ import { runWriterSession, wsBase } from './lib/ws.js';
 
 const WRITERS = Number(__ENV.WRITERS || 100);
 const DURATION = __ENV.DURATION || '45s';
-/** Updates envoyés par itération, par rédacteur. */
-const UPDATES_PER_ITER = Number(__ENV.UPDATES_PER_ITER || 2);
-/** Délai d'attente des acquittements avant de conclure à une perte. */
+/** Cadence d'écriture d'un rédacteur : un update par seconde. */
+const PACE_MS = Number(__ENV.PACE_MS || 1000);
+/** Sursis laissé aux `ack` en vol après l'arrêt de l'écriture. */
 const ACK_WAIT_MS = Number(__ENV.ACK_WAIT_MS || 2500);
+
+const durationMs = parseDuration(DURATION);
 
 const acked = new Counter('s2_acked');
 const rejected = new Counter('s2_rejected');
@@ -63,7 +69,9 @@ export const options = {
       executor: 'constant-vus',
       vus: WRITERS,
       duration: DURATION,
-      gracefulStop: '15s',
+      // Doit couvrir la durée de session + le sursis des `ack`, sinon k6 coupe
+      // les connexions avant qu'on puisse compter les updates perdues.
+      gracefulStop: `${Math.ceil((durationMs + ACK_WAIT_MS * 2) / 1000)}s`,
       tags: { scenario: 's2' },
     },
   },
@@ -77,6 +85,25 @@ export const options = {
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
 
+/** « 45s », « 2m », « 90 » → millisecondes. */
+function parseDuration(value) {
+  const raw = String(value).trim();
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(raw);
+  if (!match) return 45000;
+  const amount = Number(match[1]);
+  switch (match[2]) {
+    case 'ms':
+      return amount;
+    case 'm':
+      return amount * 60000;
+    case 'h':
+      return amount * 3600000;
+    case 's':
+    default:
+      return amount * 1000;
+  }
+}
+
 /** Jetons disponibles : `TOKEN=a,b,c` ou un seul. */
 function tokens() {
   const raw = requireEnv('TOKEN');
@@ -87,12 +114,10 @@ function tokens() {
 }
 
 /**
- * Chaque VU reçoit son propre jeton.
+ * Chaque VU reçoit son jeton.
  *
  * Le crédit étant compté **par e-mail**, répartir les VUs sur plusieurs jetons
  * est la seule façon de tester 300 rédacteurs sans épuiser un compte unique.
- * Avec un seul jeton, tous partagent 10 000 caractères : à 2 updates de
- * 1 caractère par seconde et par VU, 300 VUs épuisent le quota en ~17 s.
  */
 function tokenFor(vu, list) {
   return list[(vu - 1) % list.length];
@@ -113,10 +138,11 @@ export function setup() {
     tags: { name: 'state' },
   });
 
-  const usable = check(stateResponse, {
-    'S2 : document accessible (200)': (r) => r.status === 200,
-  });
-  if (!usable) {
+  if (
+    !check(stateResponse, {
+      'S2 : document accessible (200)': (r) => r.status === 200,
+    })
+  ) {
     // Échec au démarrage, message explicite : un scénario qui démarre sans
     // accès mesurerait des 403 et produirait des chiffres trompeurs.
     throw new Error(
@@ -127,11 +153,26 @@ export function setup() {
 
   const sinceSeq = Number(JSON.parse(stateResponse.body).seq || 0);
 
+  // Budget de crédit : à documenter dans le rapport, et à comparer au plafond.
+  const vusPerToken = Math.ceil(WRITERS / list.length);
+  const charsPerVu = Math.ceil(durationMs / PACE_MS);
+  const budget = vusPerToken * charsPerVu;
+  const overBudget = budget > 10000;
+
   console.log(
     `S2 — document ${docId}, ${WRITERS} rédacteurs, ${list.length} jeton(s), ` +
-      `${DURATION}, depuis seq=${sinceSeq}`,
+      `${DURATION}, cadence ${PACE_MS} ms, depuis seq=${sinceSeq}` +
+      ` — budget ${budget} caractères/compte${overBudget ? ' ⚠ DÉPASSE 10 000' : ''}`,
   );
-  return { docId, tokens: list, run: runId(), sinceSeq, startSeq: sinceSeq };
+  if (overBudget) {
+    console.warn(
+      `S2 — le budget de crédit dépasse le plafond quotidien (${budget} > 10 000). ` +
+        'Augmenter PACE_MS, réduire DURATION, ou fournir plus de jetons : ' +
+        'sinon les refus de crédit domineront la mesure.',
+    );
+  }
+
+  return { docId, tokens: list, run: runId(), sinceSeq, budget, overBudget };
 }
 
 export default function (data) {
@@ -150,8 +191,7 @@ export default function (data) {
   // 50 VUs ont bouclé 30 431 itérations en 45 s sans jamais se connecter.
   // Diagnostic explicite : 403 signifie « compte non membre du document »,
   // 401 « jeton invalide ». Ces deux causes ont des corrections opposées, et
-  // les confondre fait perdre du temps (2 250 tickets refusés en 45 s lors du
-  // premier essai, sans indice sur la cause).
+  // les confondre fait perdre du temps.
   const ticketOk = check(ticketResponse, {
     'S2 : ticket obtenu (201)': (r) => r.status === 201,
     'S2 : compte membre du document': (r) => r.status !== 403,
@@ -175,11 +215,13 @@ export default function (data) {
 
   const ticket = JSON.parse(ticketResponse.body).ticket;
   const session = runWriterSession({
-    url: `${wsBase(__ENV.API_URL)}/ws?ticket=${encodeURIComponent(ticket)}` +
+    url:
+      `${wsBase(__ENV.API_URL)}/ws?ticket=${encodeURIComponent(ticket)}` +
       `&documentId=${encodeURIComponent(data.docId)}`,
     docId: data.docId,
     sinceSeq: data.sinceSeq,
-    count: UPDATES_PER_ITER,
+    paceMs: PACE_MS,
+    durationMs,
     updateB64: __ENV.UPDATE_B64 || 'AQGd+OWCBAAEAQdjb250ZW50AXgA',
     opPrefix: `op_s2_${data.run}_${__VU}_${__ITER}`,
     ackWaitMs: ACK_WAIT_MS,
@@ -245,6 +287,8 @@ export function handleSummary(data) {
     lines.push(`  vérifications échouées          ${checks.fails}`);
   }
 
+  lines.push(...failedThresholds(data.metrics ?? {}));
+
   lines.push('');
   if (ticketKo > 0) {
     lines.push(
@@ -258,22 +302,21 @@ export function handleSummary(data) {
     lines.push(`=> C2 NON PROUVÉE : ${missing} update(s) accepté(s) sans acquittement.`);
   } else if (ack === 0) {
     lines.push('=> AUCUN UPDATE ACQUITTÉ : le WebSocket ne s\'est pas ouvert, ou le document est vide.');
-  } else {
+  } else if (refused > 0) {
     lines.push(
-      `=> C2 tenue sur cette charge : ${ack} updates acquittés, 0 perdu.`,
+      `=> MESURE INVALIDÉE PAR LE CRÉDIT : ${refused} VU(s) arrêté(s) par épuisement de quota. ` +
+        `${ack} updates acquittés, 0 perdu, mais le palier n'a pas été tenu jusqu'au bout — ` +
+        `augmenter PACE_MS, réduire DURATION, ou fournir plus de jetons.`,
     );
-    if (refused > 0) {
-      lines.push(
-        `   (${refused} VU(s) stoppé(s) par épuisement de crédit — répartir sur d'autres jetons pour un palier plus haut)`,
-      );
-    }
+  } else {
+    lines.push(`=> C2 tenue sur cette charge : ${ack} updates acquittés, 0 perdu.`);
   }
-
-  lines.push(...failedThresholds(data.metrics ?? {}));
 
   lines.push('');
   lines.push('Contiguïté du journal ET convergence du contenu, à exécuter après ce test :');
-  lines.push('  node tests/node/verify-convergence.mjs --api=<url> --token=<jwt> --doc=<doc>');
+  lines.push(
+    '  node tests/node/verify-convergence.mjs --api=<url>/api --token=<jwt> --doc=<doc>',
+  );
   lines.push('');
 
   return {

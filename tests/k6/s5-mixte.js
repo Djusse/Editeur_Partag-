@@ -44,6 +44,26 @@ const VISITORS = Number(__ENV.VISITORS || 15000);
 const MAX_DOWNLOADS = Number(__ENV.MAX_DOWNLOADS || 500);
 const WRITERS = Number(__ENV.WRITERS || 300);
 const WRITER_DURATION = __ENV.WRITER_DURATION || '120s';
+/** Cadence d'écriture d'un rédacteur, en ms. */
+const PACE_MS = Number(__ENV.PACE_MS || 2000);
+
+const writerDurationMs = (() => {
+  const raw = String(WRITER_DURATION).trim();
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(raw);
+  if (!match) return 120000;
+  const amount = Number(match[1]);
+  switch (match[2]) {
+    case 'ms':
+      return amount;
+    case 'm':
+      return amount * 60000;
+    case 'h':
+      return amount * 3600000;
+    case 's':
+    default:
+      return amount * 1000;
+  }
+})();
 
 /**
  * Compression des paliers, pour les essais à blanc.
@@ -224,13 +244,18 @@ export function writerFlow(data) {
   }
 
   const ticket = JSON.parse(ticketResponse.body).ticket;
+  // Session **persistante** : un rédacteur garde sa connexion ouverte. Sans
+  // cadence, chaque VU bouclait ~110 fois par seconde et consommait le quota de
+  // 10 000 caractères en quelques secondes (mesuré au banc) : le test mesurait
+  // alors le blocage de crédit, pas le pic.
   const session = runWriterSession({
     url:
       `${wsBase(__ENV.API_URL)}/ws?ticket=${encodeURIComponent(ticket)}` +
       `&documentId=${encodeURIComponent(data.docId)}`,
     docId: data.docId,
     sinceSeq: data.sinceSeq,
-    count: 10,
+    paceMs: PACE_MS,
+    durationMs: writerDurationMs,
     updateB64: __ENV.UPDATE_B64 || 'AQGd+OWCBAAEAQdjb250ZW50AXgA',
     opPrefix: `op_s5_${data.run}_${__VU}_${__ITER}`,
     ackWaitMs: Number(__ENV.ACK_WAIT_MS || 4000),
@@ -247,9 +272,6 @@ export function writerFlow(data) {
     writerMissing.add(session.missing);
     writerRejected.add(session.missing);
   }
-
-  // Une courte pause hors connexion : on mesure le pic, pas une boucle tight.
-  sleep(1);
 }
 
 /** Sonde `/status` : c'est le micro-cache nginx qui doit répondre. */

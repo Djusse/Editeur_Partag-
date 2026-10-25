@@ -88,13 +88,44 @@ DOC_ID=$(curl -s -X POST http://13.53.160.209/api/documents \
   -d '{"title":"Charge S2"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
 k6 run -e API_URL=http://13.53.160.209 -e TOKEN=$TOKEN -e DOC_ID=$DOC_ID \
-       -e WRITERS=100 -e DURATION=60s \
-       --summary-export=tests/results/s2-100.json \
+       -e WRITERS=100 -e DURATION=60s -e PACE_MS=1000 \
        tests/k6/s2-convergence.js
 ```
 
 Paliers : `WRITERS=50`, puis `100`, puis `300`. Le palier retenu est le plus
 haut où `s2_missing_ack` reste à 0.
+
+### Connexion persistante et cadence
+
+Chaque VU ouvre **une** connexion WebSocket et écrit toutes les `PACE_MS`
+pendant `DURATION` — c'est le profil d'un rédacteur réel.
+
+Une version antérieure ouvrait une connexion par update. Au banc, chaque VU
+bouclait alors ~110 itérations par seconde, soit 220 caractères/s : le quota de
+10 000 caractères partait en 45 s et le test mesurait le **blocage de crédit**
+au lieu de la convergence. Ouvrir et fermer une connexion par update teste en
+outre la poignée de main, pas le hub.
+
+### Budget de crédit à vérifier avant chaque tir
+
+Crédit : 10 000 caractères par jour et **par e-mail**. Avec `T` jetons,
+`ceil(WRITERS / T)` VUs partagent chaque quota, d'où
+
+```
+budget par compte = ceil(WRITERS / T) × (DURATION / PACE_MS)
+```
+
+S2 affiche ce budget au démarrage et prévient s'il dépasse 10 000. Repères :
+
+| WRITERS | jetons | DURATION | PACE_MS | budget/compte |
+| - | - | - | - | - |
+| 50 | 1 | 45 s | 1000 | 50 |
+| 100 | 1 | 60 s | 1000 | 60 |
+| 300 | 4 | 60 s | 1000 | 75 |
+
+Un budget dépassé ne casse pas C2 : les VUs sont arrêtés par un refus explicite
+et le verdict affiche **« MESURE INVALIDÉE PAR LE CRÉDIT »**. C'est volontaire —
+un palier interrompu ne prouve rien, et le taire serait pire.
 
 Le crédit est de 10 000 caractères **par e-mail** : à plus d'un jeton, répartir
 les VUs avec `-e TOKEN=j1,j2,j3`. Les comptes doivent être **membres** du
@@ -121,12 +152,26 @@ attendu : `CONVERGENCE OK`, code de sortie 0.
 
 ```bash
 k6 run -e API_URL=http://13.53.160.209 \
-       -e TOKEN=$TOKEN -e TOKEN2=$TOKEN2 \
+       -e TOKEN=$TOKEN \
        -e DOC_ID=$DOC_ID \
        -e VISITORS=15000 -e MAX_DOWNLOADS=500 -e WRITERS=300 \
-       --summary-export=tests/results/s5.json \
+       -e WRITER_DURATION=120s -e PACE_MS=2000 \
        tests/k6/s5-mixte.js
 ```
+
+Essai à blanc avant le tir réel — mêmes scénarios, ~17 s au lieu de 115 s :
+
+```bash
+k6 run -e API_URL=http://13.53.160.209 -e TOKEN=$TOKEN -e DOC_ID=$DOC_ID \
+       -e VISITORS=200 -e MAX_DOWNLOADS=10 -e WRITERS=4 \
+       -e WRITER_DURATION=10s -e PACE_MS=1000 -e RAMP_SCALE=0.15 \
+       tests/k6/s5-mixte.js
+```
+
+Le verdict de S5 vient de `handleSummary`, qui seul reçoit les métriques
+agrégées de tous les VUs. Un `✗` en fin de scénario n'est pas un échec de test :
+k6 renvoie le code 99 quand un seuil casse, et les scripts énumèrent eux-mêmes
+les seuils en échec (`SEUIL EN ÉCHEC : …`).
 
 Pendant l'exécution, relever le CPU et la mémoire de l'instance :
 
