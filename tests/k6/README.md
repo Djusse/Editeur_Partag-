@@ -9,15 +9,35 @@ Le test doit tourner **dans la même région AWS que l'instance** : depuis un po
 local, on mesurerait le réseau, pas l'application.
 
 ```bash
-# Sur une EC2 dédiée (t3.small suffit pour la charge elle-même)
-sudo dnf install -y dnf-plugins-core
-sudo dnf config-manager --add-repo https://dl.k6.io/rpm/repo.repo
-sudo dnf install -y k6
-
-k6 version    # ≥ 0.49
+sudo ./tests/k6/install-k6.sh
+k6 version
 ```
 
+`install-k6.sh` récupère le **binaire officiel** de la dernière version, et non
+le paquet RPM : le dépôt `dl.k6.io/rpm` n'a pas toujours de paquet pour Amazon
+Linux 2023 (échec constaté). Le script échoue bruyamment si un étape casse —
+une installation silencieusement ratée coûte plus cher qu'une installation
+visible (`k6: command not found` au moment du test).
+
 `k6` n'a besoin d'aucune dépendance Node : les scripts sont autonomes.
+
+### Le seul module WebSocket qui fonctionne partout
+
+Les scénarios S2 et S5 ouvrent de vraies connexions WebSocket, via
+[`lib/ws.js`](lib/ws.js), qui importe **`k6/ws`**.
+
+Ce choix n'est pas cosmétique. Vérifié au banc sur k6 v0.54.0 :
+
+| Module | v0.54.0 | Remarque |
+| - | - | - |
+| `WebSocket` global | ❌ | `ReferenceError: WebSocket is not defined` |
+| `k6/experimental/websocket` | ❌ | `unknown module` |
+| `k6/websocket` | ❌ | `unknown module` (n'existe qu'à partir de k6 v1.0) |
+| `k6/ws` | ✅ | présent depuis la 0.41, API inchangée |
+
+Autrement dit : toute autre choix casse le test sur une partie des versions
+installables. `lib/ws.js` documente aussi les différences d'API (`ws.connect`,
+`socket.on('message')`, `socket.setTimeout`) qui expliquent sa forme.
 
 ## Récupérer un jeton
 
@@ -76,13 +96,26 @@ k6 run -e API_URL=http://13.53.160.209 -e TOKEN=$TOKEN -e DOC_ID=$DOC_ID \
 Paliers : `WRITERS=50`, puis `100`, puis `300`. Le palier retenu est le plus
 haut où `s2_missing_ack` reste à 0.
 
-**k6 mesure le débit d'acquittement et la contiguïté du `seq`.** La convergence
-du **contenu** se vérifie ensuite avec un client Yjs :
+Le crédit est de 10 000 caractères **par e-mail** : à plus d'un jeton, répartir
+les VUs avec `-e TOKEN=j1,j2,j3`. Les comptes doivent être **membres** du
+document, sinon `POST /ws-ticket` répond 403 — `mktokens.sh` fait les deux :
+
+```bash
+./tests/k6/mktokens.sh 4 /home/ec2-user/tokens.txt "$DOC_ID" "$OWNER_TOKEN"
+```
+
+**k6 mesure le débit d'acquittement.** La contiguïté du journal et la
+convergence du **contenu** se vérifient ensuite avec un vrai client Yjs :
 
 ```bash
 node tests/node/verify-convergence.mjs \
-  --api=http://13.53.160.209 --token=$TOKEN --doc=$DOC_ID
+  --api=http://13.53.160.209/api --token=$TOKEN --doc=$DOC_ID
 ```
+
+Le `--api` inclut le préfixe `/api`. Le script reconstruit le document depuis
+`/state` puis le journal paginé de `/updates`, contrôle la contiguïté des `seq`,
+et compare deux reconstructions indépendantes (empreinte SHA-256). Verdict
+attendu : `CONVERGENCE OK`, code de sortie 0.
 
 ## S5 — C5 : pic complet (visiteurs + rédacteurs)
 
@@ -166,5 +199,20 @@ ordinaire, contre l'instance en production (`API_URL=http://13.53.160.209`).
   fausserait le test (les `error` seraient comptés comme des rejets).
 - **`LINK_TOKEN` peut être réutilisé** dans S5 pour éviter de recréer un lien :
   `-e LINK_TOKEN=<token>`. Un lien déjà épuisé donnera 100 % d'`exhausted`.
+  Le quota d'un lien réutilisé est inconnu (`/status` ne publie que `remaining`),
+  donc le verdict S5 n'affiche pas de comparaison à `MAX_DOWNLOADS` : il
+  indiquerait « 500 sur 100 », ce qui serait faux.
 - **La garde mémoire** renvoie `202 waiting` plutôt que d'écraser DynamoDB :
   c'est normal et attendu. Ne le comptez pas comme un échec.
+- **Ne pas mettre de seuil sur `http_req_failed` dans le scénario visiteur.**
+  k6 compte tout statut ≥ 400 comme échec, or 410 « épuisé » est une réponse
+  **normale** du parcours visiteur. Un tel seuil est inatteignable par
+  construction (mesuré : 84 % de « requêtes échouées » sans la moindre panne).
+  Le critère « aucun 5xx » est porté par le compteur `s5_visitor_errors`.
+- **Un `✗` en fin de scénario n'est pas forcément un échec de test.** k6 renvoie
+  le code 99 quand un seuil casse : c'est ce code, et non la croix, qui fait foi.
+  Les scripts énumèrent eux-mêmes les seuils en échec (`SEUIL EN ÉCHEC : …`),
+  car renvoyer `stdout` depuis `handleSummary` supprime le tableau de k6.
+- **Essai à blanc avant le tir réel.** `-e RAMP_SCALE=0.15` compresse les
+  paliers de S5 de 115 s à ~17 s, sans changer la forme de la charge. Cela
+  évite les deux minutes perdues par essai — et la tentation de ne pas tester.

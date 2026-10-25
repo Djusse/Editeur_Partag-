@@ -6,14 +6,14 @@
  *
  * Ce que le test doit prouver :
  *   - les visiteurs obtiennent toujours un état explicite (`ready` / `waiting` /
- *     `exhausted`), jamais une erreur ;
+ *     `exhausted`), jamais une erreur 5xx ;
  *   - les rédacteurs ne sont **pas perturbés** : leurs updates restent acquittés ;
  *   - le micro-cache de `/status` absorbe le pic (nginx, pas Node) ;
  *   - l'instance tient : CPU et mémoire restent dans les limites.
  *
  * Les métriques système (CPU, mémoire) ne sont **pas** visibles depuis k6 : il
- * faut les relever en parallèle sur CloudWatch. La commande est fournie en fin
- * de script.
+ * faut les relever en parallèle sur CloudWatch. La commande est fournie en
+ * résumé de fin de script.
  *
  * Prérequis :
  *   - `TOKEN`   : jeton du rédacteur propriétaire d'un lien (scénario visiteur) ;
@@ -24,38 +24,49 @@
  * Usage :
  *   k6 run -e API_URL=http://13.53.160.209 -e TOKEN=<jwt> -e DOC_ID=<doc> \
  *          -e MAX_DOWNLOADS=500 -e VISITORS=15000 -e WRITERS=300 \
- *          --summary-export=tests/results/s5.json tests/k6/s5-mixte.js
+ *          tests/k6/s5-mixte.js
  */
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 import {
   apiBase,
-  authHeaders,
   claim,
   createLink,
-  jsonHeaders,
   linkStatus,
   requireEnv,
   runId,
   visitorId,
 } from './lib/common.js';
+import { runWriterSession, wsBase } from './lib/ws.js';
 
 const VISITORS = Number(__ENV.VISITORS || 15000);
 const MAX_DOWNLOADS = Number(__ENV.MAX_DOWNLOADS || 500);
 const WRITERS = Number(__ENV.WRITERS || 300);
 const WRITER_DURATION = __ENV.WRITER_DURATION || '120s';
 
+/**
+ * Compression des paliers, pour les essais à blanc.
+ *
+ * Le déroulé complet dure ~2 minutes (30 + 10 + 60 + 15 s). C'est acceptable
+ * pour la mesure réelle, beaucoup trop pour vérifier qu'un script démarre : on
+ * perd deux minutes par essai, ce qui pousse à ne plus tester du tout — et
+ * c'est ainsi qu'un scénario cassé part en production. `RAMP_SCALE=0.15`
+ * ramène le déroulé à ~17 s sans changer la forme de la charge.
+ */
+const RAMP_SCALE = Number(__ENV.RAMP_SCALE || 1);
+const stage = (seconds) => `${Math.max(1, Math.round(seconds * RAMP_SCALE))}s`;
+
 const visitorReserved = new Counter('s5_visitor_reserved');
 const visitorExhausted = new Counter('s5_visitor_exhausted');
 const visitorErrors = new Counter('s5_visitor_errors');
 const writerAcked = new Counter('s5_writer_acked');
 const writerRejected = new Counter('s5_writer_rejected');
+const writerMissing = new Counter('s5_writer_missing');
+const writerTicketFailed = new Counter('s5_writer_ticket_failed');
 const claimLatency = new Trend('s5_claim_latency', true);
 const statusLatency = new Trend('s5_status_latency', true);
 const ackLatency = new Trend('s5_ack_latency', true);
-
-let totalClaimed = 0;
 
 export const options = {
   scenarios: {
@@ -67,10 +78,10 @@ export const options = {
       preAllocatedVUs: 500,
       maxVUs: 2000,
       stages: [
-        { target: 100, duration: '30s' }, // montée (20 %)
-        { target: Math.round((VISITORS * 0.8) / 60), duration: '10s' },
-        { target: Math.round((VISITORS * 0.8) / 60), duration: '60s' }, // pic 80 %
-        { target: 0, duration: '15s' },
+        { target: 100, duration: stage(30) }, // montée (20 %)
+        { target: Math.round((VISITORS * 0.8) / 60), duration: stage(10) },
+        { target: Math.round((VISITORS * 0.8) / 60), duration: stage(60) }, // pic 80 %
+        { target: 0, duration: stage(15) },
       ],
       gracefulStop: '30s',
       tags: { scenario: 's5-visitors' },
@@ -99,11 +110,30 @@ export const options = {
     },
   },
   thresholds: {
-    'http_req_failed{scenario:s5-visitors}': ['rate<0.02'],
+    // ⚠️ **Pas** de seuil sur `http_req_failed{scenario:s5-visitors}`.
+    //
+    // Le parcours visiteur renvoie légitimement 410 quand le quota est épuisé.
+    // k6 classe tout statut ≥ 400 comme requête échouée : au banc, 2 612 refus
+    // « épuisé » sur 3 112 requêtes portaient le taux à 84 % et faisaient
+    // échouer le scénario (`visitors ✗`) alors que **rien n'était cassé**.
+    // C'est exactement le piège déjà rencontré en S1, où un seuil
+    // `http_req_failed < 0.01` était inatteignable par construction.
+    //
+    // Le vrai critère « aucun 5xx » est porté par `s5_visitor_errors`
+    // (compteur alimenté uniquement sur `status >= 500`) et par le verdict de
+    // `handleSummary`. Un seuil qui ne peut pas être satisfait ne protège rien :
+    // il rend seulement le résultat illisible.
+    's5_visitor_errors{scenario:s5-visitors}': ['count==0'],
     'http_req_failed{scenario:s5-status}': ['rate<0.01'],
     's5_claim_latency{scenario:s5-visitors}': ['p(95)<3000'],
-    's5_status_latency{scenario:s5-status}': ['p(95)<200'],
     // La preuve que le cache fonctionne : médiane très basse (nginx répond).
+    // Les deux statistiques sont dans **le même** tableau : écrites en deux
+    // entrées `'s5_status_latency{…}'`, la seconde écrasait la première (clé
+    // d'objet identique en JavaScript) et la contrainte `med<50` disparaissait.
+    's5_status_latency{scenario:s5-status}': ['med<50', 'p(95)<200'],
+    // Les rédacteurs ne doivent pas perdre une seule modification sous le pic.
+    's5_writer_missing{scenario:s5-writers}': ['count==0'],
+    's5_writer_ticket_failed{scenario:s5-writers}': ['count==0'],
     's5_ack_latency{scenario:s5-writers}': ['p(95)<4000'],
   },
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
@@ -112,15 +142,38 @@ export const options = {
 export function setup() {
   const docId = requireEnv('DOC_ID');
   const run = runId();
-  // Le lien est créé une seule fois : c'est la cible du pic visiteur.
+
+  // Un lien préexistant n'a **pas** forcément le quota `MAX_DOWNLOADS`, et
+  // `/status` ne publie que `remaining` — pas la capacité. Afficher
+  // « 500 réservations sur 100 » (constaté au banc) serait donc un chiffre faux.
+  // On ne compare à `MAX_DOWNLOADS` que si c'est nous qui avons créé le lien.
+  const reusedLink = Boolean(__ENV.LINK_TOKEN);
   const token = __ENV.LINK_TOKEN || createLink(docId, MAX_DOWNLOADS);
-  if (!__ENV.LINK_TOKEN) {
+  if (!reusedLink) {
     check(linkStatus(token), {
       'S5 : lien actif au départ': (r) => r.status === 200 && r.body.status === 'active',
     });
   }
-  console.log(`S5 — document ${docId}, lien ${token}, ${VISITORS} visiteurs, ${WRITERS} rédacteurs`);
-  return { docId, token, run };
+
+  // Même précaution que S2 : on part du `seq` courant pour ne pas rejouer tout
+  // le journal à chacune des centaines de connexions.
+  const writerToken = __ENV.TOKEN2 || __ENV.TOKEN;
+  const stateResponse = http.get(`${apiBase()}/documents/${docId}/state`, {
+    headers: { authorization: `Bearer ${writerToken}` },
+    tags: { name: 'state' },
+  });
+  if (!check(stateResponse, { 'S5 : document accessible (200)': (r) => r.status === 200 })) {
+    throw new Error(
+      `S5 — impossible de lire /documents/${docId}/state (HTTP ${stateResponse.status}).`,
+    );
+  }
+  const sinceSeq = Number(JSON.parse(stateResponse.body).seq || 0);
+
+  console.log(
+    `S5 — document ${docId}, lien ${reusedLink ? 'réutilisé' : 'créé'} ${token}, ` +
+      `${VISITORS} visiteurs, ${WRITERS} rédacteurs, depuis seq=${sinceSeq}`,
+  );
+  return { docId, token, run, sinceSeq, reusedLink };
 }
 
 /** Visiteur : un claim, avec un identifiant stable. */
@@ -139,7 +192,6 @@ export function visitorFlow(data) {
   if (result.status === 429) return;
 
   if (result.state === 'ready' || result.state === 'waiting') {
-    totalClaimed += 1;
     visitorReserved.add(1);
   } else if (result.state === 'exhausted') {
     visitorExhausted.add(1);
@@ -157,77 +209,47 @@ export function writerFlow(data) {
       tags: { name: 'ws-ticket' },
     },
   );
-  if (!check(ticketResponse, { 'S5 : ticket rédacteur (200)': (r) => r.status === 200 })) {
+  // **201** et non 200 : `POST /ws-ticket` crée une ressource. La version
+  // précédente exigeait 200 et comptait donc 100 % d'échecs de rédacteurs —
+  // le même défaut que celui qui avait fait échouer S2.
+  if (
+    !check(ticketResponse, {
+      'S5 : ticket rédacteur (201)': (r) => r.status === 201,
+    })
+  ) {
+    writerTicketFailed.add(1);
     writerRejected.add(1);
+    sleep(1);
     return;
   }
 
   const ticket = JSON.parse(ticketResponse.body).ticket;
-  const wsBase = (__ENV.API_URL || 'http://localhost:4000')
-    .replace(/\/+$/, '')
-    .replace(/^http/, 'ws');
-  const socket = new WebSocket(
-    `${wsBase}/ws?ticket=${encodeURIComponent(ticket)}&documentId=${encodeURIComponent(data.docId)}`,
-  );
+  const session = runWriterSession({
+    url:
+      `${wsBase(__ENV.API_URL)}/ws?ticket=${encodeURIComponent(ticket)}` +
+      `&documentId=${encodeURIComponent(data.docId)}`,
+    docId: data.docId,
+    sinceSeq: data.sinceSeq,
+    count: 10,
+    updateB64: __ENV.UPDATE_B64 || 'AQGd+OWCBAAEAQdjb250ZW50AXgA',
+    opPrefix: `op_s5_${data.run}_${__VU}_${__ITER}`,
+    ackWaitMs: Number(__ENV.ACK_WAIT_MS || 4000),
+    onAck: (latency) => {
+      ackLatency.add(latency);
+      writerAcked.add(1);
+    },
+    onError: () => writerRejected.add(1),
+  });
 
-  const sentAt = new Map();
-  let joined = false;
-
-  socket.onopen = () => {
-    socket.send(JSON.stringify({ type: 'join', documentId: data.docId, sinceSeq: 0 }));
-  };
-
-  socket.onmessage = (event) => {
-    let message;
-    try {
-      message = JSON.parse(event.data);
-    } catch (error) {
-      return;
-    }
-    if (message.type === 'joined') {
-      joined = true;
-      for (let i = 0; i < 10; i++) sendOp();
-      return;
-    }
-    if (message.type === 'ack' && Array.isArray(message.opIds)) {
-      for (const opId of message.opIds) {
-        const at = sentAt.get(opId);
-        if (at !== undefined) {
-          ackLatency.add(Date.now() - at);
-          sentAt.delete(opId);
-          // Sans ce compteur, le résumé afficherait 0 acquittement et laisserait
-          // croire que les rédacteurs n'ont rien pu écrire.
-          writerAcked.add(1);
-        }
-      }
-      return;
-    }
-    if (message.type === 'error') {
-      writerRejected.add(1);
-      if (message.code === 'CREDIT_EXHAUSTED' || message.code === 'BLOCKED') socket.close();
-    }
-  };
-
-  socket.onerror = () => writerRejected.add(1);
-
-  function sendOp() {
-    if (!joined) return;
-    const opId = `op_s5_${data.run}_${__VU}_${__ITER}_${Math.random().toString(36).slice(2, 8)}`;
-    sentAt.set(opId, Date.now());
-    socket.send(
-      JSON.stringify({
-        type: 'update',
-        opId,
-        documentId: data.docId,
-        // Même update vérifié que dans S2 : 1 caractère facturé.
-        payload: __ENV.UPDATE_B64 || 'AQGd+OWCBAAEAQdjb250ZW50AXgA',
-      }),
-    );
+  // Sans ce compteur, le résumé afficherait 0 acquittement et laisserait croire
+  // que les rédacteurs n'ont rien pu écrire.
+  if (session.missing > 0) {
+    writerMissing.add(session.missing);
+    writerRejected.add(session.missing);
   }
 
-  sleep(2);
-  socket.close();
-  if (sentAt.size > 0) writerRejected.add(sentAt.size);
+  // Une courte pause hors connexion : on mesure le pic, pas une boucle tight.
+  sleep(1);
 }
 
 /** Sonde `/status` : c'est le micro-cache nginx qui doit répondre. */
@@ -250,6 +272,25 @@ export function statusFlow(data) {
   sleep(0.2);
 }
 
+/**
+ * Seuils en échec, avec la contrainte et la valeur observée.
+ *
+ * Renvoyer `stdout` depuis `handleSummary` **supprime le résumé par défaut de
+ * k6**, y compris le tableau `thresholds` qui explique pourquoi un scénario est
+ * marqué `✗`. Au banc, S5 affichait `visitors ✗` avec « vérifications échouées
+ * 0 » et aucun moyen de savoir quelle contrainte avait lâché : le diagnostic
+ * avait été effacé par le confort du résumé. On le rétablit ici.
+ */
+function failedThresholds(m) {
+  const out = [];
+  for (const [name, metric] of Object.entries(m)) {
+    for (const [expression, result] of Object.entries(metric.thresholds || {})) {
+      if (!result.ok) out.push(`  SEUIL EN ÉCHEC : ${name} — ${expression}`);
+    }
+  }
+  return out;
+}
+
 export function handleSummary(data) {
   const m = data.metrics;
   const lines = ['', '=== S5 — C5 : pic complet (visiteurs + rédacteurs) ==='];
@@ -260,9 +301,11 @@ export function handleSummary(data) {
 
   add('visiteurs : réservations', 's5_visitor_reserved', 'count');
   add('visiteurs : refus « épuisé »', 's5_visitor_exhausted', 'count');
-  add('visiteurs : erreurs', 's5_visitor_errors', 'count');
+  add('visiteurs : erreurs 5xx', 's5_visitor_errors', 'count');
   add('rédacteurs : updates acquittés', 's5_writer_acked', 'count');
+  add('rédacteurs : updates sans ack', 's5_writer_missing', 'count');
   add('rédacteurs : rejets', 's5_writer_rejected', 'count');
+  add('rédacteurs : tickets non obtenus', 's5_writer_ticket_failed', 'count');
   add('latence claim p95 (ms)', 's5_claim_latency', 'p(95)');
   add('latence /status médiane (ms)', 's5_status_latency', 'med');
   add('latence /status p95 (ms)', 's5_status_latency', 'p(95)');
@@ -274,13 +317,51 @@ export function handleSummary(data) {
     lines.push(`  vérifications échouées                 ${checks.fails}`);
   }
 
+  // Le verdict est calculé ici, et non dans `setup`/`teardown` : seul
+  // `handleSummary` reçoit les métriques agrégées de tous les VUs.
+  const reserved = Number(m.s5_visitor_reserved?.values?.count ?? 0);
+  const exhausted = Number(m.s5_visitor_exhausted?.values?.count ?? 0);
+  const missing = Number(m.s5_writer_missing?.values?.count ?? 0);
+  const ticketKo = Number(m.s5_writer_ticket_failed?.values?.count ?? 0);
+  const visitorErr = Number(m.s5_visitor_errors?.values?.count ?? 0);
+  const acked = Number(m.s5_writer_acked?.values?.count ?? 0);
+
+  lines.push('');
+  if (ticketKo > 0) {
+    lines.push(
+      `=> PRÉPARATION INCOMPLÈTE : ${ticketKo} tickets rédacteur refusés. ` +
+        `Vérifier TOKEN2/TOKEN et l'appartenance au document.`,
+    );
+  } else if (missing > 0) {
+    lines.push(
+      `=> C5 NON PROUVÉE : ${missing} update(s) rédacteur sans acquittement sous le pic.`,
+    );
+  } else if (visitorErr > 0) {
+    lines.push(
+      `=> C5 NON PROUVÉE : ${visitorErr} erreur(s) 5xx côté visiteur — ` +
+        `aucune requête ne doit échouer.`,
+    );
+  } else if (acked === 0) {
+    lines.push('=> AUCUN UPDATE RÉDACTEUR ACQUITTÉ : le scénario rédacteur n\'a rien mesuré.');
+  } else {
+    // Le quota réel n'est connu que si le lien a été créé par ce script.
+    const quota =
+      data.setup_data?.reusedLink === true
+        ? 'quota du lien réutilisé non vérifié'
+        : `${reserved} / ${MAX_DOWNLOADS}`;
+    lines.push(
+      `=> C5 tenue : ${reserved} réservations (${quota}), ${exhausted} refus « épuisé » ` +
+        `explicites, 0 erreur 5xx, ${acked} updates rédacteur acquittés, 0 perdu.`,
+    );
+  }
+
+  lines.push(...failedThresholds(m));
+
   lines.push('');
   lines.push('Métriques système à relever sur CloudWatch pendant le test :');
   lines.push('  aws cloudwatch get-metric-statistics --namespace AWS/EC2 \\');
   lines.push('    --metric-name CPUUtilization --dimensions Name=InstanceId,Value=<id> \\');
   lines.push('    --start-time <début> --end-time <fin> --period 60 --statistics Maximum');
-  lines.push('');
-  lines.push(`  réservations totales (k6) : ${totalClaimed} / ${MAX_DOWNLOADS}`);
   lines.push('');
 
   return {

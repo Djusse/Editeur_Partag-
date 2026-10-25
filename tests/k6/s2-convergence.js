@@ -1,20 +1,27 @@
 /**
  * S2 — C2 : N rédacteurs écrivent dans le même document, aucune modification
- * acceptée n'est perdue, et le journal reste contigu.
+ * acceptée n'est perdue.
  *
  * Objectif du plan v7 : montée 50 → 100 → 300 rédacteurs.
  *
  * Ce que k6 peut mesurer correctement ici :
  *   - le nombre d'updates **acquittés** (`ack` reçu avec l'`opId` émis) ;
  *   - l'absence d'updates sans acquittement après le délai de garde ;
- *   - la **contiguïté du `seq`** (un trou signalerait une écriture perdue) ;
  *   - la latence d'acquittement sous charge.
  *
- * Ce qu'il ne mesure pas : la convergence du **contenu**. k6 ne peut pas faire
- * tourner un vrai client Yjs (moteur JS embarqué, sans `Buffer` ni modules
- * Node). Cette preuve est apportée par `tests/node/verify-convergence.mjs`,
- * exécuté après S2 : il reconstruit le document depuis le journal, vérifie les
- * `seq` contigus et l'égalité insertions − suppressions = longueur finale.
+ * Ce qu'il ne mesure pas : la **contiguïté du journal** et la convergence du
+ * **contenu**. k6 ne peut pas faire tourner un vrai client Yjs (moteur JS
+ * embarqué, sans `Buffer` ni modules Node). Ces deux preuves sont apportées par
+ * `tests/node/verify-convergence.mjs`, exécuté après S2 : il reconstruit le
+ * document depuis le journal, vérifie que les `seq` sont contigus et que
+ * insertions − suppressions = longueur finale.
+ *
+ * ⚠️ Une version précédente de ce fichier prétendait vérifier la contiguïté
+ * depuis k6. C'était faux : le `seq` est **global au document**, et chaque VU ne
+ * voit que les `seq` émis pendant que sa propre connexion était ouverte. Des
+ * suites « 41, 42, 43 » par VU sont parfaitement normales et ne disent rien sur
+ * l'absence de trous. La vérification a donc été retirée d'ici plutôt que
+ * laissée en place avec un résultat qui ne prouvait rien.
  *
  * ⚠️ Contrainte de crédit : 10 000 caractères par jour et par **e-mail**. Un
  * jeton unique est donc partagé par tous les VUs. À 300 rédacteurs, il faut
@@ -24,13 +31,14 @@
  *   k6 run -e API_URL=http://<ip> -e TOKEN=<jwt> -e DOC_ID=<doc> \
  *          -e WRITERS=100 -e DURATION=45s tests/k6/s2-convergence.js
  *
- *   # plusieurs jetons (un par groupe de 100 VUs), dans un fichier séparé par des virgules
+ *   # plusieurs jetons (un par groupe de VUs), séparés par des virgules
  *   k6 run -e TOKEN=a,b,c -e WRITERS=300 …
  */
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
 import { apiBase, requireEnv, runId } from './lib/common.js';
+import { runWriterSession, wsBase } from './lib/ws.js';
 
 const WRITERS = Number(__ENV.WRITERS || 100);
 const DURATION = __ENV.DURATION || '45s';
@@ -44,6 +52,7 @@ const rejected = new Counter('s2_rejected');
 const missingAck = new Counter('s2_missing_ack');
 const updatesReceived = new Counter('s2_updates_recu');
 const ticketFailed = new Counter('s2_ticket_failed');
+const joinFailed = new Counter('s2_join_failed');
 const creditRefused = new Counter('s2_credit_refused');
 const ackLatency = new Trend('s2_ack_latency', true);
 const ackOk = new Rate('s2_all_acked');
@@ -59,8 +68,10 @@ export const options = {
     },
   },
   thresholds: {
-    // Critère central de C2 : aucun update accepté ne doit rester sans ack.
+    // Critère de préparation : sans ticket, le test ne mesure rien.
     's2_ticket_failed{scenario:s2}': ['count==0'],
+    // Critère central de C2.
+    's2_missing_ack{scenario:s2}': ['count==0'],
     's2_ack_latency{scenario:s2}': ['p(95)<4000'],
   },
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
@@ -90,10 +101,37 @@ function tokenFor(vu, list) {
 export function setup() {
   const docId = requireEnv('DOC_ID');
   const list = tokens();
+  const token = list[0];
+
+  // Point de départ de la lecture : le `seq` courant. Joindre avec 0 rejouerait
+  // tout le journal à chaque connexion — mesuré à 90 513 messages reçus pour
+  // 0 update acquitté lors du premier essai. Ce rattrapage intégral est un
+  // comportement légitime du serveur, mais il n'a rien à faire dans la mesure
+  // de C2 : il fausse la latence et sature la VM de charge.
+  const stateResponse = http.get(`${apiBase()}/documents/${docId}/state`, {
+    headers: { authorization: `Bearer ${token}` },
+    tags: { name: 'state' },
+  });
+
+  const usable = check(stateResponse, {
+    'S2 : document accessible (200)': (r) => r.status === 200,
+  });
+  if (!usable) {
+    // Échec au démarrage, message explicite : un scénario qui démarre sans
+    // accès mesurerait des 403 et produirait des chiffres trompeurs.
+    throw new Error(
+      `S2 — impossible de lire /documents/${docId}/state (HTTP ${stateResponse.status}). ` +
+        'Vérifier DOC_ID, la validité du jeton, et que le compte est membre du document.',
+    );
+  }
+
+  const sinceSeq = Number(JSON.parse(stateResponse.body).seq || 0);
+
   console.log(
-    `S2 — document ${docId}, ${WRITERS} rédacteurs, ${list.length} jeton(s), ${DURATION}`,
+    `S2 — document ${docId}, ${WRITERS} rédacteurs, ${list.length} jeton(s), ` +
+      `${DURATION}, depuis seq=${sinceSeq}`,
   );
-  return { docId, tokens: list, run: runId() };
+  return { docId, tokens: list, run: runId(), sinceSeq, startSeq: sinceSeq };
 }
 
 export default function (data) {
@@ -136,109 +174,48 @@ export default function (data) {
   }
 
   const ticket = JSON.parse(ticketResponse.body).ticket;
-  const wsBase = (__ENV.API_URL || 'http://localhost:4000')
-    .replace(/\/+$/, '')
-    .replace(/^http/, 'ws');
-  const socket = new WebSocket(
-    `${wsBase}/ws?ticket=${encodeURIComponent(ticket)}&documentId=${encodeURIComponent(data.docId)}`,
-  );
+  const session = runWriterSession({
+    url: `${wsBase(__ENV.API_URL)}/ws?ticket=${encodeURIComponent(ticket)}` +
+      `&documentId=${encodeURIComponent(data.docId)}`,
+    docId: data.docId,
+    sinceSeq: data.sinceSeq,
+    count: UPDATES_PER_ITER,
+    updateB64: __ENV.UPDATE_B64 || 'AQGd+OWCBAAEAQdjb250ZW50AXgA',
+    opPrefix: `op_s2_${data.run}_${__VU}_${__ITER}`,
+    ackWaitMs: ACK_WAIT_MS,
+    onUpdate: () => updatesReceived.add(1),
+    onAck: (latency) => {
+      ackLatency.add(latency);
+      acked.add(1);
+    },
+    onError: () => rejected.add(1),
+  });
 
-  const sentAt = new Map();
-  const seqs = [];
-  let joined = false;
-  let refused = false;
-
-  socket.onopen = () => {
-    socket.send(JSON.stringify({ type: 'join', documentId: data.docId, sinceSeq: 0 }));
-  };
-
-  socket.onmessage = (event) => {
-    let message;
-    try {
-      message = JSON.parse(event.data);
-    } catch (error) {
-      return;
-    }
-
-    if (message.type === 'joined') {
-      joined = true;
-      // Les updates partent dès l'ouverture : c'est le comportement réel du
-      // client, qui n'attend pas pour écrire.
-      for (let index = 0; index < UPDATES_PER_ITER; index++) sendUpdate();
-      return;
-    }
-
-    if (message.type === 'update') {
-      updatesReceived.add(1);
-      seqs.push(message.seq);
-      return;
-    }
-
-    if (message.type === 'ack' && Array.isArray(message.opIds)) {
-      for (const opId of message.opIds) {
-        const at = sentAt.get(opId);
-        if (at === undefined) continue;
-        ackLatency.add(Date.now() - at);
-        sentAt.delete(opId);
-        acked.add(1);
-      }
-      return;
-    }
-
-    if (message.type === 'error') {
-      rejected.add(1);
-      if (message.code === 'CREDIT_EXHAUSTED' || message.code === 'BLOCKED') {
-        // Crédit épuisé pour ce jeton : on arrête proprement ce VU, sans le
-        // compter comme une perte d'update (le refus est explicite).
-        creditRefused.add(1);
-        refused = true;
-        socket.close();
-      }
-    }
-  };
-
-  socket.onerror = () => rejected.add(1);
-
-  function sendUpdate() {
-    if (!joined) return;
-    const opId = `op_s2_${data.run}_${__VU}_${__ITER}_${Math.random().toString(36).slice(2, 8)}`;
-    sentAt.set(opId, Date.now());
-    socket.send(
-      JSON.stringify({
-        type: 'update',
-        opId,
-        documentId: data.docId,
-        // Update Yjs de 1 caractère, vérifié par le compteur du serveur :
-        // creditCost(...) → inserted=1. Voir la note en bas de fichier.
-        payload: __ENV.UPDATE_B64 || 'AQGd+OWCBAAEAQdjb250ZW50AXgA',
-      }),
-    );
-  }
-
-  // Attente des acquittements. On vérifie progressivement plutôt que de dormir
-  // la durée pleine : un test qui répond vite ne perd pas de temps.
-  const deadline = Date.now() + ACK_WAIT_MS;
-  while (sentAt.size > 0 && Date.now() < deadline) {
-    sleep(0.2);
-  }
-
-  if (sentAt.size > 0) {
-    missingAck.add(sentAt.size);
+  if (!session.joined) joinFailed.add(1);
+  if (session.missing > 0) {
+    missingAck.add(session.missing);
     ackOk.add(false);
-  } else if (!refused) {
+  } else if (!session.creditRefused) {
     ackOk.add(true);
   }
+  if (session.creditRefused) creditRefused.add(1);
+}
 
-  // Contiguïté : les `seq` reçus doivent former une suite de pas 1.
-  for (let index = 1; index < seqs.length; index++) {
-    if (seqs[index] !== seqs[index - 1] + 1) {
-      check(null, {
-        [`S2 : trou de séquence ${seqs[index - 1]} -> ${seqs[index]}`]: () => false,
-      });
+/**
+ * Seuils en échec, avec la contrainte et la valeur observée.
+ *
+ * Renvoyer `stdout` depuis `handleSummary` **supprime le résumé par défaut de
+ * k6**, y compris le tableau qui explique pourquoi un scénario est marqué `✗`.
+ * Sans cette énumération, un `✗` n'a aucun diagnostic associé.
+ */
+function failedThresholds(metrics) {
+  const out = [];
+  for (const [name, metric] of Object.entries(metrics)) {
+    for (const [expression, result] of Object.entries(metric.thresholds || {})) {
+      if (!result.ok) out.push(`  SEUIL EN ÉCHEC : ${name} — ${expression}`);
     }
   }
-
-  socket.close();
+  return out;
 }
 
 export function handleSummary(data) {
@@ -246,6 +223,7 @@ export function handleSummary(data) {
   const ack = get('s2_acked');
   const missing = get('s2_missing_ack');
   const ticketKo = get('s2_ticket_failed');
+  const joinKo = get('s2_join_failed');
   const refused = get('s2_credit_refused');
   const rejectedCount = get('s2_rejected');
   const received = get('s2_updates_recu');
@@ -258,6 +236,7 @@ export function handleSummary(data) {
   lines.push(`  refus explicites (erreur)       ${rejectedCount}`);
   lines.push(`  dont crédit épuisé              ${refused}`);
   lines.push(`  tickets non obtenus             ${ticketKo}`);
+  lines.push(`  connexions jamais jointes       ${joinKo}`);
   if (p95 !== undefined) lines.push(`  latence ack p95 (ms)            ${Number(p95).toFixed(1)}`);
 
   const checks = data.metrics?.checks?.values;
@@ -271,13 +250,17 @@ export function handleSummary(data) {
     lines.push(
       `=> ECHEC DE PRÉPARATION : ${ticketKo} tickets non obtenus. Vérifier le jeton et l'accès au document.`,
     );
+  } else if (joinKo > 0 && ack === 0) {
+    lines.push(
+      `=> AUCUNE CONNEXION JOINTE : le WebSocket s'ouvre mais ne répond pas \`joined\` (${joinKo} échecs).`,
+    );
   } else if (missing > 0) {
     lines.push(`=> C2 NON PROUVÉE : ${missing} update(s) accepté(s) sans acquittement.`);
   } else if (ack === 0) {
     lines.push('=> AUCUN UPDATE ACQUITTÉ : le WebSocket ne s\'est pas ouvert, ou le document est vide.');
   } else {
     lines.push(
-      `=> C2 tenue sur cette charge : ${ack} updates acquittés, aucun perdu, aucun trou de séquence.`,
+      `=> C2 tenue sur cette charge : ${ack} updates acquittés, 0 perdu.`,
     );
     if (refused > 0) {
       lines.push(
@@ -286,8 +269,10 @@ export function handleSummary(data) {
     }
   }
 
+  lines.push(...failedThresholds(data.metrics ?? {}));
+
   lines.push('');
-  lines.push('Convergence du CONTENU, à exécuter après ce test :');
+  lines.push('Contiguïté du journal ET convergence du contenu, à exécuter après ce test :');
   lines.push('  node tests/node/verify-convergence.mjs --api=<url> --token=<jwt> --doc=<doc>');
   lines.push('');
 
