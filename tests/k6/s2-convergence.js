@@ -110,11 +110,25 @@ export default function (data) {
   // L'API répond **201** (création), pas 200 : c'est ce qui a fait échouer la
   // première version, qui exigeait 200 et sortait donc avant le `sleep` —
   // 50 VUs ont bouclé 30 431 itérations en 45 s sans jamais se connecter.
+  // Diagnostic explicite : 403 signifie « compte non membre du document »,
+  // 401 « jeton invalide ». Ces deux causes ont des corrections opposées, et
+  // les confondre fait perdre du temps (2 250 tickets refusés en 45 s lors du
+  // premier essai, sans indice sur la cause).
   const ticketOk = check(ticketResponse, {
     'S2 : ticket obtenu (201)': (r) => r.status === 201,
+    'S2 : compte membre du document': (r) => r.status !== 403,
+    'S2 : jeton valide': (r) => r.status !== 401,
   });
   if (!ticketOk) {
     ticketFailed.add(1);
+    if (ticketResponse.status === 403) {
+      console.error(
+        `S2 — 403 : le compte n'est pas membre de ${data.docId}. ` +
+          'Utiliser tests/k6/mktokens.sh, qui ajoute chaque compte comme rédacteur.',
+      );
+    } else if (ticketResponse.status === 401) {
+      console.error('S2 — 401 : jeton expiré ou invalide. Recréer avec mktoken.sh.');
+    }
     // On patiente avant de réessayer : sans ce `sleep`, une erreur persistante
     // transforme la boucle k6 en salve de requêtes inutiles.
     sleep(1);
