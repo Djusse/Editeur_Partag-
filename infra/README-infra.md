@@ -89,7 +89,7 @@ mais l'Elastic IP est réattachée : l'adresse publique reste stable.
 
 | Ressource | Rôle |
 | - | - |
-| `Instance` (EC2 t3.large) | Node.js : Fastify (REST) + `ws` (WebSocket) + Yjs, état en mémoire |
+| `Instance` (EC2 `m7i-flex.large`) | Node.js : Fastify (REST) + `ws` (WebSocket) + Yjs, état en mémoire |
 | `ElasticIp` | URL stable (l'IP publique change après arrêt/démarrage) |
 | `SecurityGroup` | 80 ouvert ; 22 **seulement** si `AdminCidr` est une vraie plage |
 | `InstanceRole` | Moindre privilège : tables nommées, préfixe S3, file SQS, SES filtré, `/editeur/*` en SSM |
@@ -106,6 +106,33 @@ ils sont lus dans SSM par le rôle d'instance.
 Les secrets `/editeur/jwt-secret` et `/editeur/admin-key` sont créés par
 `scripts/deploy.sh`, jamais par le template : ils n'apparaissent donc ni dans le
 dépôt, ni dans l'historique CloudFormation.
+
+---
+
+## Défauts révélés par le premier déploiement réel
+
+Aucun test unitaire ne pouvait les attraper : ils n'existent qu'au contact de
+l'environnement cible. Tous sont corrigés, et chacun a laissé une trace dans le
+code sous forme de commentaire.
+
+| # | Symptôme | Cause réelle | Correction |
+| - | - | - | - |
+| 1 | `The specified instance type is not eligible for Free Tier` | `t3.large` n'est pas éligible sur un compte neuf | `m7i-flex.large` (2 vCPU / 8 Gio, éligible) |
+| 2 | `is in ROLLBACK_COMPLETE state and can not be updated` | une pile ayant échoué à sa création n'accepte plus aucune mise à jour | `deploy.sh` la supprime puis recrée |
+| 3 | `Received FAILURE signal` sans raison | `cfn-signal -e 1` sans `--reason` ; `set -e` tuait le script à la première erreur | user data instrumenté : étapes nommées, `--reason "etape=… code=…"`, codes `exit` explicites |
+| 4 | `nginx: [emerg] mkdir() "/var/cache/nginx/editeur" failed` | **`/var/cache/nginx` n'existe pas sur AL2023** — le paquet ne le crée pas, à la différence de l'image `nginx:alpine` | `mkdir -p` + `chown` avant `nginx -t` |
+| 5 | `npm error Invalid: lock file's @types/node@20… does not satisfy @types/node@22` | `package-lock.json` du frontend antérieur au passage à `@types/node@22` | lockfile régénéré |
+| 6 | `ENOSPC: no space left on device` en fin de build | CloudShell plafonne `$HOME` à 1 Gio ; `node_modules` et le cache npm s'y accumulaient | libération au fur et à mesure dans `deploy.sh` (pic ramené de ~880 à 665 Mio) + purge du cache npm |
+| 7 | `X-Cache-Status` absent au diagnostic | `add_header` ne s'applique pas aux 404 sans le mot-clé `always` | `add_header … always` |
+
+Les défauts 3 et 4 sont les plus instructifs : sans instrumentation, un échec de
+user data ne renvoie qu'un `FAILURE signal` anonyme, et l'on perd des heures. Le
+diagnostic n'a été possible qu'en **conservant l'instance** (`--on-failure
+DO_NOTHING`) puis en lisant `/var/log/editeur-init.log` par SSM.
+
+Le défaut 4 illustre une limite du test en conteneur : la configuration nginx
+avait été validée dans `nginx:alpine`, qui fournit `/var/cache/nginx`. Tester
+dans une image `amazonlinux:2023` aurait révélé le problème avant le déploiement.
 
 ---
 

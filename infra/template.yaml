@@ -570,7 +570,11 @@ Resources:
               proxy_cache_lock on;
               proxy_cache_lock_timeout 2s;
               proxy_cache_use_stale error timeout updating;
-              add_header X-Cache-Status $upstream_cache_status;
+              # `always` : sans ce mot-clé, nginx n'ajoute l'en-tête que sur les
+              # réponses 2xx/3xx. Un diagnostic sur un jeton inexistant (404)
+              # n'affichait donc rien, ce qui faisait croire à tort que le cache
+              # n'était pas configuré.
+              add_header X-Cache-Status $upstream_cache_status always;
             }
 
             location /api/ {

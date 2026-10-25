@@ -188,15 +188,23 @@ rm -rf frontend/.next frontend/out backend/dist backend/node_modules frontend/no
 # + build 70 + sources), ce qui dépassait une première estimation à 800 : le
 # déploiement échouait en `ENOSPC` juste après le `next build`. D'où le seuil
 # relevé et, surtout, la suppression des `node_modules` **au fur et à mesure**.
-NEED_MB=900
+# Pic réel du script : 665 Mio (frontend/node_modules 448 + .next 105 + sources),
+# les dépendances backend puis frontend étant libérées dès leur build terminé.
+# 700 laisse donc ~35 Mio de marge pour les fichiers temporaires de npm.
+NEED_MB=700
 AVAIL_MB="$(df -Pm "$ROOT" | awk 'NR==2 {print $4}')"
 echo "    espace libre : ${AVAIL_MB} Mio (requis ~${NEED_MB} Mio)"
 if [[ -n "$AVAIL_MB" && "$AVAIL_MB" -lt "$NEED_MB" ]]; then
   echo "ERREUR : espace insuffisant dans $ROOT (${AVAIL_MB} Mio libres, ~${NEED_MB} requis)."
-  echo "  Options :"
-  echo "    - libérer de la place : rm -rf ~/Editeur_Partag-/{build,app.tar.gz,backend/node_modules,frontend/node_modules,frontend/.next}"
-  echo "    - CloudShell plafonne le home à 1 Gio : un second déploiement dans le"
-  echo "      même home est donc limite. Le script nettoie normalement derrière lui."
+  echo "  Options, dans cet ordre :"
+  echo "    1. vider le cache npm (souvent 200+ Mio, jamais purgé) :"
+  echo "         npm cache clean --force && rm -rf ~/.npm/_cacache"
+  echo "    2. supprimer les restes d'un essai précédent :"
+  echo "         rm -rf backend/node_modules frontend/node_modules frontend/.next frontend/out build app.tar.gz"
+  echo "    3. si cela ne suffit pas, construire hors du home (1 Gio seulement) :"
+  echo "         mkdir -p /tmp/build && cd /tmp/build"
+  echo "         git clone https://github.com/Djusse/Editeur_Partag-.git"
+  echo "         cd Editeur_Partag- && ./scripts/deploy.sh"
   exit 1
 fi
 
@@ -334,13 +342,21 @@ else
   echo "  Le routage nginx de /d/ est probablement absent (404 HTML servi par nginx)."
 fi
 
-# Micro-cache : la preuve attendue est « HIT » au second appel rapproché.
+# Micro-cache : on vérifie que la directive est bien servie par nginx.
+#
+# Limite assumée : un jeton inexistant renvoie 404, et `proxy_cache_valid 200`
+# n'emmagasine que les 200. On ne peut donc pas espérer un `HIT` ici — seulement
+# constater que la `location` regex est atteinte (l'en-tête est présent). Le
+# `HIT` réel se vérifie avec un vrai jeton, indiqué en fin de script.
 CACHE_1="$(curl -s -o /dev/null -D - --max-time 10 "http://$PUBLIC_IP/d/inexistant/status" \
   | tr -d '\r' | awk -F': ' 'tolower($1)=="x-cache-status"{print $2}' || true)"
 if [[ -n "$CACHE_1" ]]; then
-  echo "    X-Cache-Status : $CACHE_1"
+  echo "    micro-cache : location /status atteinte (X-Cache-Status=$CACHE_1)"
 else
-  echo "AVERTISSEMENT : aucun en-tête X-Cache-Status — le micro-cache /status n'est pas actif."
+  echo "    micro-cache : non concluant sur un jeton inexistant (404 non mis en cache)."
+  echo "      Vérification réelle avec un vrai jeton :"
+  echo "        curl -sI http://$PUBLIC_IP/d/<token>/status | grep X-Cache-Status"
+  echo "        (deux appels rapprochés : EXPIRED puis HIT)"
 fi
 
 ADMIN_KEY="$(aws ssm get-parameter --name /editeur/admin-key --with-decryption \

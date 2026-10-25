@@ -114,6 +114,20 @@ aws sesv2 get-email-identity --email-identity vous@gmail.com --region eu-north-1
 
 ## 4. Déployer
 
+### En production actuellement
+
+```
+Application  : http://13.53.160.209
+Supervision  : http://13.53.160.209/admin
+Instance     : i-047242beb2de758e5  (m7i-flex.large, eu-north-1)
+```
+
+Premier déploiement réel : sept défauts propres à l'environnement cible ont été
+révélés et corrigés — Free Tier, `ROLLBACK_COMPLETE`, `nginx -t` sur AL2023,
+lockfile désynchronisé, espace CloudShell, en-tête de cache. Ils sont listés dans
+[`infra/README-infra.md`](infra/README-infra.md), section « Défauts révélés par le
+premier déploiement réel » : aucun test unitaire ne pouvait les détecter.
+
 ```bash
 KEY_NAME=cle-christian \
 SES_SENDER="vous@gmail.com" \
