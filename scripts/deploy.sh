@@ -116,6 +116,24 @@ echo "==> 4/6 Construction de l'application"
 # le front appellerait alors l'API sur la mauvaise origine. On repart propre.
 rm -rf frontend/.next frontend/out backend/dist build app.tar.gz
 
+# --- Contrôle d'espace ---------------------------------------------------
+# CloudShell ne dispose que d'environ 1 Gio dans `$HOME`. Le pic mesuré sur ce
+# dépôt est ~730 Mio (node_modules des deux projets + .next). On échoue tôt,
+# avec un message actionnable, plutôt qu'au milieu d'un `npm ci`.
+NEED_MB=800
+AVAIL_MB="$(df -Pm "$ROOT" | awk 'NR==2 {print $4}')"
+echo "    espace libre : ${AVAIL_MB} Mio (requis ~${NEED_MB} Mio)"
+if [[ -n "$AVAIL_MB" && "$AVAIL_MB" -lt "$NEED_MB" ]]; then
+  echo "ERREUR : espace insuffisant dans $ROOT (${AVAIL_MB} Mio libres, ~${NEED_MB} requis)."
+  echo "  Options :"
+  echo "    - libérer de la place : rm -rf ~/Editeur_Partag-/build ~/Editeur_Partag-/app.tar.gz"
+  echo "    - ou travailler dans /tmp :"
+  echo "        mkdir -p /tmp/build && cd /tmp/build"
+  echo "        git clone <url-du-depot> && cd Editeur_Partag-"
+  echo "        ./scripts/deploy.sh"
+  exit 1
+fi
+
 (cd backend && npm ci --no-audit --no-fund && npm run build)
 (cd frontend && npm ci --no-audit --no-fund && npm run build)
 
@@ -140,6 +158,18 @@ cp backend/package.json build/package.json
 (cd build && npm install --omit=dev --no-audit --no-fund --ignore-scripts)
 cp -r frontend/out build/public
 tar -czf app.tar.gz -C build .
+
+# --- Libération de l'espace -------------------------------------------------
+# `node_modules` et `.next` ne servent plus une fois l'archive créée, et ils
+# occupent ~620 Mio : les garder fait échouer le déploiement suivant sur un
+# disque de 1 Gio. On les supprime après avoir vérifié que l'archive existe.
+if [[ -s app.tar.gz ]]; then
+  rm -rf frontend/.next frontend/node_modules backend/node_modules build
+  echo "    espace libéré (node_modules et .next supprimés)"
+else
+  echo "ERREUR : app.tar.gz absent ou vide — rien n'a été envoyé."
+  exit 1
+fi
 
 echo "==> 5/6 Envoi vers S3 et installation sur l'instance (SSM)"
 aws s3 cp app.tar.gz "s3://$BUCKET/artifacts/app.tar.gz" --region "$AWS_REGION" >/dev/null
