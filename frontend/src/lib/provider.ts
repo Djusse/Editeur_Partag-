@@ -125,6 +125,32 @@ export class CollaborativeProvider {
     this.pendingFromStorage = ops;
   }
 
+  /**
+   * Passe la session en lecture seule **sans** rejouer la procédure de rejet.
+   *
+   * Utilisé après une reconstruction du document : l'état vient du serveur, il
+   * n'y a donc plus rien à jeter, ni de toast à empiler. Sans cette méthode, un
+   * provider recréé repartait avec `readOnly = false` : l'utilisateur dont le
+   * crédit était épuisé pouvait **de nouveau** taper, chaque frappe étant
+   * refusée puis suivie d'une nouvelle reconstruction — boucle sans fin, avec
+   * un toast par tour et un texte refusé toujours affiché.
+   */
+  lockSilently(code: RejectionCode | null = null): void {
+    this.readOnly = true;
+    if (code) this.rejectionCode = code;
+    for (const op of this.queue) {
+      if (op.timer) clearTimeout(op.timer);
+    }
+    this.queue = [];
+    this.buffer = [];
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.persist();
+    this.options.callbacks?.onQueueChange?.(0);
+  }
+
   /** Ouvre la connexion. `sinceSeq` vient de `GET /documents/{id}/state`. */
   async connect(sinceSeq: number): Promise<void> {
     this.lastSeq = sinceSeq;
@@ -232,8 +258,20 @@ export class CollaborativeProvider {
       // du document, nouvelle connexion, nouveau rejet… boucle infinie, avec
       // un toast empilé par tour.
       if (typeof message.readOnly === 'string' && this.rejectionCode === null) {
+        const code = message.readOnly as RejectionCode;
+        // `CREDIT_EXHAUSTED` à l'ouverture n'est pas un rejet : rien n'a été
+        // refusé, le compteur du jour est simplement déjà à zéro.
+        //
+        // Il ne faut **ni** afficher « Vos dernières modifications n'ont pas
+        // été enregistrées » (l'utilisateur vient d'ouvrir la page), **ni**
+        // passer `readOnly = true` : la file cesserait d'envoyer, plus aucun
+        // refus ne serait compté côté serveur, et les 4 refus exigés par la
+        // règle C4 deviendraient inatteignables. L'interface se contente
+        // d'afficher le bandeau ; c'est le serveur qui refuse, essai après
+        // essai, jusqu'au blocage.
+        if (code === 'CREDIT_EXHAUSTED') return;
         this.handleRejection({
-          code: message.readOnly as RejectionCode,
+          code,
           blockedUntil: typeof message.blockedUntil === 'string' ? message.blockedUntil : undefined,
           creditRemaining: typeof message.creditRemaining === 'number' ? message.creditRemaining : undefined,
         });
@@ -299,9 +337,22 @@ export class CollaborativeProvider {
    * Un update refusé est déjà affiché localement mais invisible pour les
    * autres : on cesse d'envoyer, on vide la file, et la page reconstruit le
    * document depuis le serveur (callback `onRejection`).
+   *
+   * **Tous les refus ne verrouillent pas l'écriture.** Seuls ceux qui
+   * suspendent réellement la session la verrouillent :
+   *
+   *  - `BLOCKED` : les 4 refus sont atteints, l'écriture est suspendue ;
+   *  - `FORBIDDEN` : l'accès au document est perdu.
+   *
+   * `CREDIT_EXHAUSTED` et `PAYLOAD_TOO_LARGE` laissent la session active : la
+   * modification est refusée, mais l'utilisateur doit pouvoir réessayer. C'est
+   * indispensable au blocage lui-même — le compteur serveur exige **4 refus**
+   * pour bloquer, et verrouiller dès le premier rendait la règle C4
+   * inatteignable : l'utilisateur perdait le curseur, ne pouvait plus forcer
+   * l'écriture, et ne voyait donc jamais la page `/bloque`.
    */
   private handleRejection(payload: RejectionPayload): void {
-    if (payload.code !== 'PAYLOAD_TOO_LARGE') {
+    if (payload.code === 'BLOCKED' || payload.code === 'FORBIDDEN') {
       this.readOnly = true;
       this.rejectionCode = payload.code;
     }

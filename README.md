@@ -74,7 +74,7 @@ backend/            Node.js 22 / TypeScript
   src/routes/       routes Fastify (/api/* et parcours visiteur)
   src/server/       main.ts (Fastify + ws), worker.ts (SQS), app.ts (assemblage)
   src/local/        mode local sans AWS
-  test/             29 tests unitaires (Vitest)
+  test/             33 tests unitaires (Vitest)
 frontend/           Next.js 14 en export statique, thème clair
   src/app/          /, /documents, /doc, /d, /admin
   src/lib/          client API, provider Yjs, utilitaires (uuidv4, copyText)
@@ -158,12 +158,12 @@ npm install
 npm test
 ```
 
-29 tests couvrent la logique critique :
+33 tests couvrent la logique critique :
 
 | Fichier | Ce qui est prouvé |
 | - | - |
 | `test/claim.test.ts` (11) | **C1** : N exact, 50 claims concurrents, idempotence, ticket renvoyé après épuisement, T1 figée, un seul job PDF par version |
-| `test/credit.test.ts` (11) | **C4** : débit exact, plafond, multi-appareils, `opId` rejoué, contenu identique, suppressions facturées, séquence contiguë, restauration gratuite, blocage au 4ᵉ refus, isolation d'un refus dans un lot |
+| `test/credit.test.ts` (15) | **C4** : débit exact, plafond, multi-appareils, `opId` rejoué, contenu identique, suppressions facturées, séquence contiguë, restauration gratuite, blocage au 4ᵉ refus, isolation d'un refus dans un lot, jour métier à minuit heure de Douala, refus après blocage |
 | `test/yjs-update.test.ts` (7) | Comptage sur de vrais updates Yjs : insertions, suppressions, update complet, unicode, update corrompu |
 
 ### Tester en local, sans AWS
@@ -206,9 +206,10 @@ Ce qui n'est **pas** testable en local : le pic de charge (C5), SES et nginx.
 
 #### Outils de développement (mode local uniquement)
 
-Le crédit est quotidien et un blocage dure jusqu'à minuit UTC : après avoir testé
-le scénario d'épuisement, le compte reste bloqué pour la journée. Pour rejouer le
-parcours sans attendre :
+Le crédit est quotidien et un blocage dure jusqu'à la remise à zéro (minuit
+**heure de Douala**, soit 23:00 UTC) : après avoir testé le scénario
+d'épuisement, le compte reste bloqué pour la journée. Pour rejouer le parcours
+sans attendre :
 
 ```bash
 # Crédit et blocage d'une adresse

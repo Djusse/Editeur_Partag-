@@ -151,7 +151,7 @@ export function registerDocumentRoutes(app: FastifyInstance): void {
       cursor: null,
     };
 
-    await commitBatch(state, [
+    const rejections = await commitBatch(state, [
       {
         client,
         opId,
@@ -162,6 +162,29 @@ export function registerDocumentRoutes(app: FastifyInstance): void {
         hash: hashOf(payload),
       },
     ]);
+
+    // Sans cette vérification, le repli HTTP répondait `ack` alors que la
+    // transaction avait été refusée (crédit épuisé ou blocage) : le client
+    // croyait son update enregistré et la jauge restait inchangée.
+    const rejection = rejections.find((entry) => entry.email === user.email);
+    if (rejection) {
+      const credit = await getCreditState(user.email);
+      throw new AppError(
+        403,
+        rejection.code,
+        rejection.code === 'BLOCKED'
+          ? 'Écriture bloquée après trop de refus de crédit.'
+          : 'Crédit d\'écriture du jour épuisé.',
+        {
+          details: {
+            opId,
+            creditRemaining: credit.remaining,
+            resetsAt: credit.resetsAt,
+            ...(rejection.blockedUntil ? { blockedUntil: rejection.blockedUntil } : {}),
+          },
+        },
+      );
+    }
 
     const credit = await getCreditState(user.email);
     return {

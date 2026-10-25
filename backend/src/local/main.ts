@@ -20,6 +20,7 @@ import { setSecretOverrides, generateLocalSecrets } from '../lib/secrets';
 import { setJobQueue } from '../lib/queue';
 import { setLastSeqReader } from '../lib/links';
 import { resetConfigCache } from '../lib/config';
+import { utcDay } from '../lib/ids';
 import { buildPdf, type PdfJob } from '../lib/pdf';
 import { manager } from '../realtime/manager';
 import { LocalPersistence } from './persistence';
@@ -205,16 +206,20 @@ async function main(): Promise<void> {
   // --- Outils de développement -------------------------------------------
   //
   // Remise à zéro du crédit d'une adresse. En production, la recharge est
-  // quotidienne et le blocage dure jusqu'à minuit UTC : sans cet outil, un test
-  // manuel du scénario d'épuisement condamne le compte pour la journée, ce qui
-  // rend le parcours impossible à rejouer (constaté en essai).
+  // quotidienne et le blocage dure jusqu'à la remise à zéro suivante (minuit
+  // heure de Douala) : sans cet outil, un test manuel du scénario d'épuisement
+  // condamne le compte pour la journée, ce qui rend le parcours impossible à
+  // rejouer (constaté en essai).
   //
   // Ces routes n'existent **que** dans le mode local : `src/server/main.ts` ne
   // les enregistre pas.
   app.post('/__reset-credit', async (request) => {
     const body = (request.body ?? {}) as { email?: string };
     const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
-    const day = new Date().toISOString().slice(0, 10);
+    // **Même calcul que le crédit** : la clé est le jour métier (Douala), pas
+    // le jour UTC. Utiliser `toISOString().slice(0,10)` ici laissait une ligne
+    // orpheline entre 23:00 et 00:00 UTC, et le reset semblait sans effet.
+    const day = utcDay();
     if (email) {
       memory.delete('Credits', { id: `${email}#${day}` });
       memory.delete('Abuse', { id: `${email}#${day}` });

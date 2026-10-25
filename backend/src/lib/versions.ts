@@ -125,6 +125,9 @@ export async function restoreVersion(
     docId,
     seq: state.seq,
     cursor: null,
+    // Restauration gratuite : elle doit aboutir même si l'auteur est bloqué
+    // (crédit épuisé → 4 refus → écriture suspendue).
+    system: true,
   };
 
   state.enqueue({

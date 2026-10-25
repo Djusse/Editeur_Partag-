@@ -20,7 +20,7 @@ import { config } from '../lib/config';
 import { db } from '../lib/db';
 import { WsErrorCodes } from '../lib/errors';
 import { sha256Hex, sleep, utcDay } from '../lib/ids';
-import { recordCreditRefusal } from '../lib/credits';
+import { blockedUntilFor, recordCreditRefusal } from '../lib/credits';
 import { putObject, snapshotKey } from '../lib/s3';
 import type { OpIdRow } from '../lib/types';
 
@@ -35,6 +35,16 @@ export interface Client {
   seq: number;
   cursor: number | null;
   awareness?: string;
+  /**
+   * Update **système** (restauration de version, par exemple).
+   *
+   * Il n'est pas facturé et doit rester acceptable même quand l'écriture de
+   * l'auteur est bloquée : sans ce marqueur, la nouvelle garde de blocage
+   * ajoutée dans `commitBatch` aurait rendu la restauration impossible pour un
+   * utilisateur ayant épuisé son crédit — alors que la spécification la prévoit
+   * explicitement gratuite.
+   */
+  system?: boolean;
 }
 
 export interface IncomingUpdate {
@@ -181,7 +191,18 @@ async function currentCreditRemaining(email: string): Promise<number> {
  * Tout réussit ou rien n'est appliqué : ni trou de `seq`, ni crédit débité pour
  * un update non persisté, ni marqueur sans update.
  */
-export async function commitBatch(state: DocumentState, batch: IncomingUpdate[]): Promise<void> {
+export interface BatchRejection {
+  email: string;
+  /** `BLOCKED` prime sur `CREDIT_EXHAUSTED` : c'est lui qui lève la session d'écriture. */
+  code: 'CREDIT_EXHAUSTED' | 'BLOCKED';
+  blockedUntil?: string;
+  creditRemaining: number;
+}
+
+export async function commitBatch(
+  state: DocumentState,
+  batch: IncomingUpdate[],
+): Promise<BatchRejection[]> {
   const cfg = config();
   const day = utcDay();
   const ttl = Math.floor(Date.now() / 1000) + 48 * 3600;
@@ -197,19 +218,68 @@ export async function commitBatch(state: DocumentState, batch: IncomingUpdate[])
     seenHash.add(update.hash);
     unique.push(update);
   }
-  if (unique.length === 0) return;
+  if (unique.length === 0) return [];
+
+  const rejections: BatchRejection[] = [];
+
+  // --- Garde de blocage ---------------------------------------------------
+  // `assertNotBlocked` est vérifié à l'entrée du WebSocket, mais un lot peut
+  // franchir la limite de refus **pendant** son traitement. Sans ce second
+  // contrôle, l'update suivant était acquitté et facturé alors que l'écriture
+  // était déjà suspendue : côté interface, plus rien ne signalait le blocage.
+  // Les updates système (restauration de version) ne sont jamais bloqués : la
+  // restauration est gratuite et reste possible une fois le crédit épuisé.
+  const regular = unique.filter((update) => !update.client.system);
+  const authors = new Set(regular.map((update) => update.client.email));
+  const blockedUntilByAuthor = new Map<string, string>();
+  await Promise.all(
+    [...authors].map(async (email) => {
+      const until = await blockedUntilFor(email);
+      if (until) blockedUntilByAuthor.set(email, until);
+    }),
+  );
+
+  let candidates = unique;
+  if (blockedUntilByAuthor.size > 0) {
+    for (const [email, until] of blockedUntilByAuthor) {
+      const own = unique.filter((update) => update.client.email === email && !update.client.system);
+      if (own.length === 0) continue;
+      const remaining = await currentCreditRemaining(email);
+      rejections.push({
+        email,
+        code: WsErrorCodes.blocked,
+        blockedUntil: until,
+        creditRemaining: remaining,
+      });
+      for (const update of own) {
+        send(update.client, {
+          type: 'error',
+          code: WsErrorCodes.blocked,
+          opId: update.opId,
+          creditRemaining: remaining,
+          blockedUntil: until,
+          message: 'Écriture bloquée après trop de refus de crédit.',
+        });
+      }
+    }
+    // Un update système survit au blocage de son auteur : il est gratuit.
+    candidates = unique.filter(
+      (update) => update.client.system || !blockedUntilByAuthor.has(update.client.email),
+    );
+    if (candidates.length === 0) return rejections;
+  }
 
   const byAuthor = new Map<string, IncomingUpdate[]>();
-  for (const update of unique) {
+  for (const update of candidates) {
     const list = byAuthor.get(update.client.email) ?? [];
     list.push(update);
     byAuthor.set(update.client.email, list);
   }
 
   const nextSeq = state.seq + 1;
-  const merged = Y.mergeUpdates(unique.map((update) => update.payload));
-  const insertedTotal = unique.reduce((sum, update) => sum + update.inserted, 0);
-  const deletedTotal = unique.reduce((sum, update) => sum + update.deleted, 0);
+  const merged = Y.mergeUpdates(candidates.map((update) => update.payload));
+  const insertedTotal = candidates.reduce((sum, update) => sum + update.inserted, 0);
+  const deletedTotal = candidates.reduce((sum, update) => sum + update.deleted, 0);
 
   const entries: Parameters<ReturnType<typeof db>['transact']>[0] = [
     {
@@ -234,7 +304,7 @@ export async function commitBatch(state: DocumentState, batch: IncomingUpdate[])
           seq: nextSeq,
           payload: merged,
           chars: insertedTotal + deletedTotal,
-          ops: unique.map((update) => ({
+          ops: candidates.map((update) => ({
             opId: update.opId,
             authorEmail: update.client.email,
             chars: update.chars,
@@ -273,7 +343,9 @@ export async function commitBatch(state: DocumentState, batch: IncomingUpdate[])
     });
   }
 
-  for (const update of unique) {
+  // Seuls les updates réellement persistés reçoivent un marqueur : en créer un
+  // pour un update bloqué rendrait son `opId` acquitté plus tard, sans écriture.
+  for (const update of candidates) {
     entries.push({
       Put: {
         table: cfg.opIdsTable,
@@ -307,8 +379,8 @@ export async function commitBatch(state: DocumentState, batch: IncomingUpdate[])
   const outcome = await db().transact(entries);
 
   if (outcome.ok) {
-    applyAndBroadcast(state, merged, nextSeq, unique);
-    return;
+    applyAndBroadcast(state, merged, nextSeq, candidates);
+    return rejections;
   }
 
   const reasons = outcome.reasons ?? [];
@@ -326,14 +398,24 @@ export async function commitBatch(state: DocumentState, batch: IncomingUpdate[])
     // Un seul refus ne doit pas bloquer les autres rédacteurs du même tick :
     // on retire les fautifs et on relance immédiatement les survivants.
     for (const email of rejected) {
-      const own = unique.filter((update) => update.client.email === email);
+      const own = candidates.filter((update) => update.client.email === email);
       if (own.length === 0) continue;
       const refusal = await recordCreditRefusal(email, own[0].opId);
       const remaining = await currentCreditRemaining(email);
+      // `recordCreditRefusal` vient de franchir le seuil : l'écriture est
+      // désormais bloquée, et c'est `BLOCKED` — pas `CREDIT_EXHAUSTED` — que
+      // l'interface doit recevoir pour basculer en lecture seule.
+      const code = refusal.blockedUntil ? WsErrorCodes.blocked : WsErrorCodes.creditExhausted;
+      rejections.push({
+        email,
+        code,
+        creditRemaining: remaining,
+        ...(refusal.blockedUntil ? { blockedUntil: refusal.blockedUntil } : {}),
+      });
       for (const update of own) {
         send(update.client, {
           type: 'error',
-          code: WsErrorCodes.creditExhausted,
+          code,
           opId: update.opId,
           creditRemaining: remaining,
           ...(refusal.blockedUntil ? { blockedUntil: refusal.blockedUntil } : {}),
@@ -341,16 +423,18 @@ export async function commitBatch(state: DocumentState, batch: IncomingUpdate[])
       }
     }
 
-    const survivors = unique.filter((update) => !rejected.has(update.client.email));
-    if (survivors.length > 0) await commitBatch(state, survivors);
-    return;
+    const survivors = candidates.filter((update) => !rejected.has(update.client.email));
+    if (survivors.length > 0) {
+      rejections.push(...(await commitBatch(state, survivors)));
+    }
+    return rejections;
   }
 
   if (opConflict) {
     // Idempotence : un opId (ou un contenu) déjà accepté renvoie l'ack d'origine.
     const duplicates: IncomingUpdate[] = [];
     const fresh: IncomingUpdate[] = [];
-    for (const update of unique) {
+    for (const update of candidates) {
       const marker =
         (await db().get<OpIdRow>(cfg.opIdsTable, { id: `OP#${update.client.email}#${update.opId}` })) ??
         (await db().get<OpIdRow>(cfg.opIdsTable, { id: `HASH#${state.docId}#${update.hash}` }));
@@ -367,11 +451,12 @@ export async function commitBatch(state: DocumentState, batch: IncomingUpdate[])
       });
     }
     if (fresh.length > 0) state.replay(fresh);
-    return;
+    return rejections;
   }
 
   // Conflit de séquence (autre processus, ou redémarrage) : on rejoue le lot.
-  state.replay(unique);
+  state.replay(candidates);
+  return rejections;
 }
 
 /** Applique l'update fusionné en mémoire et diffuse **un seul** message. */

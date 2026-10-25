@@ -164,7 +164,11 @@ check('crédit épuisé après l’update', ack?.creditRemaining === 0, `creditR
 
 const credit = await json('/api/me/credit', { headers: auth });
 check('GET /me/credit : remaining = 0', credit.body.remaining === 0, `remaining=${credit.body.remaining}`);
-check('resetsAt fourni (minuit UTC)', typeof credit.body.resetsAt === 'string', credit.body.resetsAt);
+check(
+  'resetsAt fourni (minuit heure de Douala)',
+  typeof credit.body.resetsAt === 'string' && new Date(credit.body.resetsAt).getUTCHours() === 23,
+  credit.body.resetsAt,
+);
 
 const seqBefore = (await json(`/api/documents/${docId}/state`, { headers: auth })).body.seq;
 

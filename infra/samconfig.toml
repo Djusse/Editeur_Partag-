@@ -1,14 +1,22 @@
 # Configuration SAM par défaut. Les valeurs sensibles ne sont jamais ici :
 # SES_SENDER est passé en paramètre de déploiement (voir scripts/deploy.sh).
+#
+# ATTENTION : ce fichier n'est PAS utilisé par scripts/deploy.sh, qui appelle
+# directement `aws cloudformation deploy`. Il est conservé pour un éventuel
+# usage `sam deploy`.
+#
+# La région doit rester **eu-north-1** (Stockholm) : c'est celle du compte et
+# celle imposée par infra/template.yaml. Un `eu-west-3` ici faisait échouer un
+# `sam deploy` avec des noms de ressources introuvables.
 version = 0.1
 
 [default.deploy.parameters]
-stack_name = "editeur-documents"
-region = "eu-west-3"
-capabilities = "CAPABILITY_IAM"
+stack_name = "editeur"
+region = "eu-north-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
 resolve_s3 = true
 no_fail_on_empty_changeset = true
 confirm_changeset = false
 
 [default.local_start_api.parameters]
-region = "eu-west-3"
+region = "eu-north-1"

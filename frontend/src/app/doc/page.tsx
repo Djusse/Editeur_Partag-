@@ -53,6 +53,14 @@ import {
 
 type Overlay = 'none' | 'share' | 'versions' | 'links';
 type LoadError = 'forbidden' | 'notfound' | 'generic' | null;
+type ReadOnlyReason = 'credit' | 'blocked' | 'forbidden';
+
+/** Traduction de l'état de lecture seule vers le code du protocole. */
+function rejectionCodeFor(reason: ReadOnlyReason) {
+  if (reason === 'blocked') return 'BLOCKED' as const;
+  if (reason === 'forbidden') return 'FORBIDDEN' as const;
+  return 'CREDIT_EXHAUSTED' as const;
+}
 
 function EditorScreen() {
   const router = useRouter();
@@ -68,8 +76,38 @@ function EditorScreen() {
   const [connection, setConnection] = useState<ConnectionState>('offline');
   const [peers, setPeers] = useState<Peer[]>([]);
   const [queueSize, setQueueSize] = useState(0);
-  const [readOnlyReason, setReadOnlyReason] = useState<'credit' | 'blocked' | 'forbidden' | null>(null);
+  const [readOnlyReason, setReadOnlyReason] = useState<ReadOnlyReason | null>(null);
   const [blockedUntil, setBlockedUntil] = useState<string | null>(null);
+
+  /**
+   * Bandeau « crédit épuisé », **indépendant** du verrouillage de l'éditeur.
+   *
+   * Les deux notions étaient confondues : `readOnlyReason === 'credit'` servait
+   * à la fois à afficher le bandeau et à passer CodeMirror en lecture seule.
+   * Résultat : dès le premier refus, le curseur disparaissait, l'écriture
+   * devenait impossible à forcer, et les 4 refus exigés pour le blocage ne
+   * pouvaient jamais être atteints. Le bandeau doit informer sans désarmer la
+   * zone de saisie.
+   */
+  const [creditNotice, setCreditNotice] = useState(false);
+
+  /**
+   * Miroir **synchrone** de `readOnlyReason`.
+   *
+   * L'état React n'est lisible qu'au rendu suivant. Or `rebuildFromServer` et
+   * `startProvider` sont appelés depuis des callbacks asynchrones : ils lisaient
+   * une valeur périmée (`null`), remontaient CodeMirror **éditable** et
+   * recréaient un provider avec `readOnly = false`. L'utilisateur dont le
+   * crédit était épuisé pouvait donc continuer à taper — chaque frappe refusée
+   * déclenchant une nouvelle reconstruction, donc une nouvelle frappe possible.
+   * Ce ref est mis à jour en même temps que l'état, jamais après.
+   */
+  const readOnlyRef = useRef<ReadOnlyReason | null>(null);
+
+  const lockWriting = useCallback((reason: ReadOnlyReason) => {
+    readOnlyRef.current = reason;
+    setReadOnlyReason(reason);
+  }, []);
 
   const [overlay, setOverlay] = useState<Overlay>('none');
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -83,20 +121,50 @@ function EditorScreen() {
     setToasts((current) => [...current, { id: uuidv4(), message, variant }]);
   }, []);
 
-  const refreshCredit = useCallback(async (current: Session) => {
-    try {
-      const info = await api.getCredit(current.token);
-      setCredit(info);
-      if (info.blockedUntil) {
-        setBlockedUntil(info.blockedUntil);
-        setReadOnlyReason('blocked');
-      } else if (info.remaining <= 0) {
-        setReadOnlyReason('credit');
+  /**
+   * Bascule vers la page de blocage, **une seule fois**.
+   *
+   * La spécification (9.6) demande une page dédiée quand l'écriture est
+   * suspendue pour la journée. Cette redirection était court-circuitée dans
+   * deux cas, ce qui rendait `/bloque` inatteignable :
+   *
+   *  - au chargement, `refreshCredit` verrouillait la session **avant** que le
+   *    WebSocket ne réponde. Le `joined {readOnly: 'BLOCKED'}` trouvait alors
+   *    `rejectionCode` déjà renseigné et ne déclenchait plus la redirection ;
+   *  - un utilisateur déjà bloqué qui rouvrait la page ne voyait qu'un bandeau.
+   *
+   * On redirige donc ici, à la source : dès que `blockedUntil` est connu.
+   */
+  const redirectedToBlocked = useRef(false);
+
+  const goToBlockedPage = useCallback(() => {
+    if (redirectedToBlocked.current) return;
+    redirectedToBlocked.current = true;
+    router.push('/bloque');
+  }, [router]);
+
+  const refreshCredit = useCallback(
+    async (current: Session) => {
+      try {
+        const info = await api.getCredit(current.token);
+        setCredit(info);
+        if (info.blockedUntil) {
+          setBlockedUntil(info.blockedUntil);
+          lockWriting('blocked');
+          provider.current?.lockSilently('BLOCKED');
+          goToBlockedPage();
+        } else if (info.remaining <= 0) {
+          // Crédit à zéro : on informe, on ne verrouille pas. L'utilisateur
+          // doit pouvoir tenter d'écrire pour que le serveur compte le refus —
+          // c'est ce compteur qui mène au blocage après 4 essais.
+          setCreditNotice(true);
+        }
+      } catch {
+        /* la jauge sera rafraîchie au prochain ack */
       }
-    } catch {
-      /* la jauge sera rafraîchie au prochain ack */
-    }
-  }, []);
+    },
+    [lockWriting, goToBlockedPage],
+  );
 
   /**
    * Montage / remontage de CodeMirror sur un nouveau Y.Doc.
@@ -166,9 +234,18 @@ function EditorScreen() {
 
       // Si le conteneur est déjà rendu, on remonte immédiatement ; sinon l'effet
       // ci-dessus s'en charge au prochain rendu.
-      // `readOnlyReason` est lu ici dans la closure : après un refus, il vaut
-      // déjà le nouveau code, donc l'éditeur remonté est bien en lecture seule.
-      mountEditor(fresh, readOnlyReason !== null);
+      //
+      // **On lit `readOnlyRef`, pas `readOnlyReason`.** L'état React était encore
+      // `null` ici (la mise à jour n'avait pas eu lieu), donc l'éditeur était
+      // remonté éditable : l'écriture restait possible malgré le refus.
+      //
+      // Seuls un blocage ou une perte d'accès désarment la saisie : après un
+      // simple `CREDIT_EXHAUSTED`, l'éditeur doit rester éditable pour que
+      // l'utilisateur puisse réessayer et déclencher les 4 refus du blocage.
+      mountEditor(
+        fresh,
+        readOnlyRef.current === 'blocked' || readOnlyRef.current === 'forbidden',
+      );
       await startProvider(current, fresh, state.seq, true);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -197,6 +274,10 @@ function EditorScreen() {
           setCredit((previous) =>
             previous ? { ...previous, remaining: creditRemaining, used: previous.limit - creditRemaining } : previous,
           );
+          // Le bandeau suit la jauge : il apparaît dès que le crédit tombe à
+          // zéro par une écriture **acceptée** (le dernier update qui consomme
+          // exactement le reliquat), pas seulement après un refus.
+          if (creditRemaining <= 0) setCreditNotice(true);
         },
         onRejection: (payload) => {
           // Section 9.6 : la jauge doit tomber à zéro immédiatement. Sans cet
@@ -213,23 +294,40 @@ function EditorScreen() {
           }
 
           if (payload.code === 'CREDIT_EXHAUSTED') {
-            setReadOnlyReason('credit');
+            /**
+             * `CREDIT_EXHAUSTED` **ne verrouille pas l'éditeur**.
+             *
+             * Le message est ambigu : le même code sert quand le crédit est
+             * réellement à zéro *et* quand l'update dépassait seulement le
+             * reliquat (5 caractères restants pour une frappe de 10). Dans les
+             * deux cas on se contente d'informer : le bandeau s'affiche, mais le
+             * curseur reste dans la zone de saisie.
+             *
+             * C'était le défaut signalé : dès le premier refus, l'éditeur
+             * passait en lecture seule, le pointeur disparaissait, l'utilisateur
+             * ne pouvait plus forcer l'écriture — donc ne déclenchait jamais les
+             * **4 refus** exigés pour le blocage, et `/bloque` restait
+             * inatteignable. Le verrouillage n'intervient qu'au refus `BLOCKED`,
+             * c'est-à-dire quand le serveur suspend réellement l'écriture.
+             */
+            setCreditNotice(true);
             pushToast('Vos dernières modifications n\'ont pas été enregistrées.', 'error');
           } else if (payload.code === 'BLOCKED') {
-            setReadOnlyReason('blocked');
+            lockWriting('blocked');
             if (payload.blockedUntil) setBlockedUntil(payload.blockedUntil);
             pushToast('Vos dernières modifications n\'ont pas été enregistrées.', 'error');
-            // 4ᵉ refus : l'écriture est suspendue jusqu'à minuit UTC (C4). On
+            // 4ᵉ refus : l'écriture est suspendue jusqu'à la remise à zéro
+            // suivante, à minuit heure de Douala (C4). On
             // montre la page qui explique la cause et le terme, plutôt que de
             // laisser l'utilisateur devant un éditeur inerte.
             //
             // On ne **déconnecte** pas : la session reste valable et la lecture
             // est explicitement autorisée (spec 9.6). Couper la session
             // obligerait à ressaisir son identité pour relire un document.
-            router.push('/bloque');
+            goToBlockedPage();
             return;
           } else if (payload.code === 'FORBIDDEN') {
-            setReadOnlyReason('forbidden');
+            lockWriting('forbidden');
             pushToast('Vous n\'avez plus accès à ce document.', 'error');
           } else {
             pushToast(
@@ -247,6 +345,20 @@ function EditorScreen() {
     });
 
     if (!rebuild) instance.loadPending(loadPendingOps(docId, current.email));
+
+    // Un provider neuf repart toujours éditable. Après un **blocage** ou une
+    // perte d'accès, la session doit rester verrouillée : sans cela,
+    // l'utilisateur retrouvait un éditeur qui acceptait la frappe, chaque refus
+    // déclenchant une nouvelle reconstruction, donc une nouvelle frappe
+    // possible. On verrouille **sans** rejouer la procédure de rejet : il n'y a
+    // rien à jeter et aucun toast supplémentaire à empiler.
+    //
+    // Un simple `CREDIT_EXHAUSTED` ne verrouille pas : la saisie reste ouverte.
+    const lockedCode = readOnlyRef.current;
+    if (lockedCode === 'blocked' || lockedCode === 'forbidden') {
+      instance.lockSilently(rejectionCodeFor(lockedCode));
+    }
+
     provider.current = instance;
     await instance.connect(sinceSeq);
   };
@@ -274,7 +386,26 @@ function EditorScreen() {
         const docDetail = await api.getDocument(current.token, docId);
         if (cancelled) return;
         setDetail(docDetail);
-        void refreshCredit(current);
+        // Attendu (et non lancé en tâche de fond) : `readOnlyRef` doit être à
+        // jour **avant** le montage de l'éditeur et l'ouverture du WebSocket.
+        // Sinon, un crédit déjà épuisé s'affichait sur un éditeur éditable, et
+        // le message `joined {readOnly}` déclenchait un rejet fictif — donc un
+        // toast « modifications non enregistrées » alors que rien n'avait été
+        // saisi (section 9.6 : l'éditeur s'ouvre directement en lecture seule).
+        await refreshCredit(current);
+
+        // Seul un blocage ou une perte d'accès désarme la zone de saisie. Le
+        // crédit épuisé, lui, n'affiche qu'un bandeau : l'utilisateur doit
+        // pouvoir continuer à taper pour que le serveur compte les refus (c'est
+        // ce compteur qui mène au blocage après 4 essais). Le figer dès le
+        // premier refus rendait le blocage — et donc `/bloque` — inatteignable.
+        const lockEditorNow =
+          readOnlyRef.current === 'blocked' || readOnlyRef.current === 'forbidden';
+
+        // Bloqué : la redirection vers `/bloque` est déjà lancée. Inutile de
+        // charger l'état, de monter un éditeur et d'ouvrir un WebSocket pour
+        // une page qu'on quitte immédiatement.
+        if (readOnlyRef.current === 'blocked') return;
 
         // 3. État Yjs complet.
         const state = await api.getState(current.token, docId);
@@ -284,18 +415,25 @@ function EditorScreen() {
         Y.applyUpdate(doc, Uint8Array.from(atob(state.state), (char) => char.charCodeAt(0)));
         ydoc.current = doc;
 
-        // 4. Rejeu local des updates non acquittées.
+        // 4. Rejeu local des updates non acquittées — **sauf** si l'écriture
+        //    est verrouillée. Ces updates ne partiront jamais : les afficher
+        //    donnerait l'illusion qu'ils ont été enregistrés, alors qu'ils
+        //    n'existent que dans ce navigateur. On purge donc la file.
         const pending = loadPendingOps(docId, current.email);
-        for (const op of pending) {
-          try {
-            Y.applyUpdate(doc, Uint8Array.from(atob(op.update), (char) => char.charCodeAt(0)));
-          } catch {
-            /* update illisible : il sera abandonné à l'envoi */
+        if (lockEditorNow) {
+          if (pending.length > 0) clearPendingOps(docId, current.email);
+        } else {
+          for (const op of pending) {
+            try {
+              Y.applyUpdate(doc, Uint8Array.from(atob(op.update), (char) => char.charCodeAt(0)));
+            } catch {
+              /* update illisible : il sera abandonné à l'envoi */
+            }
           }
         }
 
         // 5. Affichage.
-        mountEditor(doc, false);
+        mountEditor(doc, lockEditorNow);
         setLoading(false);
 
         // 6-7. WebSocket + join + renvoi.
@@ -331,8 +469,14 @@ function EditorScreen() {
   }, [docId, router]);
 
   // --- Lecture seule -------------------------------------------------------
+  // **C'est ici que le pointeur disparaissait.** L'effet verrouillait dès que
+  // `readOnlyReason` était non nul, donc dès le premier `CREDIT_EXHAUSTED` : la
+  // zone de saisie perdait son curseur, l'utilisateur ne pouvait plus forcer
+  // l'écriture et n'atteignait jamais les 4 refus menant au blocage. Seuls un
+  // blocage et une perte d'accès désarment réellement la saisie.
   useEffect(() => {
-    setReadOnly(view.current, readOnlyReason !== null);
+    const mustLock = readOnlyReason === 'blocked' || readOnlyReason === 'forbidden';
+    setReadOnly(view.current, mustLock);
   }, [readOnlyReason]);
 
   // --- Rendu ---------------------------------------------------------------
@@ -403,11 +547,11 @@ function EditorScreen() {
       </div>
 
       {/* Bandeau de lecture seule */}
-      {readOnlyReason === 'credit' && credit && (
+      {creditNotice && credit && (
         <div style={{ padding: '0 24px', marginTop: 12 }}>
           <div className="banner-danger" role="alert">
             <strong>Crédit du jour épuisé.</strong> Vous pourrez de nouveau écrire à{' '}
-            {formatTime(credit.resetsAt)}.
+            {formatTime(credit.resetsAt)}, à la remise à zéro de minuit.
           </div>
         </div>
       )}

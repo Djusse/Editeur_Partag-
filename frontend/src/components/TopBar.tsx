@@ -31,7 +31,7 @@ export function CreditMeter({ credit }: { credit: Credit | null }) {
   return (
     <div
       className="credit-meter"
-      title={`Recharge à ${formatTime(credit.resetsAt)} (minuit UTC)`}
+      title={`Recharge à ${formatTime(credit.resetsAt)} (minuit heure de Douala)`}
     >
       <span className="credit-meter-text">
         {formatNumber(credit.remaining)} / {formatNumber(credit.limit)} caractères

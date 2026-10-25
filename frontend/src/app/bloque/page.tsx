@@ -1,7 +1,8 @@
 'use client';
 
 /**
- * Page de blocage (C4 : 4 refus pour crédit épuisé → blocage jusqu'à minuit UTC).
+ * Page de blocage (C4 : 4 refus pour crédit épuisé → blocage jusqu'à la
+ * prochaine remise à zéro, à minuit heure de Douala).
  *
  * Pourquoi une page entière et non un simple bandeau : la session reste valide
  * (l'utilisateur peut toujours **lire** les documents, section 9.6), mais toute
@@ -9,8 +10,8 @@
  * comprend pas pourquoi sa frappe ne part pas. Cette page explique la cause, le
  * terme et ce qui reste possible.
  *
- * Elle n'est pas un mur : « Continuer en lecture seule » mène aux documents.
- * Le blocage est levé automatiquement à l'heure indiquée, sans action serveur.
+ * L'unique action est « Changer d'identité » : le blocage porte sur l'adresse
+ * e-mail, pas sur le navigateur, et il se lève seul à l'heure indiquée.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -122,9 +123,9 @@ export default function BlockedPage() {
         {credit && (
           <>
             <p className="muted" style={{ marginBottom: 20 }}>
-              Votre crédit d&#8217;écriture a été refusé{' '}
-              <strong>4 fois</strong> dans la même journée (heure UTC). L&#8217;écriture est
-              donc suspendue jusqu&#8217;au prochain minuit UTC.
+              Votre crédit d&#8217;écriture a été refusé <strong>4 fois</strong> dans la
+              même journée. L&#8217;écriture est donc suspendue jusqu&#8217;à la prochaine
+              remise à zéro, à <strong>minuit heure de Douala</strong>.
             </p>
 
             <div
@@ -155,41 +156,35 @@ export default function BlockedPage() {
             >
               <dt className="muted">Écriture bloquée</dt>
               <dd>{expired ? 'terminée' : 'oui'}</dd>
-              <dt className="muted">Lecture des documents</dt>
-              <dd>
-                <strong>toujours possible</strong>
-              </dd>
               <dt className="muted">Crédit du jour</dt>
               <dd>
                 {formatNumber(credit.remaining)} / {formatNumber(credit.limit)} caractères
               </dd>
               <dt className="muted">Recharge</dt>
-              <dd>{formatTime(credit.resetsAt)} (minuit UTC)</dd>
+              <dd>{formatTime(credit.resetsAt)} (minuit heure de Douala)</dd>
             </dl>
 
-            <div className="stack">
-              <button
-                type="button"
-                className="btn-primary btn-block"
-                onClick={() => router.push('/documents')}
-              >
-                Continuer en lecture seule
-              </button>
-              <button
-                type="button"
-                className="btn-secondary btn-block"
-                onClick={() => {
-                  clearSession();
-                  router.replace('/');
-                }}
-              >
-                Changer d&#8217;identité
-              </button>
-            </div>
+            {/*
+              Une seule action : « Changer d'identité ».
+              « Continuer en lecture seule » a été retiré : le blocage porte sur
+              l'adresse e-mail, donc se connecter avec une autre adresse est la
+              seule issue réelle. Continuer en lecture seule ne menait qu'à une
+              impasse, l'écriture restant refusée dans tous les documents.
+            */}
+            <button
+              type="button"
+              className="btn-primary btn-block"
+              onClick={() => {
+                clearSession();
+                router.replace('/');
+              }}
+            >
+              Changer d&#8217;identité
+            </button>
 
             <p className="muted" style={{ marginTop: 20, fontSize: 13 }}>
-              Le blocage se lève tout seul à l&#8217;heure indiquée : rien à faire de votre
-              côté. Rechargez simplement la page à ce moment-là.
+              Le blocage se lève tout seul à la remise à zéro indiquée : rien à faire de
+              votre côté. Rechargez simplement la page à ce moment-là.
             </p>
           </>
         )}

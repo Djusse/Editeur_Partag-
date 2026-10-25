@@ -13,6 +13,7 @@ import { setupHarness, seedDocument, teardownHarness, type Harness } from './hel
 import { resetConfigCache } from '../src/lib/config';
 import { MemoryDatabase } from './helpers/memory-db';
 import { getCreditState } from '../src/lib/credits';
+import { nextUtcMidnight, secondsUntilUtcMidnight, utcDay } from '../src/lib/ids';
 import type { CreditRow } from '../src/lib/types';
 
 let harness: Harness;
@@ -62,6 +63,26 @@ describe('C4 — crédit d’écriture', () => {
   beforeEach(async () => {
     harness = setupHarness();
     await seedDocument(harness.memory);
+  });
+
+  it('remet le crédit à zéro à minuit heure de Douala, pas à minuit UTC', () => {
+    // 22:59 UTC = 23:59 à Douala : encore le même jour métier.
+    const before = new Date('2026-10-25T22:59:00.000Z');
+    // 23:00 UTC = 00:00 à Douala le lendemain : le jour métier a changé.
+    const after = new Date('2026-10-25T23:00:00.000Z');
+
+    expect(utcDay(before)).toBe('2026-10-25');
+    expect(utcDay(after)).toBe('2026-10-26');
+
+    // Le lendemain de `before` commence bien à 23:00 UTC (minuit local).
+    expect(nextUtcMidnight(before).toISOString()).toBe('2026-10-25T23:00:00.000Z');
+    expect(secondsUntilUtcMidnight(before)).toBe(60);
+  });
+
+  it('annonce une recharge à 23:00 UTC, soit minuit à Douala', async () => {
+    const credit = await getCreditState('auteur@exemple.cm');
+    expect(new Date(credit.resetsAt).getUTCHours()).toBe(23);
+    expect(new Date(credit.resetsAt).getUTCMinutes()).toBe(0);
   });
 
   it('débite exactement le nombre de caractères insérés', async () => {
@@ -223,6 +244,66 @@ describe('C4 — crédit d’écriture', () => {
     const credit = await getCreditState('auteur@exemple.cm');
     expect(credit.used).toBe(0);
     expect(credit.blockedUntil).not.toBeNull();
+  });
+
+  it('refuse encore l’écriture une fois bloqué, sans rien persister', async () => {
+    // Régression : `assertNotBlocked` n'était vérifié qu'à l'entrée du
+    // WebSocket. Un lot franchissant la limite de refus pendant son traitement
+    // laissait passer l'update suivant : il était acquitté et facturé alors que
+    // l'écriture était déjà suspendue, et l'interface ne signalait plus rien.
+    harness = setupHarness({ creditPerDay: 5, blockAfterRefusals: 2 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
+
+    const doc = await manager.load('doc_test');
+    const client = makeClient('auteur@exemple.cm');
+
+    // Deux refus suffisent ici à déclencher le blocage.
+    const first = await commitBatch(doc, [incoming(client, 'op_refus_1', 'trop long pour le credit')]);
+    const second = await commitBatch(doc, [incoming(client, 'op_refus_2', 'trop long pour le credit')]);
+    expect(first[0]?.code).toBe('CREDIT_EXHAUSTED');
+    expect(second[0]?.code).toBe('BLOCKED');
+    expect(second[0]?.blockedUntil).toBeTruthy();
+
+    const seqBefore = doc.seq;
+
+    // Maintenant bloqué : même un update minuscule doit être refusé.
+    const after = await commitBatch(doc, [incoming(client, 'op_apres_blocage', 'a')]);
+
+    expect(after).toHaveLength(1);
+    expect(after[0].code).toBe('BLOCKED');
+    expect(after[0].email).toBe('auteur@exemple.cm');
+    expect(doc.seq).toBe(seqBefore);
+    expect(harness.memory.rows('Updates').length).toBe(0);
+  });
+
+  it('laisse passer un update système malgré le blocage (restauration gratuite)', async () => {
+    // La nouvelle garde de blocage ne doit pas empêcher la restauration d'une
+    // version, explicitement gratuite dans la spécification.
+    harness = setupHarness({ creditPerDay: 5, blockAfterRefusals: 2 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
+
+    const doc = await manager.load('doc_test');
+    const client = makeClient('auteur@exemple.cm');
+    await commitBatch(doc, [incoming(client, 'op_r1', 'trop long pour le credit')]);
+    await commitBatch(doc, [incoming(client, 'op_r2', 'trop long pour le credit')]);
+    expect((await getCreditState('auteur@exemple.cm')).blockedUntil).not.toBeNull();
+
+    const seqBefore = doc.seq;
+    const payload = updateOf('texte restauré');
+    const systemClient = { ...client, system: true };
+    const result = await commitBatch(doc, [
+      { client: systemClient, opId: 'op_restore', payload, chars: 0, inserted: 0, deleted: 0, hash: hashOf(payload) },
+    ]);
+
+    expect(result).toHaveLength(0);
+    expect(doc.seq).toBe(seqBefore + 1);
+    expect((await getCreditState('auteur@exemple.cm')).used).toBe(0);
   });
 
   it('un refus ne bloque pas les autres rédacteurs du même lot', async () => {

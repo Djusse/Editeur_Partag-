@@ -2,11 +2,12 @@
  * Crédit d'écriture (C4) et anti-abus.
  *
  * Règles (plan v7, tableau 1.4) :
- *  - 10 000 caractères par e-mail et par **jour UTC**, insertions **et**
- *    suppressions comptées ;
+ *  - 10 000 caractères par e-mail et par **jour de Douala** (UTC+1), insertions
+ *    **et** suppressions comptées. La remise à zéro tombe donc à 00:00 heure
+ *    locale, et non à 01:00 comme avec un jour calé sur UTC ;
  *  - compteur unique par (e-mail, jour) : plusieurs appareils partagent le quota ;
- *  - 4 refus pour crédit épuisé dans la journée → écriture bloquée jusqu'au
- *    prochain minuit UTC ; la lecture reste possible.
+ *  - 4 refus pour crédit épuisé dans la journée → écriture bloquée jusqu'à la
+ *    prochaine remise à zéro ; la lecture reste possible.
  *
  * Le crédit est débité dans la **même transaction** que l'écriture au journal.
  */
@@ -33,7 +34,7 @@ export interface CreditState {
   day: string;
   /** `null` si l'utilisateur n'est pas bloqué. */
   blockedUntil: string | null;
-  /** Prochain minuit UTC (instant de recharge). */
+  /** Prochaine remise à zéro (minuit heure de Douala). */
   resetsAt: string;
   resetsIn: number;
 }
@@ -48,8 +49,21 @@ export async function getCreditState(email: string): Promise<CreditState> {
 
   const limit = credit?.limit ?? cfg.creditPerDay;
   const used = credit?.used ?? 0;
+
+  /**
+   * Le blocage dure **jusqu'à la prochaine remise à zéro**, par définition.
+   *
+   * On dérive donc le terme de `nextUtcMidnight()` au lieu de relire la valeur
+   * stockée. Celle-ci reste utile comme indicateur (« un blocage a été posé »),
+   * mais s'y fier comme échéance rendait le changement de règle horaire
+   * inopérant : les lignes écrites du temps du jour UTC annonçaient encore
+   * « 01:00 » alors que la recharge tombait désormais à minuit heure locale.
+   * Calculer le terme corrige les données existantes sans migration.
+   */
   const blockedUntil =
-    abuse?.blockedUntil && new Date(abuse.blockedUntil).getTime() > Date.now() ? abuse.blockedUntil : null;
+    abuse?.blockedUntil && new Date(abuse.blockedUntil).getTime() > Date.now()
+      ? nextUtcMidnight().toISOString()
+      : null;
 
   return {
     limit,
@@ -60,6 +74,19 @@ export async function getCreditState(email: string): Promise<CreditState> {
     resetsAt: nextUtcMidnight().toISOString(),
     resetsIn: secondsUntilUtcMidnight(),
   };
+}
+
+/**
+ * Terme du blocage en cours, ou `null`.
+ *
+ * Lecture **unique** sur la table d'abus : c'est la garde bon marché utilisée
+ * par le hub à chaque lot d'écriture (une lecture par auteur et par tick), là
+ * où `getCreditState` lirait aussi le compteur de crédit.
+ */
+export async function blockedUntilFor(email: string, day = utcDay()): Promise<string | null> {
+  const abuse = await db().get<AbuseRow>(config().abuseTable, { id: abuseId(email, day) });
+  const value = abuse?.blockedUntil;
+  return value && new Date(value).getTime() > Date.now() ? value : null;
 }
 
 /** Lève `BLOCKED` si l'utilisateur est bloqué pour la journée en cours. */
@@ -115,6 +142,9 @@ export async function recordCreditRefusal(
   const refusals = Number(updated?.refusals ?? 1);
   if (refusals < cfg.blockAfterRefusals) return { refusals, blockedUntil: null };
 
+  // Le blocage court jusqu'à la prochaine remise à zéro (minuit heure de
+  // Douala). Cette valeur sert de drapeau ; `getCreditState` recalcule le
+  // terme, ce qui rattrape les lignes écrites sous l'ancienne règle UTC.
   const blockedUntil = nextUtcMidnight().toISOString();
   await db().update(
     cfg.abuseTable,
