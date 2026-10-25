@@ -1,0 +1,88 @@
+@startuml
+' États du crédit quotidien — corrigé.
+'
+' Corrections de fond :
+'  1. la version précédente omettait l'état **bloqué mais non épuisé**. Le
+'     blocage est posé par 4 refus dans la journée et il survit à la remise à
+'     zéro du seul compteur : un utilisateur peut donc être bloqué avec du
+'     crédit disponible s'il n'a pas attendu minuit ;
+'  2. la remise à zéro était datée « minuit » sans préciser le fuseau. C'est
+'     minuit **heure de Douala**, soit 23:00 UTC — le décalage a réellement
+'     produit un affichage « recharge à 01:00 » incompréhensible ;
+'  3. `Disponible → Disponible : remise à zéro` n'avait aucun sens : la remise
+'     à zéro n'est pas un événement d'écriture, c'est un changement de clé
+'     (`email#jour`). Deux journées différentes sont deux lignes distinctes ;
+'  4. l'update **système** (restauration de version) franchit un blocage : ce
+'     n'est pas un contournement mais une décision — la restauration est
+'     gratuite et doit rester un recours.
+'
+' Défaut de rendu corrigé : quatre arcs se croisaient au-dessus de `Disponible`,
+' au point de rendre les libellés illisibles. Les transitions de remise à zéro
+' sont regroupées et les états nommés en clair.
+
+skinparam {
+  dpi 150
+  defaultFontName Arial
+  shadowing false
+  roundcorner 6
+  ArrowColor #333333
+  ArrowThickness 1.1
+  BackgroundColor white
+  stateBackgroundColor #FFFFFF
+  stateBorderColor #333333
+  noteBackgroundColor #FEF9E7
+  noteBorderColor #8A6D1F
+}
+
+title États du crédit d'écriture, par utilisateur et par jour
+
+[*] --> Disponible : début de la journée métier\n(limite = 10 000 caractères)
+
+state Disponible {
+  Disponible : used < limit
+  Disponible : blockedUntil = null
+  Disponible : toute écriture est acceptée
+}
+
+state LimiteAtteinte {
+  LimiteAtteinte : used ≤ limit, refus ≥ 1
+  LimiteAtteinte : l'écriture dépasserait le plafond
+}
+
+state Bloque {
+  Bloque : blockedUntil = prochain minuit (Douala)
+  Bloque : 4 refus atteints
+  Bloque : même si du crédit reste disponible
+}
+
+Disponible --> Disponible : update accepté\n[used + n ≤ limit]
+Disponible --> LimiteAtteinte : update refusé\n[used + n > limit]
+
+LimiteAtteinte --> LimiteAtteinte : refus n°2 ou n°3\n(refus compté une fois par opId)
+LimiteAtteinte --> Bloque : refus n°4 de la journée
+
+Disponible --> Bloque : 4 refus antérieurs\n(état hérité de la connexion)
+
+Bloque --> Bloque : toute écriture refusée\n→ BLOCKED { blockedUntil }
+
+note right of Bloque
+  Un update **système** franchit ce blocage :
+  la restauration de version est gratuite (chars = 0)
+  et doit rester possible même sans crédit.
+end note
+
+LimiteAtteinte --> Disponible : réinitialisation
+Bloque --> Disponible : réinitialisation
+Disponible --> Disponible : réinitialisation
+
+note bottom of Disponible
+  « Réinitialisation » n'est pas un événement : c'est un
+  changement de clé. Le compteur est indexé par `email#jour`,
+  et le jour est celui de **Douala** (UTC+1) — minuit local,
+  soit 23:00 UTC. L'ancienne règle, en jour UTC, rechargeait à
+  01:00 heure locale, ce que l'utilisateur ne comprenait pas.
+  Aucune migration n'a été nécessaire : le terme du blocage est
+  recalculé à chaque lecture, jamais relu en base.
+end note
+
+@enduml

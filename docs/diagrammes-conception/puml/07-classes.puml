@@ -1,0 +1,175 @@
+@startuml
+' Diagramme de classes du domaine — calé sur `backend/src/lib/types.ts`.
+'
+' Erreurs factuelles corrigées par rapport à la version précédente :
+'  1. `Document` portait un champ « mis à jour le » et omettait
+'     `latestSnapshotSeq` et `textLength`, qui bornent le rattrapage et portent
+'     la longueur courante ;
+'  2. `Version` portait `n` **et** `seq` comme deux champs distincts. Or `n`
+'     **est** le `seq` au moment de l'enregistrement : la numérotation ne peut
+'     donc pas avoir de trous ;
+'  3. `LienTelechargement` portait un booléen « épuisé » : le statut est un type
+'     fermé `ACTIVE | EXHAUSTED`, et `remaining` fait foi ;
+'  4. `Ticket` portait « notifié » : ce champ appartient au **lien**, c'est lui
+'     qui garantit un seul e-mail ;
+'  5. `PdfCache` ne montrait ni `attempts` ni `leaseUntil`, qui évitent de
+'     régénérer un PDF en échec et de publier deux jobs ;
+'  6. `OpId` (idempotence) et `MiseAJour.ops` étaient absents, alors que la
+'     déduplication par `opId` **et** par empreinte empêche un renvoi de débiter
+'     deux fois ;
+'  7. `MiseAJour` portait « auteur » au singulier : une entrée de journal
+'     regroupe plusieurs updates et porte une **liste** d'auteurs.
+'
+' Défauts de rendu corrigés : les paquets forçaient une disposition où
+' `Document` restait isolé en haut à gauche, avec six arcs traversant toute la
+' figure et des cardinalités superposées. Les paquets sont supprimés, les
+' pastilles « C » masquées, et la relation `Document — PdfCache` (déductible de
+' `PdfCache.id = docId#seq`) est déplacée en légende pour retirer un arc long.
+
+skinparam {
+  dpi 150
+  defaultFontName Arial
+  shadowing false
+  roundcorner 4
+  classAttributeIconSize 0
+  classBackgroundColor #FFFFFF
+  classBorderColor #333333
+  classArrowColor #333333
+  ArrowThickness 1.1
+  nodesep 40
+  ranksep 55
+  BackgroundColor white
+  legendBackgroundColor #FEF9E7
+  legendBorderColor #8A6D1F
+}
+
+title Modèle de données du domaine
+
+hide empty members
+hide circle
+
+class Document {
+  docId
+  titre
+  ownerEmail
+  ownerName
+  seq
+  latestSnapshotSeq
+  textLength
+  createdAt
+  updatedAt
+}
+
+class Membre {
+  docId
+  email
+  nom
+  role : owner | editor
+  addedAt
+}
+
+class MiseAJour {
+  docId
+  seq
+  payload : Uint8Array (Yjs fusionné)
+  chars
+  ops : liste de { opId, authorEmail, chars }
+  createdAt
+}
+
+class OpId {
+  id : OP#email#opId
+  id : HASH#docId#empreinte
+  hash
+  seq
+  email
+  docId
+  ttl
+}
+
+class Version {
+  docId
+  n  (= seq à l'enregistrement)
+  s3Key
+  authorEmail
+  authorName
+  chars
+  createdAt
+}
+
+class LienTelechargement {
+  token
+  docId
+  docTitle
+  createdByEmail
+  maxDownloads
+  remaining
+  status : ACTIVE | EXHAUSTED
+  notified
+  createdAt
+}
+
+class Ticket {
+  token
+  visitorId
+  docId
+  seqFrozen  (T1)
+  createdAt
+  ttl
+}
+
+class PdfCache {
+  id : docId#seq
+  docId
+  seq
+  status : BUILDING | READY | FAILED
+  s3Key
+  attempts
+  leaseUntil
+  ttl
+}
+
+class Credit {
+  id : email#jour
+  email
+  day
+  used
+  limit
+  ttl
+}
+
+class Abus {
+  id : email#jour
+  email
+  day
+  refusals
+  blockedUntil
+  ttl
+}
+
+Document "1" *-- "0..*" MiseAJour : journal
+Document "1" *-- "0..*" Version : historique
+Document "1" -- "0..*" Membre : partagé à
+Document "1" -- "0..*" LienTelechargement : distribué par
+LienTelechargement "1" *-- "0..*" Ticket : réserve
+Ticket "0..*" -- "0..1" PdfCache : fige sur seq
+MiseAJour "1" -- "0..*" OpId : idempotence
+MiseAJour "0..*" ..> "1" Credit : débite (hors transaction)
+Abus "1" ..> "1" Credit : bloque après 4 refus
+
+legend bottom
+  <b>Document — PdfCache</b> : la relation existe (le document génère des PDF)
+  mais elle se lit dans la clé `PdfCache.id = docId#seq`. L'arc correspondant
+  est retiré pour alléger la figure.
+  <b>OpId</b> porte deux clés d'idempotence : l'`opId` explicite du client et
+  l'empreinte du contenu. Un même update présenté sous un autre `opId` n'est
+  donc pas débité deux fois.
+  <b>Ticket</b> ne référence pas le lien : `remaining` a déjà été décrémenté
+  dans la même transaction, le couple (token, visitorId) suffit.
+  <b>Version.n</b> <i>est</i> le `seq` au moment de l'enregistrement — d'où
+  l'absence de trous dans la numérotation.
+  <b>Document.latestSnapshotSeq</b> borne la fenêtre de rattrapage ;
+  <b>Document.textLength</b> est tenu à jour par l'écrivain à chaque tick.
+endlegend
+
+@enduml

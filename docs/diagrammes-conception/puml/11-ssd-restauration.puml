@@ -1,0 +1,94 @@
+@startuml
+' Diagramme de séquence système — restaurer une version.
+'
+' Corrections de fond :
+'  1. la version précédente écrivait « S --> R : confirmation » **puis**
+'     « modification de restauration diffusée » dans le désordre : la
+'     confirmation n'arrive qu'après le commit (le `seq` renvoyé est celui de
+'     l'update de restauration) ;
+'  2. la sauvegarde préalable du texte courant était présentée comme une simple
+'     étape interne. C'est une **version à part entière**, visible dans la
+'     liste : le texte qu'on écrase reste consultable ;
+'  3. le fait que la restauration soit un **nouvel update** (et non un retour en
+'     arrière de l'historique) n'était pas explicité — c'est pourtant ce qui la
+'     rend compatible CRDT, donc ce qui évite la divergence entre clients ;
+'  4. la gratuité en crédit **et** le franchissement d'un blocage étaient
+'     mentionnés en note seulement ; ils font partie du contrat.
+'
+' Défaut de rendu corrigé : deux flèches identiques partaient de S vers R, sans
+' qu'on puisse distinguer la confirmation de la diffusion.
+
+skinparam {
+  dpi 150
+  defaultFontName Arial
+  shadowing false
+  ArrowColor #333333
+  ArrowThickness 1.1
+  BackgroundColor white
+  actorBorderColor #1B3A6B
+  actorBackgroundColor #E8F0FE
+  databaseBorderColor #1E6B45
+  databaseBackgroundColor #E9F7EF
+  sequence {
+    ParticipantBorderColor #333333
+    ParticipantBackgroundColor #E8F0FE
+    LifeLineBorderColor #BBBBBB
+    GroupBorderColor #333333
+    GroupHeaderBackgroundColor #F7FBFF
+    NoteBackgroundColor #FEF9E7
+    NoteBorderColor #8A6D1F
+  }
+}
+
+title Séquence système — restaurer une version
+
+actor Rédacteur as R
+participant "Système\nÉditeur partagé" as S
+database "S3 + DynamoDB\nVersions" as V
+actor "Autres\nrédacteurs" as O
+
+R -> S : lister les versions — GET /api/documents/{id}/versions
+S -> V : 100 versions les plus récentes, n décroissant
+S --> R : [{ n, createdAt, authorName, chars }]
+note right of R
+  `n` **est** le `seq` au moment de l'enregistrement :
+  la numérotation ne peut donc pas avoir de trous.
+end note
+
+R -> S : restaurer la version n — POST /…/versions/{n}/restore
+S -> V : lire le snapshot de la version n
+V --> S : état Yjs archivé
+
+S -> V : **sauvegarder le texte courant** comme version
+note right of S
+  Le texte qu'on écrase reste consultable : une
+  restauration n'efface jamais l'historique.
+end note
+
+S -> S : calculer le diff entre le texte courant réel\net le texte de la version n
+note right of S
+  Le diff est calculé sur l'état **courant réel**.
+  Le calculer sur un document vide produirait des
+  insertions sans suppression, donc une duplication
+  chez les autres clients au lieu d'un remplacement.
+end note
+
+S -> V : écrire un **nouvel update** de remplacement\n(OpIds, journal, seq + 1)
+note right of S
+  Ce n'est pas un retour en arrière de l'historique
+  mais une révision de plus : c'est ce qui la rend
+  compatible CRDT, donc convergente pour tous.
+end note
+
+S --> R : 200 { seq } — la restauration est enregistrée
+S --> O : `update` { seq, payload } — la restauration est diffusée
+S --> R : `ack` (si le rédacteur est connecté en WebSocket)
+
+note over S
+  Restauration **gratuite** : chars = 0, aucun débit de crédit.
+  Update « système » : elle aboutit même si l'auteur a épuisé
+  son crédit et s'est fait bloquer — sans quoi il serait
+  enfermé sans recours.
+end note
+
+@enduml

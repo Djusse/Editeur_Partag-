@@ -42,23 +42,17 @@ Le plan d'exécution complet est dans
 
 ## 1. Architecture en un schéma
 
-```
-Visiteurs / rédacteurs (navigateurs, k6)
-        │  HTTP :80 — REST (/api), parcours visiteur (/d), WebSocket (/ws)
-        ▼
-Elastic IP ──► EC2 (Amazon Linux 2023, m7i-flex.large, 2 vCPU / 8 Gio)
-               ├─ nginx : front statique, micro-cache de /status, proxy /api, /d et /ws
-               └─ Node.js 22 (systemd : editeur-app et editeur-worker)
-                     • hub : UN SEUL écrivain par document, état Yjs en mémoire
-                     • tick d'écriture de 250 ms, transaction atomique
-                     • claim, crédit, présence, génération PDF
-                     │  rôle d'instance : identifiants temporaires, aucune clé
-        ┌────────────┼──────────────┬──────────────┬──────────────────┐
-        ▼            ▼              ▼              ▼                  ▼
-   DynamoDB       S3 privé      SQS pdf-jobs    SES            SSM Parameter Store
-   (10 tables)    (PDF,         + lettres       (dernier       (secret JWT,
-                   snapshots)    mortes)         exemplaire)    clé d'admin)
-```
+![Architecture de déploiement AWS](docs/diagrammes-conception/png/02-deploiement.png)
+
+Tout le trafic entre par une **Elastic IP** et atteint nginx, sur la même
+instance : le serveur statique, le proxy vers l'API et le WebSocket, et le
+micro-cache de `/status` qui absorbe le pic de visiteurs. L'application Node
+tient l'état Yjs de chaque document ouvert en mémoire et n'écrit dans DynamoDB
+que par lots, une transaction par tick de 250 ms. Le PDF n'est jamais transporté
+par l'instance : elle présigne une URL et laisse S3 servir le fichier.
+
+Légende complète et versions modifiables : [`docs/diagrammes-conception/`](docs/diagrammes-conception/)
+(sources PlantUML dans `puml/`, rendus dans `png/`).
 
 Une seule pile CloudFormation ([`infra/template.yaml`](infra/template.yaml)) :
 EC2 + Elastic IP + Security Group, 10 tables DynamoDB, un bucket S3 privé, une

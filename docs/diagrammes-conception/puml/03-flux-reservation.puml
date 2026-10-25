@@ -1,0 +1,127 @@
+@startuml
+' Flux interne de réservation — corrigé.
+'
+' Erreurs factuelles corrigées (relevées dans backend/src/lib/links.ts et
+' backend/src/routes/visitor.ts) :
+'  1. « ticket déjà connu ? (mémoire) » : les tickets de téléchargement sont
+'     dans la table DynamoDB `Tickets` ; seuls les tickets *WebSocket* vivent en
+'     mémoire. La lecture est donc `GetItem` ;
+'  2. « 200 « attendre » » : un PDF en génération renvoie **202**, pas 200.
+'     Confondre les deux fait compter un état normal comme un succès ;
+'  3. « 302 vers S3 » : il n'y a **aucune redirection**. Le corps du 200 porte
+'     une URL présignée que le navigateur suit ensuite ;
+'  4. la garde mémoire (50 claims simultanés par lien) était absente alors
+'     qu'elle explique les 202 sous pic ;
+'  5. la transition `ACTIVE → EXHAUSTED` et la notification SES étaient
+'     implicites : ce sont deux écritures distinctes, après la transaction.
+'
+' Défauts de rendu corrigés : cinq `alt` imbriqués donnaient une figure très
+' haute où les libellés de branche se chevauchaient. Les branches sont
+' aplaties, et les couleurs de bordure des participants sont fixées (la file
+' SQS restait rouge par défaut).
+
+' Les couleurs de `database`, `queue` et `actor` sont posées **au niveau global** :
+' dans un bloc `sequence { }`, la version 1.2020.02 de PlantUML les ignore — le
+' cylindre DynamoDB et la file SQS gardaient alors les teintes par défaut (jaune
+' et rouge), en décalage avec le reste de la figure.
+skinparam {
+  dpi 150
+  defaultFontName Arial
+  shadowing false
+  ArrowColor #333333
+  ArrowThickness 1.1
+  BackgroundColor white
+  actorBorderColor #1B3A6B
+  actorBackgroundColor #E8F0FE
+  databaseBorderColor #1E6B45
+  databaseBackgroundColor #E9F7EF
+  queueBorderColor #1E6B45
+  queueBackgroundColor #E9F7EF
+  sequence {
+    ParticipantBorderColor #333333
+    ParticipantBackgroundColor #E8F0FE
+    LifeLineBorderColor #BBBBBB
+    GroupBorderColor #333333
+    GroupHeaderBackgroundColor #F7FBFF
+    NoteBackgroundColor #FEF9E7
+    NoteBorderColor #8A6D1F
+  }
+}
+
+title Flux interne — réserver un exemplaire, puis obtenir le PDF (C1)
+
+actor Visiteur as V
+participant nginx as N
+participant "Application\nroutes visiteur" as A
+database "DynamoDB\nTickets · Links" as D
+' `queue` n'est pas un type de couleur reconnu par cette version de PlantUML : il
+' retombe sur les couleurs de `participant` et gardait une bordure rouge. On
+' déclare donc la file comme un participant coloré, ce qui rend le résultat
+' identique quelle que soit la version.
+participant "SQS" as Q #E9F7EF
+participant "Worker PDF" as W
+participant "S3" as S
+
+== Réserver (claim) ==
+V -> N : POST /d/{token}/claim { visitorId }
+N -> A : proxy — aucune authentification,\nle jeton du lien est la capacité
+A -> A : visitorId valide ? (8 à 100 caractères)
+A -> D : GetItem Tickets (token, visitorId)\n→ cherché AVANT le court-circuit « épuisé »
+alt ticket existant (requête rejouée)
+  A --> V : même réponse qu'au premier claim\n(200 ou 202 — idempotent)
+else nouveau visiteur
+  A -> D : GetItem Links → remaining, status, docTitle
+  alt lien EXHAUSTED ou remaining ≤ 0
+    A --> V : 410 { state: "exhausted" }  (cache public 60 s)
+  else exemplaire peut-être disponible
+    A -> A : garde mémoire — 50 claims simultanés par lien
+    opt garde saturée
+      A --> V : 202 { state: "waiting", retryAfter: 1 }\nle visiteur patiente, il n'est jamais refusé
+    end
+    A -> D : TransactWriteItems\n• Links : ADD remaining −1\n   si remaining > 0 AND status = ACTIVE\n• Tickets : Put (token, visitorId, seqFrozen)\n   si attribute_not_exists(visitorId)
+    alt transaction refusée
+      A --> V : 410 épuisé (ou nouvelle tentative si conflit)
+    else exemplaire réservé
+      note over A
+        T1 est figé ici : seqFrozen = dernier seq réellement écrit.
+        Tous les exemplaires d'une même rafale partagent le même PDF.
+      end note
+      A -> D : transition ACTIVE → EXHAUSTED\nsi status = ACTIVE AND remaining = 0
+      opt la transaction vient d'épuiser le lien
+        A -> D : SET notified = true (conditionnel)
+        A -> A : envoi SES au créateur du lien\n(idempotent, ne lève jamais)
+      end opt
+      A -> D : GetItem PdfCache (docId#seqFrozen)
+      alt cache READY
+        A --> V : 200 { state: "ready", url, expiresIn: 60 }
+      else absent, ou FAILED depuis moins de 3 essais
+        A -> D : verrou BUILDING (bail 120 s)
+        A -> Q : publier le job de génération
+        A --> V : 202 { state: "waiting", retryAfter: 2 }
+        W -> Q : consomme le job
+        W -> D : lit le journal jusqu'à seqFrozen
+        W -> S : dépose le PDF
+        W -> D : PdfCache → READY
+      else FAILED depuis 3 essais
+        A --> V : 503 PDF_UNAVAILABLE
+      end
+    end
+  end
+end
+
+== Consulter l'état, puis reprendre le téléchargement ==
+V -> N : GET /d/{token}/status
+N --> V : { status, title, remaining }\nCache-Control 1 s (actif) / 60 s (épuisé)
+V -> N : GET /d/{token}/file?visitorId=…
+N -> A : proxy
+A -> D : GetItem Tickets
+alt aucun ticket pour ce visiteur
+  A --> V : 410 NO_TICKET
+else ticket trouvé
+  A -> S : présigner la clé du PDF (TTL 60 s)
+  A --> V : 200 { state: "ready", url } ou 202 { state: "waiting" }
+  V -> S : GET sur l'URL présignée
+  S --> V : le PDF — S3 sert le fichier, pas l'instance
+end
+
+@enduml

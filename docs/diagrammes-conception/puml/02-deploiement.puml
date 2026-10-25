@@ -1,0 +1,110 @@
+@startuml
+' Diagramme de déploiement AWS — figure d'architecture du README.
+'
+' Défauts corrigés par rapport à la version précédente :
+'  1. le type d'instance annoncé était `t3.large` : le déploiement réel utilise
+'     `m7i-flex.large` (2 vCPU / 8 Gio), seul type à la fois éligible au Free
+'     Tier et doté de la mémoire utile à C5 ;
+'  2. les détails de l'instance (IMDSv2, crédits CPU) étaient dans le titre du
+'     noeud, où les flèches entrantes les chevauchaient ; ils passent en légende
+'     détachée ;
+'  3. le rôle IAM était un composant *interne* à l'EC2, ce qui le présentait
+'     comme un processus déployé : c'est une identité attachée ;
+'  4. l'Elastic IP n'était qu'une mention dans un titre alors qu'elle est le
+'     point d'entrée de tout le trafic ;
+'  5. le libellé `SQS PDF + DLQ` débordait du cadre et était tronqué ;
+'  6. les flèches courbes se croisaient au point de rendre la lecture confuse :
+'     `linetype ortho` impose des angles droits, bien plus lisibles pour une
+'     architecture ;
+'  7. les couleurs par défaut de PlantUML (composants jaunes à bordure rouge)
+'     donnaient un aspect « planche d'autocollants » : chaque famille de
+'     ressources a désormais sa teinte, choisie pour rester lisible en
+'     impression noir et blanc.
+
+' Les couleurs de fond **et** de bordure sont posées famille par famille :
+' ne fixer que le fond laissait les bordures aux teintes par défaut de PlantUML
+' (acteurs magenta, file SQS rouge), ce qui jurait avec le reste.
+skinparam {
+  dpi 150
+  defaultFontName Arial
+  shadowing false
+  roundcorner 6
+  linetype ortho
+  ArrowColor #333333
+  ArrowThickness 1.1
+  BackgroundColor white
+  nodesep 40
+  ranksep 50
+  Padding 8
+
+  rectangleBackgroundColor white
+  rectangleBorderColor #333333
+  nodeBackgroundColor #F7FBFF
+  nodeBorderColor #333333
+  databaseBackgroundColor #E9F7EF
+  databaseBorderColor #1E6B45
+  storageBackgroundColor #E9F7EF
+  storageBorderColor #1E6B45
+  queueBackgroundColor #E9F7EF
+  queueBorderColor #1E6B45
+  actorBackgroundColor #E8F0FE
+  actorBorderColor #1B3A6B
+  componentBackgroundColor #E8F0FE
+  noteBackgroundColor #FEF9E7
+  legendBackgroundColor #FEF9E7
+  legendBorderColor #8A6D1F
+}
+
+title Déploiement AWS — région eu-north-1, un seul compte
+
+actor "Navigateur\nrédacteur / visiteur" as B #E8F0FE
+actor "Générateur de charge\nk6 — temporaire" as LG #FEF9E7
+
+rectangle "AWS — région eu-north-1" as CLOUD #F7FBFF {
+
+  rectangle "Elastic IP" as EIP #FFF4E5
+
+  node "EC2 applicative — Amazon Linux 2023\nm7i-flex.large (2 vCPU / 8 Gio)" as EC2 {
+
+    rectangle "nginx :80\nfront statique\nmicro-cache /d/*/status\nproxy /api · /d · /ws" as NG #E8F0FE
+
+    rectangle "Application Node.js :3000\nFastify + ws + Yjs\nhub : un seul écrivain\nsystemd — editeur-app" as APP #E8F0FE
+
+    rectangle "Front statique\nexport Next.js" as FS #E8F0FE
+
+    rectangle "Worker PDF\nsystemd — editeur-worker" as WK #E8F0FE
+  }
+
+  database "DynamoDB\n10 tables, à la demande" as DDB
+  storage "S3 privé\nPDF · snapshots" as S3
+  queue "SQS\nPDF + lettres mortes" as SQS
+  rectangle "SES\nnotification de fin de quota" as SES #FEF9E7
+  rectangle "SSM Parameter Store\nsecret JWT · clé d'admin" as SSM #FEF9E7
+}
+
+B --> EIP : HTTP :80\nWebSocket /ws
+LG --> EIP : charge
+EIP --> NG
+NG --> FS : statique
+NG --> APP : proxy\n127.0.0.1:3000
+
+APP --> DDB : transactions
+APP --> S3 : snapshots\nURL présignées
+APP --> SQS : demande\nde PDF
+APP --> SES : e-mail
+APP --> SSM : secrets
+
+WK --> SQS : consomme
+WK --> S3 : dépose le PDF
+WK --> DDB : cache PDF
+
+B ..> S3 : URL présignée 60 s
+
+legend bottom left
+  IMDSv2 obligatoire (HttpTokens: required) · crédits CPU Standard
+  Rôle IAM d'instance, moindre privilège : identifiants temporaires,
+  aucune clé d'accès n'est stockée sur la machine
+  Secrets SSM créés une seule fois, jamais dans le template ni le user data
+end legend
+
+@enduml

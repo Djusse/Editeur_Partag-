@@ -1,0 +1,65 @@
+@startuml
+' États d'un lien de téléchargement — corrigé.
+'
+' Correction de fond : la version précédente montrait `Actif → Epuise` sur le
+' seul événement « dernier exemplaire réservé », et `Epuise → [*]`. C'est
+' incomplet sur deux points : un lien n'a **pas** d'état terminal (il reste
+' consultable indéfiniment, en répondant « épuisé »), et la transition dépend
+' d'une **écriture séparée et conditionnelle**, pas du claim lui-même. C'est
+' cette séparation qui rend l'épuisement idempotent sous concurrence : seul le
+' claim qui amène réellement `remaining` à 0 peut poser `EXHAUSTED`.
+'
+' Ajout de l'état initial et de la garde de concurrence, qui expliquent pourquoi
+' deux visiteurs simultanés ne peuvent pas poser la transition deux fois.
+
+skinparam {
+  dpi 150
+  defaultFontName Arial
+  shadowing false
+  roundcorner 6
+  ArrowColor #333333
+  ArrowThickness 1.1
+  BackgroundColor white
+  stateBackgroundColor #FFFFFF
+  stateBorderColor #333333
+  noteBackgroundColor #FEF9E7
+  noteBorderColor #8A6D1F
+}
+
+title États d'un lien de téléchargement
+
+[*] --> Actif : création\nremaining = maxDownloads, status = ACTIVE
+
+state Actif {
+  Actif : remaining > 0
+  Actif : chaque claim accepté\nADD remaining −1
+}
+
+state Epuise {
+  Epuise : remaining = 0
+  Epuise : status = EXHAUSTED
+}
+
+Actif --> Actif : claim accepté\n[remaining reste > 0]
+Actif --> Epuise : claim accepté, dernier exemplaire\n[remaining = 0]
+
+note right of Epuise
+  Transition posée par une écriture **séparée** :
+  SET status = EXHAUSTED
+  SI status = ACTIVE AND remaining = 0
+
+  Idempotente : sous 50 claims concurrents, un seul
+  peut satisfaire la condition. Les autres obtiennent
+  ConditionalCheckFailed, ce qui n'est pas une erreur.
+end note
+
+Epuise --> Epuise : claim ou /status\n→ 410 « épuisé »\n(cache public 60 s)
+
+note bottom of Epuise
+  Pas d'état terminal : le lien reste consultable et
+  répond « épuisé » indéfiniment. Il n'existe **aucune**
+  route de révocation — un lien ne peut pas être coupé,
+  seulement épuisé.
+end note
+
+@enduml
