@@ -36,22 +36,16 @@ const MAX_DOWNLOADS = Number(__ENV.MAX_DOWNLOADS || 500);
 const PEAK_SHARE = Number(__ENV.PEAK_SHARE || 0.8);
 const PEAK_SECONDS = Number(__ENV.PEAK_SECONDS || 60);
 
+// `Counter` est un **aggregate metric** : k6 agrège les valeurs de tous les
+// VUs et les rend disponibles dans `data.metrics` au `teardown` et dans le
+// résumé. Une simple variable JS, elle, est **locale à chaque VU** : c'est
+// pourquoi la première version affichait « 0 / 10 » alors que le compteur
+// `s1_reserved` en montrait 10.
 const reserved = new Counter('s1_reserved');
 const exhausted = new Counter('s1_exhausted');
 const serverErrors = new Counter('s1_server_errors');
 const throttled = new Counter('s1_throttled_429');
 const claimLatency = new Trend('s1_claim_latency', true);
-
-/**
- * Quotas atteints et réservations accordées.
- *
- * Ils sont partagés par tous les VUs **du même processus k6**. k6 ne garantit
- * pas ce partage entre instances distribuées : pour un test distribué, il
- * faudrait agréger les compteurs de chaque instance. En pratique, une seule
- * instance de charge suffit ici (le plan prévoit ~15 000 requêtes).
- */
-let totalClaimed = 0;
-let totalExhausted = 0;
 
 export const options = {
   scenarios: {
@@ -136,57 +130,65 @@ export default function (data) {
   }
 
   if (result.state === 'ready' || result.state === 'waiting') {
-    totalClaimed += 1;
     reserved.add(1);
-    check(result, {
-      'S1 : réservation a un état explicite': () => result.state === 'ready' || result.state === 'waiting',
-    });
   } else if (result.state === 'exhausted') {
-    totalExhausted += 1;
     exhausted.add(1);
   }
 }
 
-/** Vérifications finales : la somme doit être exactement le quota. */
+/**
+ * Vérifications finales côté lien.
+ *
+ * ⚠️ `teardown` **ne reçoit pas les métriques** : il n'a que la valeur rendue
+ * par `setup`. Le verdict de C1 est donc calculé dans `handleSummary`, qui
+ * reçoit `data.metrics`. La première version le faisait ici, sur des variables
+ * locales aux VUs — d'où « 0 / 10 » alors que le compteur en montrait 10.
+ */
 export function teardown(data) {
   const final = linkStatus(data.token);
-
-  check(null, {
-    'S1 : plus aucun exemplaire restant': () => final.body.remaining === 0,
-    'S1 : statut passé à exhausted': () => final.body.status === 'exhausted',
-    'S1 : au moins un visiteur a été servi': () => totalClaimed > 0,
-    'S1 : au moins un visiteur a été refusé': () => totalExhausted > 0,
-    'S1 : aucun 5xx': () => serverErrors.value === undefined || Number(serverErrors.value) === 0,
+  check(final, {
+    'S1 : plus aucun exemplaire restant': (r) => r.body.remaining === 0,
+    'S1 : statut passé à exhausted': (r) => r.body.status === 'exhausted',
   });
-
-  // La condition centrale de C1 : ni plus, ni moins que le quota.
-  const exact = totalClaimed === MAX_DOWNLOADS;
-  check(null, {
-    [`S1 : exactement ${MAX_DOWNLOADS} réservations (obtenu ${totalClaimed})`]: () => exact,
-  });
-
-  console.log('');
-  console.log(`S1 — réservations accordées : ${totalClaimed} / ${MAX_DOWNLOADS}`);
-  console.log(`S1 — refus « épuisé »       : ${totalExhausted}`);
-  console.log(`S1 — 429 (garde mémoire)    : ${Number(throttled.value) || 0}`);
-  console.log(`S1 — 5xx                    : ${Number(serverErrors.value) || 0}`);
-  console.log(`S1 — remaining final        : ${final.body.remaining}`);
-  console.log('');
-  console.log(
-    exact
-      ? '=> C1 RESPECTÉE : exactement N exemplaires distribués, jamais N+1.'
-      : `=> C1 VIOLÉE : ${totalClaimed} réservations pour ${MAX_DOWNLOADS} exemplaires.`,
-  );
 }
 
 export function handleSummary(data) {
-  // Aucune dépendance externe : un serveur de charge n'a pas toujours accès à
-  // Internet, et un import réseau en échec empêcherait le test de démarrer.
-  // Les résultats sont en JSON, convertibles ensuite en tableau ou graphique.
+  const claimed = metricCount(data, 's1_reserved');
+  const refused = metricCount(data, 's1_exhausted');
+  const errors5xx = metricCount(data, 's1_server_errors');
+  const throttled429 = metricCount(data, 's1_throttled_429');
+  const exact = claimed === MAX_DOWNLOADS;
+
+  const lines = textSummary(data).split('\n');
+  lines.push('');
+  lines.push(`S1 — réservations accordées : ${claimed} / ${MAX_DOWNLOADS}`);
+  lines.push(`S1 — refus « épuisé »       : ${refused}`);
+  lines.push(`S1 — 429 (garde mémoire)    : ${throttled429}`);
+  lines.push(`S1 — 5xx                    : ${errors5xx}`);
+  lines.push('');
+  lines.push(
+    exact && errors5xx === 0
+      ? '=> C1 RESPECTÉE : exactement N exemplaires distribués, jamais N+1, aucun 5xx.'
+      : `=> C1 NON PROUVÉE : ${claimed} réservations pour ${MAX_DOWNLOADS} exemplaires, ${errors5xx} erreur(s) 5xx.`,
+  );
+  lines.push('');
+
   return {
-    stdout: textSummary(data),
+    stdout: lines.join('\n'),
+    // ⚠️ k6 n'a **pas** d'API de système de fichiers sans
+    // `--compatibility-mode` : il ne peut pas créer le dossier lui-même. S'il
+    // manque, k6 signale `failed to handle the end-of-test summary` et perd le
+    // résumé — le verdict ci-dessus reste affiché, mais le JSON n'est pas écrit.
+    // Le dossier est donc créé par l'appelant (voir tests/k6/run.sh).
     'tests/results/s1.json': JSON.stringify(data, null, 2),
   };
+}
+
+/** Lit le total d'un compteur dans le résumé, ou 0 s'il est absent. */
+function metricCount(data, name) {
+  const values = data.metrics?.[name]?.values;
+  if (!values) return 0;
+  return Number(values.count ?? 0);
 }
 
 /** Résumé lisible, sans dépendre du formateur par défaut de k6. */
@@ -205,10 +207,8 @@ function textSummary(data) {
   add('latence claim médiane (ms)', 's1_claim_latency', 'med');
   add('latence claim p95 (ms)', 's1_claim_latency', 'p(95)');
   add('latence claim p99 (ms)', 's1_claim_latency', 'p(99)');
-  add('réservations accordées', 's1_reserved', 'count');
-  add('refus « épuisé »', 's1_exhausted', 'count');
-  add('429 (garde mémoire)', 's1_throttled_429', 'count');
-  add('5xx', 's1_server_errors', 'count');
+  // Les compteurs réservations / refus / 429 / 5xx sont affichés par le verdict
+  // de `handleSummary` : les répéter ici produirait deux fois les mêmes lignes.
 
   const checks = metrics.checks?.values;
   if (checks) {
