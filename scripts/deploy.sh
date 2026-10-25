@@ -174,7 +174,11 @@ echo "    instance $INSTANCE_ID — $PUBLIC_IP — bucket $BUCKET"
 echo "==> 4/6 Construction de l'application"
 # Un `.next` résiduel d'un `next dev` fige une URL localhost dans les chunks :
 # le front appellerait alors l'API sur la mauvaise origine. On repart propre.
-rm -rf frontend/.next frontend/out backend/dist build app.tar.gz
+# Nettoyage **avant** le contrôle d'espace : `node_modules` et `.next` d'un
+# essai précédent occupent ~620 Mio et ne servent plus. Les laisser ferait
+# échouer le contrôle alors qu'il suffit de les supprimer — c'était le cas au
+# deuxième déploiement de CloudShell.
+rm -rf frontend/.next frontend/out backend/dist backend/node_modules frontend/node_modules build app.tar.gz
 
 # --- Contrôle d'espace ---------------------------------------------------
 # CloudShell ne dispose que d'environ 1 Gio dans `$HOME`. Le pic mesuré sur ce
