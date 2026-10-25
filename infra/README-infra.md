@@ -124,15 +124,26 @@ code sous forme de commentaire.
 | 5 | `npm error Invalid: lock file's @types/node@20… does not satisfy @types/node@22` | `package-lock.json` du frontend antérieur au passage à `@types/node@22` | lockfile régénéré |
 | 6 | `ENOSPC: no space left on device` en fin de build | CloudShell plafonne `$HOME` à 1 Gio ; `node_modules` et le cache npm s'y accumulaient | libération au fur et à mesure dans `deploy.sh` (pic ramené de ~880 à 665 Mio) + purge du cache npm |
 | 7 | `X-Cache-Status` absent au diagnostic | `add_header` ne s'applique pas aux 404 sans le mot-clé `always` | `add_header … always` |
+| 8 | « N modifications en attente » sans fin, « Connecté », crédit intact | `used + :chars <= :limit` dans une `ConditionExpression` : **DynamoDB refuse l'arithmétique entre deux valeurs** (`Syntax error; token: "+"`). Le double en mémoire, lui, l'évaluait → **42 tests verts et aucune écriture possible** | contrôle du plafond par **lecture préalable** ; le double de test lève désormais sur cette forme |
+| 9 | Le client reste silencieux malgré l'échec serveur | `commitBatch` lève, `tick` journalise et **rejoue indéfiniment** sans prévenir personne | à traiter : envoyer un message `error` au client plutôt que boucler |
 
-Les défauts 3 et 4 sont les plus instructifs : sans instrumentation, un échec de
-user data ne renvoie qu'un `FAILURE signal` anonyme, et l'on perd des heures. Le
-diagnostic n'a été possible qu'en **conservant l'instance** (`--on-failure
-DO_NOTHING`) puis en lisant `/var/log/editeur-init.log` par SSM.
+Les défauts 3, 4 et 8 sont les plus instructifs.
 
-Le défaut 4 illustre une limite du test en conteneur : la configuration nginx
-avait été validée dans `nginx:alpine`, qui fournit `/var/cache/nginx`. Tester
-dans une image `amazonlinux:2023` aurait révélé le problème avant le déploiement.
+**3** — sans instrumentation, un échec de user data ne renvoie qu'un
+`FAILURE signal` anonyme. Le diagnostic n'a été possible qu'en **conservant
+l'instance** (`--on-failure DO_NOTHING`) puis en lisant
+`/var/log/editeur-init.log` par SSM.
+
+**4** — illustre une limite du test en conteneur : la configuration nginx avait
+été validée dans `nginx:alpine`, qui fournit `/var/cache/nginx`. Tester dans une
+image `amazonlinux:2023` aurait révélé le problème avant le déploiement.
+
+**8** — le plus grave, et le plus révélateur. Le double de test **évaluait
+lui-même** les expressions qu'on lui passait ; il était donc plus permissif que
+DynamoDB et validait une syntaxe impossible. 42 tests au vert, application
+déployée, et aucune écriture ne passait. La leçon : un faux service doit
+**rejeter** ce que le vrai rejette, sinon il ne prouve rien. Le helper lève
+désormais explicitement sur toute arithmétique entre deux valeurs.
 
 ---
 

@@ -371,10 +371,23 @@ function evaluate(
     return evaluate(trimmed, current, values, names);
   }
 
-  // `:delta <= :limit` (comparaison de deux valeurs)
+  // Comparaison de deux valeurs littérales (`:delta <= :limit`) : c'est la
+  // seule forme arithmétique que DynamoDB accepte.
   const twoValues = expression.match(/^:(\w+)\s*<=\s*:(\w+)$/);
   if (twoValues) {
     return Number(values[`:${twoValues[1]}`] ?? 0) <= Number(values[`:${twoValues[2]}`] ?? 0);
+  }
+
+  // --- Rejets volontaires : DynamoDB refuse ces formes ------------------------
+  // Les simuler ici évite qu'un test passe sur une expression que le vrai
+  // service rejetterait. C'est exactement ce qui est arrivé avec
+  // `used + :chars <= :limit` : le double en mémoire l'évaluait, DynamoDB
+  // répondait `ValidationException: Syntax error; token: "+"`, et tous les
+  // tests étaient verts alors que l'écriture ne partait jamais en production.
+  if (/[#\w]+\s*[+\-*/]\s*:\w+\s*[<>=]/.test(expression) || /\b(used|usedBefore)\s*\+/.test(expression)) {
+    throw new Error(
+      `Invalid ConditionExpression: Syntax error; token: "+" (arithmétique entre deux valeurs) — ${expression}`,
+    );
   }
 
   if (expression.includes('attribute_not_exists')) {

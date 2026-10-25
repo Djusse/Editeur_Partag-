@@ -51,6 +51,15 @@ export interface ProviderCallbacks {
   onRejection?: (payload: RejectionPayload) => void;
   onQueueChange?: (size: number) => void;
   onRemoteUpdate?: () => void;
+  /**
+   * Échec d'écriture **côté serveur** (transaction refusée par DynamoDB).
+   *
+   * Distinct des refus métier (`onRejection`) : il ne s'agit ni du crédit, ni
+   * d'un blocage, ni de la taille. Le serveur réessaie, mais l'utilisateur doit
+   * savoir que rien n'est enregistré — sans quoi « Connecté » et « N
+   * modifications en attente » laissent croire le contraire.
+   */
+  onWriteFailure?: (message: string) => void;
 }
 
 export interface ProviderOptions {
@@ -315,6 +324,23 @@ export class CollaborativeProvider {
 
     if (type === 'error') {
       const code = String(message.code ?? 'ERROR');
+
+      /**
+       * Échec d'écriture côté serveur (`WRITE_FAILED`).
+       *
+       * Distinct d'un refus métier : la transaction a levé une exception
+       * (validation DynamoDB, throttling, permission). Le hub réessaie, mais
+       * sans ce message l'interface affichait « Connecté » et un compteur de
+       * modifications en attente qui ne descendait jamais — l'utilisateur
+       * croyait son texte enregistré.
+       */
+      if (code === 'WRITE_FAILED') {
+        this.options.callbacks?.onWriteFailure?.(
+          typeof message.message === 'string' ? message.message : 'Enregistrement impossible.',
+        );
+        return;
+      }
+
       if (code === 'CREDIT_EXHAUSTED' || code === 'BLOCKED' || code === 'FORBIDDEN' || code === 'PAYLOAD_TOO_LARGE') {
         // `creditRemaining` accompagne le refus : il met la jauge à zéro sans
         // appel réseau supplémentaire.

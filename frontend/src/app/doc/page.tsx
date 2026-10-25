@@ -279,6 +279,16 @@ function EditorScreen() {
           // exactement le reliquat), pas seulement après un refus.
           if (creditRemaining <= 0) setCreditNotice(true);
         },
+        /**
+         * Échec d'écriture côté serveur : distinct d'un refus métier.
+         *
+         * Sans ce retour, l'interface restait sur « Connecté » avec un compteur
+         * de modifications en attente qui ne descendait jamais — l'utilisateur
+         * croyait son texte enregistré alors qu'aucune transaction n'aboutissait.
+         */
+        onWriteFailure: (message) => {
+          pushToast(`Enregistrement impossible. ${message}`, 'error');
+        },
         onRejection: (payload) => {
           // Section 9.6 : la jauge doit tomber à zéro immédiatement. Sans cet
           // alignement, elle restait à « 1 / 10 000 » alors que l'écriture

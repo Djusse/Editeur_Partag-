@@ -95,6 +95,23 @@ describe('C4 — crédit d’écriture', () => {
     expect(doc.seq).toBe(1);
   });
 
+  it('n’utilise aucune arithmétique entre valeurs dans une ConditionExpression', async () => {
+    // Régression : `used + :chars <= :limit` levait en production
+    //   ValidationException: Invalid ConditionExpression:
+    //   Syntax error; token: "+", near: "used + :chars"
+    // Le double en mémoire évaluait lui-même cette expression, donc les tests
+    // restaient verts alors qu'aucun update n'était persisté. Le helper lève
+    // désormais, et l'on vérifie ici que le débit fonctionne toujours.
+    const doc = await state();
+    const client = makeClient('auteur@exemple.cm');
+
+    await commitBatch(doc, [incoming(client, 'op_no_arith', 'bonjour')]);
+
+    const credit = await getCreditState('auteur@exemple.cm');
+    expect(credit.used).toBe(7);
+    expect(doc.seq).toBe(1);
+  });
+
   it('refuse au-delà du plafond sans rien persister', async () => {
     harness = setupHarness({ creditPerDay: 20 });
     await seedDocument(harness.memory);

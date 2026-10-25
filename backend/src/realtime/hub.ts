@@ -128,6 +128,19 @@ export class DocumentState {
       await commitBatch(this, batch);
     } catch (error) {
       console.error('Échec du tick d\'écriture', { docId: this.docId, error });
+      // Sans ce message, le client affichait « Connecté » et « N modifications
+      // en attente » indéfiniment : le hub réessayait toutes les 250 ms sans
+      // jamais rien dire. On prévient l'utilisateur, et on garde le lot en file :
+      // la cause peut être transitoire (throttling, coupure réseau).
+      const message = error instanceof Error ? error.message : 'Erreur inconnue';
+      for (const update of batch) {
+        send(update.client, {
+          type: 'error',
+          code: 'WRITE_FAILED',
+          opId: update.opId,
+          message: `Enregistrement impossible : ${message}`,
+        });
+      }
       this.replay(batch);
     } finally {
       this.committing = false;
@@ -316,11 +329,41 @@ export async function commitBatch(
     },
   ];
 
-  // On retient l'auteur de chaque élément `Credits` : l'indice dans
-  // `CancellationReasons` permet ensuite d'identifier **le seul** fautif.
+  // --- Contrôle du crédit, en lecture préalable ------------------------------
+  //
+  // DynamoDB **n'autorise pas l'arithmétique entre deux valeurs** dans une
+  // `ConditionExpression` : `used + :chars <= :limit` lève
+  //   ValidationException: Invalid ConditionExpression:
+  //   Syntax error; token: "+", near: "used + :chars"
+  // Ce défaut ne se voyait pas en test, car le double en mémoire évaluait
+  // lui-même cette expression — il était plus permissif que le vrai service.
+  //
+  // La seule forme valide serait de comparer le compteur à une valeur
+  // **littérale** calculée à l'avance, ce qui imposerait une écriture par
+  // auteur. On préfère donc lire le compteur avant la transaction : le risque
+  // de course est borné par l'écrivain unique du hub (un seul processus tient
+  // le document), et la transaction reste la garde d'atomicité pour `seq`,
+  // le journal et les marqueurs `opId`.
   const creditAuthorByIndex = new Map<number, string>();
+  const overBudget = new Set<string>();
+
+  await Promise.all(
+    [...byAuthor].map(async ([email, updates]) => {
+      const chars = updates.reduce((sum, update) => sum + update.chars, 0);
+      const row = await db().get<{ used: number; limit: number }>(cfg.creditsTable, {
+        id: `${email}#${day}`,
+      });
+      const used = row?.used ?? 0;
+      const limit = row?.limit ?? cfg.creditPerDay;
+      if (used + chars > limit) overBudget.add(email);
+    }),
+  );
 
   for (const [email, updates] of byAuthor) {
+    // Auteur hors budget : il n'entre pas dans la transaction. Il sera traité
+    // comme un refus (et fera l'objet d'un `recordCreditRefusal` plus bas).
+    if (overBudget.has(email)) continue;
+
     const chars = updates.reduce((sum, update) => sum + update.chars, 0);
     creditAuthorByIndex.set(entries.length, email);
     entries.push({
@@ -328,9 +371,9 @@ export async function commitBatch(
         table: cfg.creditsTable,
         key: { id: `${email}#${day}` },
         update: 'ADD used :chars SET email = :email, #day = :day, #limit = :limit, #ttl = :ttl',
-        // Sur un compteur absent, `attribute_not_exists(used)` seul laisserait
-        // passer une première écriture supérieure au plafond.
-        condition: '(attribute_not_exists(used) AND :chars <= :limit) OR (used + :chars <= :limit)',
+        // Condition uniquement sur l'existence : aucune arithmétique, c'est la
+        // forme que DynamoDB accepte réellement.
+        condition: 'attribute_not_exists(used) OR used >= :zero',
         names: { '#day': 'day', '#limit': 'limit', '#ttl': 'ttl' },
         values: {
           ':chars': chars,
@@ -338,9 +381,38 @@ export async function commitBatch(
           ':day': day,
           ':limit': cfg.creditPerDay,
           ':ttl': ttl,
+          ':zero': 0,
         },
       },
     });
+  }
+
+  // Aucun auteur n'a de crédit suffisant : rien à persister. On annonce le
+  // refus à chacun et on rend la main, sans transaction inutile.
+  if (creditAuthorByIndex.size === 0) {
+    for (const [email, updates] of byAuthor) {
+      const own = updates.length;
+      if (own === 0) continue;
+      const refusal = await recordCreditRefusal(email, updates[0].opId);
+      const remaining = await currentCreditRemaining(email);
+      const code = refusal.blockedUntil ? WsErrorCodes.blocked : WsErrorCodes.creditExhausted;
+      rejections.push({
+        email,
+        code,
+        creditRemaining: remaining,
+        ...(refusal.blockedUntil ? { blockedUntil: refusal.blockedUntil } : {}),
+      });
+      for (const update of updates) {
+        send(update.client, {
+          type: 'error',
+          code,
+          opId: update.opId,
+          creditRemaining: remaining,
+          ...(refusal.blockedUntil ? { blockedUntil: refusal.blockedUntil } : {}),
+        });
+      }
+    }
+    return rejections;
   }
 
   // Seuls les updates réellement persistés reçoivent un marqueur : en créer un
