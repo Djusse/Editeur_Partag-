@@ -1016,12 +1016,3 @@ node tests/node/verify-convergence.mjs \
 > compteurs) et sert au mode local et aux tests. C'est néanmoins une route de
 > diagnostic exposée : elle est à retirer ou à protéger si le service devait
 > sortir du cadre du projet.
-
-### Routes absentes, à connaître
-
-| Attendu | État | Contournement |
-| - | - | - |
-| `DELETE /links/{token}` (révocation) | **non implémenté** | quota épuisé, ou lien de remplacement |
-| `DELETE /documents/{id}/members` | **non implémenté** | partage additif uniquement |
-| message WebSocket `resync` | **n'existe pas** | `join` avec `sinceSeq`, ou `/updates?since=` |
-| rafraîchissement de jeton | **non implémenté** | refaire `POST /api/session` (7 jours) |
