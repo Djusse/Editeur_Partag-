@@ -1,25 +1,11 @@
 @startuml
-' Diagramme de séquence système — réserver et télécharger un exemplaire.
-'
-' Corrections de fond :
-'  1. la boucle d'attente interrogeait `/status` alors que le front interroge
-'     `/file` (`pollFile` dans frontend/src/app/d/page.tsx) : consulter `/status`
-'     ne dit rien de l'avancement du PDF, seulement du quota du lien ;
-'  2. « PDF du document à l'instant de la réservation » : le fichier est servi
-'     par **S3** sur une URL présignée, pas par le système. Le système ne
-'     transporte jamais le PDF ;
-'  3. le cas « aucune réservation préalable » (410 NO_TICKET) manquait ;
-'  4. l'expiration de l'URL (60 s) et sa redemande étaient absentes.
-'
-' Défaut de rendu corrigé : les libellés longs débordaient des flèches de retour ;
-' ils sont découpés et la note de bas de diagramme porte les précisions.
+' Séquence système — téléchargement. Version simple.
 
 skinparam {
   dpi 150
   defaultFontName Arial
   shadowing false
   ArrowColor #333333
-  ArrowThickness 1.1
   BackgroundColor white
   actorBorderColor #1B3A6B
   actorBackgroundColor #E8F0FE
@@ -29,54 +15,24 @@ skinparam {
     LifeLineBorderColor #BBBBBB
     GroupBorderColor #333333
     GroupHeaderBackgroundColor #F7FBFF
-    NoteBackgroundColor #FEF9E7
-    NoteBorderColor #8A6D1F
   }
 }
 
-title Séquence système — réserver puis télécharger un exemplaire
+title Séquence système — réserver et télécharger
 
 actor Visiteur as V
-participant "Système\nÉditeur partagé" as S
-participant "Stockage objet\nS3" as S3
+participant "Système" as S
+participant "S3" as S3
 
-V -> S : ouvrir le lien (page /d?token=…)
-V -> S : consulter l'état — GET /status
-S --> V : état du lien : actif ou épuisé, titre, remaining
-note right of V
-  Consulter ne consomme **aucun** exemplaire :
-  les aperçus de liens et les robots ne doivent
-  pas épuiser le quota.
-end note
-
-V -> S : réserver — POST /claim { visitorId }
-alt aucune réservation possible
-  S --> V : 410 { state: "exhausted" }
-else réservation acceptée
-  S --> V : 202 { state: "waiting", retryAfter }
-  loop jusqu'à obtention du fichier
-    V -> S : GET /file?visitorId=…
-    alt PDF en préparation
-      S --> V : 202 { state: "waiting", retryAfter: 2 }
-    else PDF disponible
-      S --> V : 200 { state: "ready", url, expiresIn: 60 }
-    end
-  end
+V -> S : consulter l'état du lien
+S --> V : actif ou épuisé, titre
+V -> S : réserver (claim)
+alt exemplaire disponible
+  S --> V : « patienter » puis « prêt »
   V -> S3 : GET sur l'URL présignée
-  S3 --> V : le PDF figé à l'instant T1 de la réservation
-  opt URL expirée (plus de 60 s)
-    V -> S : GET /file?visitorId=…
-    S --> V : 200 { nouvelle URL présignée }
-    note right of V
-      Aucun exemplaire supplémentaire n'est consommé :
-      la réservation a eu lieu au claim, pas au téléchargement.
-    end note
-  end
-end
-
-opt visiteur sans réservation préalable
-  V -> S : GET /file?visitorId=… (inconnu)
-  S --> V : 410 NO_TICKET
+  S3 --> V : le PDF figé à la réservation
+else épuisé
+  S --> V : « épuisé »
 end
 
 @enduml

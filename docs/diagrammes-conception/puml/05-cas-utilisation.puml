@@ -1,24 +1,7 @@
 @startuml
-' Cas d'utilisation — corrigé.
-'
-' Corrections de fond :
-'  1. « Vérifier le crédit quotidien » était en `<<include>>` de « Éditer en
-'     collaboration » : c'est l'inverse. Le crédit n'est jamais consulté avant
-'     d'écrire ; c'est le refus du serveur qui met la jauge à jour. D'où
-'     `<<extend>>`, qui décrit ce déclenchement par exception ;
-'  2. un arc « non — le visiteur n'a pas de session » reliait la réservation à
-'     l'identification : c'était un commentaire déguisé en relation, qui
-'     ajoutait une flèche pointillée traversant la figure pour dire qu'elle
-'     n'existe pas. Supprimé ; l'information passe en légende ;
-'  3. la reprise d'un téléchargement déjà réservé (`/file`) manquait, alors que
-'     c'est le cas majoritaire après un rechargement de page ;
-'  4. « Superviser » ne disait pas ce qui est exposé : les trois blocs de
-'     `GET /api/admin/state`.
-'
-' Défauts de rendu corrigés : les cas du visiteur et ceux du rédacteur étaient
-' entrelacés, ce qui produisait des arcs très longs se croisant au centre. Ils
-' sont désormais déclarés dans l'ordre des acteurs, et les précisions passent en
-' légende plutôt qu'en notes, qui décalaient la mise en page.
+' Cas d'utilisation — version simple.
+' Dix cas, trois acteurs, deux relations. Le détail des règles est dans
+' docs/api.md.
 
 skinparam {
   dpi 150
@@ -26,18 +9,14 @@ skinparam {
   shadowing false
   roundcorner 6
   ArrowColor #333333
-  ArrowThickness 1.1
   BackgroundColor white
   actorBorderColor #1B3A6B
   actorBackgroundColor #E8F0FE
   usecaseBorderColor #333333
   usecaseBackgroundColor #F7FBFF
   rectangleBorderColor #333333
-  rectangleBackgroundColor white
   nodesep 30
   ranksep 50
-  legendBackgroundColor #FEF9E7
-  legendBorderColor #8A6D1F
 }
 
 title Cas d'utilisation
@@ -49,27 +28,24 @@ actor Visiteur as V
 actor Administrateur as A
 
 rectangle "Éditeur de documents partagé" {
-  usecase "S'identifier\n(nom + e-mail)" as UC1
-
-  usecase "Gérer ses documents\n(créer, lister, ouvrir)" as UC2
-  usecase "Éditer en collaboration\ntemps réel" as UC3
-  usecase "Suivre la présence\ndes autres" as UC5
-  usecase "Partager un document\n(ajouter un membre)" as UC6
-  usecase "Gérer les versions\n(enregistrer, restaurer)" as UC7
+  usecase "S'identifier" as UC1
+  usecase "Gérer ses documents" as UC2
+  usecase "Éditer en collaboration" as UC3
+  usecase "Partager un document" as UC6
+  usecase "Gérer les versions" as UC7
   usecase "Créer un lien\nde N exemplaires" as UC8
-  usecase "Consulter son crédit\nquotidien" as UC4
+  usecase "Consulter son crédit" as UC4
 
-  usecase "Consulter l'état du lien\n(sans consommer)" as UC9
-  usecase "Réserver un exemplaire\n(T1 figée)" as UC10
-  usecase "Obtenir le PDF\nd'un exemplaire réservé" as UC11
+  usecase "Consulter l'état du lien" as UC9
+  usecase "Réserver un exemplaire" as UC10
+  usecase "Télécharger le PDF" as UC11
 
-  usecase "Superviser : documents ouverts,\nliens actifs, blocages" as UC12
+  usecase "Superviser" as UC12
 }
 
 R --> UC1
 R --> UC2
 R --> UC3
-R --> UC5
 R --> UC6
 R --> UC7
 R --> UC8
@@ -83,18 +59,5 @@ A --> UC12
 
 UC2 ..> UC1 : <<include>>
 UC3 ..> UC4 : <<extend>>
-UC11 ..> UC10 : <<include>>
-
-legend bottom
-  <b>UC4 en `extend`, pas en `include`</b> : la jauge n'est pas interrogée
-  avant chaque frappe. Le retour du serveur (`ack` ou refus) porte
-  `creditRemaining` ; c'est le refus qui déclenche la mise à jour.
-  <b>UC11 inclut UC10</b> : on réserve d'abord, on télécharge ensuite. Un
-  exemplaire est consommé au claim, pas au téléchargement — rappeler `/file`
-  ne consomme donc rien de plus.
-  <b>Le visiteur ne s'identifie jamais</b> : le jeton du lien est sa capacité.
-  Aucune relation entre UC10 et UC1, contrairement à ce que suggérait la
-  version précédente.
-endlegend
 
 @enduml

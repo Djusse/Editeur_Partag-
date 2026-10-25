@@ -1,18 +1,5 @@
 @startuml
-' États d'un visiteur sur un lien — corrigé.
-'
-' Corrections de fond :
-'  1. la version précédente ignorait l'état `en attente de la garde mémoire`
-'     (202, retryAfter 1) qui précède pourtant toute réservation sous pic ;
-'  2. `Pret → Telecharge → [*]` suggérait un seul téléchargement possible. Or
-'     l'URL présignée expire en 60 s et le client peut la redemander
-'     indéfiniment via /file : un exemplaire réservé reste **acquis** ;
-'  3. l'état `ticket expiré` n'existait pas alors que /file répond 410 NO_TICKET
-'     si le visiteur n'a jamais réservé sur ce lien ;
-'  4. la reprise après rechargement de page (visitorId conservé côté client) est
-'     ce qui garantit l'idempotence : elle est maintenant explicite.
-'
-' Défaut de rendu corrigé : les deux notes se superposaient au cadre.
+' États d'un visiteur — version simple.
 
 skinparam {
   dpi 150
@@ -20,48 +7,19 @@ skinparam {
   shadowing false
   roundcorner 6
   ArrowColor #333333
-  ArrowThickness 1.1
   BackgroundColor white
   stateBackgroundColor #FFFFFF
   stateBorderColor #333333
-  noteBackgroundColor #FEF9E7
-  noteBorderColor #8A6D1F
 }
 
 title États d'un visiteur sur un lien
 
-[*] --> Consultation : ouvre /d?token=…\nGET /status (ne consomme rien)
-Consultation --> Epuise : status = exhausted
-Consultation --> Reservation : clique « Télécharger »\nPOST /claim { visitorId }
-
-Reservation --> AttenteGarde : garde saturée (50 claims)\n202 retryAfter 1
-AttenteGarde --> Reservation : nouvelle tentative
-
-Reservation --> Epuise : 410 exhausted
-Reservation --> EnGeneration : 202 waiting\nPDF pas encore construit
-Reservation --> Pret : 200 ready\nURL présignée (60 s)
-
-EnGeneration --> Pret : GET /file → 200\n(ou reprise par POST /claim)
-EnGeneration --> Indisponible : 503 PDF_UNAVAILABLE\naprès 3 échecs
-
-Pret --> Pret : URL expirée (60 s)\nGET /file → nouvelle URL
-Pret --> [*] : le PDF est téléchargé
-
+[*] --> Consultation : ouvre le lien\n(/status ne consomme rien)
+Consultation --> Epuise : lien épuisé
+Consultation --> EnGeneration : claim accepté,\nPDF absent
+Consultation --> Pret : claim accepté,\nPDF en cache
+EnGeneration --> Pret : PDF construit
+Pret --> [*] : PDF téléchargé
 Epuise --> [*]
-Indisponible --> [*]
-
-note right of Pret
-  Un exemplaire est consommé **au claim**, pas au
-  téléchargement : réutiliser l'URL, recharger la page
-  ou rappeler /file ne consomme rien de plus.
-  `visitorId` est conservé côté client, ce qui rend
-  l'opération idempotente.
-end note
-
-note right of Epuise
-  Un visiteur qui a DÉJÀ son ticket n'arrive jamais ici :
-  le ticket est cherché **avant** le court-circuit
-  « épuisé ». C'est une exigence explicite du sujet.
-end note
 
 @enduml

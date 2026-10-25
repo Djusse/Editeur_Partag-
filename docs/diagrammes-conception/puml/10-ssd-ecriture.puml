@@ -1,31 +1,11 @@
 @startuml
-' Diagramme de séquence système — éditer un document.
-'
-' Corrections de fond :
-'  1. la version précédente faisait suivre un refus de crédit d'une
-'     « demande d'état complet (resynchronisation) ». C'est faux et coûteux :
-'     un refus ne modifie pas le document, il n'y a rien à resynchroniser.
-'     Le vrai comportement (frontend/src/app/doc/page.tsx) est de vider la file
-'     locale et de reconstruire le document — parce que les modifications déjà
-'     saisies ne seront jamais enregistrées, pas parce que l'état serveur a
-'     changé ;
-'  2. `joined` n'était pas distingué du rattrapage. Le serveur envoie **deux**
-'     messages `joined` : le premier à l'ouverture (avec le crédit restant et
-'     l'éventuel `readOnly`), le second en réponse au `join` (avec `caughtUp`).
-'     Les confondre provoque une boucle de reconnexion ;
-'  3. le cas « update refusé pour cause de taille » était absent : il ne coupe
-'     pas l'écriture, contrairement aux refus de crédit ;
-'  4. la reconnexion avec le même `opId` (garantie C2) était implicite.
-'
-' Défaut de rendu corrigé : la boucle englobait la branche de refus, ce qui
-' suggérait que le client continue d'écrire après avoir été arrêté.
+' Séquence système — écriture. Version simple.
 
 skinparam {
   dpi 150
   defaultFontName Arial
   shadowing false
   ArrowColor #333333
-  ArrowThickness 1.1
   BackgroundColor white
   actorBorderColor #1B3A6B
   actorBackgroundColor #E8F0FE
@@ -35,57 +15,28 @@ skinparam {
     LifeLineBorderColor #BBBBBB
     GroupBorderColor #333333
     GroupHeaderBackgroundColor #F7FBFF
-    NoteBackgroundColor #FEF9E7
-    NoteBorderColor #8A6D1F
   }
 }
 
-title Séquence système — éditer un document en collaboration
+title Séquence système — éditer un document
 
 actor Rédacteur as R
-participant "Système\nÉditeur partagé" as S
+participant "Système" as S
 actor "Autres\nrédacteurs" as O
 
-== Ouverture ==
-R -> S : s'identifier (nom, e-mail) — POST /api/session
-S --> R : jeton de session (JWT, 7 jours) et état du crédit
-R -> S : demander un ticket WebSocket — POST /api/ws-ticket
-S --> R : ticket à usage unique (60 s)
-R -> S : ouvrir /ws?ticket=…&documentId=…
-S --> R : `joined` #1 — you, seq, creditRemaining, resetsAt,\nreadOnly éventuel (CREDIT_EXHAUSTED, BLOCKED, FORBIDDEN)
-R -> S : `join` { sinceSeq } — le seq lu sur /state
-S --> R : les `update` manquants, puis `joined` #2 avec caughtUp
-S --> O : `presence` { users }
-
-== Écriture ==
+R -> S : s'identifier (nom, e-mail)
+S --> R : jeton de session
+R -> S : ouvrir la connexion du document
+S --> R : état courant, présence,\ncrédit restant
 loop à chaque saisie
-  R -> S : `update` { opId, payload Base64 }
-  alt crédit suffisant et écrivain non bloqué
-    S --> O : `update` { seq, payload } — un seul message par tick de 250 ms
-    S --> R : `ack` { opIds, seq, creditRemaining }
-  else update trop volumineux (> 64 Kio)
-    S --> R : `error` PAYLOAD_TOO_LARGE
-    note right of R
-      L'écriture **reste possible** :
-      seule cette modification est perdue.
-    end note
-  else crédit épuisé ou 4 refus atteints
-    S --> R : `error` CREDIT_EXHAUSTED ou BLOCKED { opId, blockedUntil }
-    R -> R : passer en lecture seule\nvider la file locale\nreconstruire le document depuis /state
-    note right of R
-      Rien à resynchroniser : le refus n'a pas modifié
-      le document. On reconstruit parce que les frappes
-      déjà faites ne seront jamais enregistrées.
-    end note
+  R -> S : envoyer une modification
+  alt crédit suffisant
+    S --> R : acquittement
+    S --> O : modification diffusée
+  else crédit épuisé ou bloqué
+    S --> R : refus
+    R -> R : passer en lecture seule
   end
-end
-
-== Coupure et reprise ==
-opt connexion perdue
-  R -> R : conserver les opérations en attente (`pendingOps`)
-  R -> S : nouveau ticket, puis `join` avec le dernier seq connu
-  R -> S : renvoyer les opérations avec le **même** opId
-  S --> R : `ack` d'origine — aucune écriture dédoublée (C2)
 end
 
 @enduml

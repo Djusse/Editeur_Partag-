@@ -1,106 +1,43 @@
 @startuml
-' Flux interne d'écriture — corrigé.
-'
-' Erreurs factuelles corrigées (relevées dans backend/src/realtime/hub.ts,
-' fonction commitBatch) :
-'  1. le crédit était présenté comme une condition **de la transaction**
-'     (« Credits : used + n ≤ 10 000 »). DynamoDB refuse l'arithmétique entre
-'     deux valeurs dans une ConditionExpression : `used + :chars <= :limit`
-'     lève « Syntax error; token: + ». Le contrôle se fait donc par une
-'     **lecture préalable**, hors transaction, puis la transaction ne porte
-'     qu'un `ADD used`. Cette erreur a bloqué toutes les écritures en
-'     production alors que les tests étaient verts ;
-'  2. le blocage après 4 refus n'était pas représenté, alors qu'il est vérifié
-'     à l'entrée de la connexion **et** au début de chaque lot ;
-'  3. les cas « update système » (restauration de version, gratuite et
-'     autorisée malgré un blocage) étaient absents ;
-'  4. l'idempotence par empreinte du contenu était omise : le serveur déduplique
-'     aussi par hash, pas seulement par `opId` ;
-'  5. le message `WRITE_FAILED` (échec de persistance, lot remis en file) était
-'     absent : sans lui le client affichait « Connecté » indéfiniment.
-'
-' Défaut de rendu corrigé : une ligne de séparation en plein milieu du message
-' `TransactWriteItems` coupait la flèche et son libellé.
+' Flux d'écriture — version simple.
+' Le détail des gardes (crédit en lecture préalable, blocage, idempotence,
+' WRITE_FAILED) est dans docs/api.md §6 et docs/adr/002.
 
-' Les couleurs de `database`, `queue` et `actor` sont posées **au niveau global** :
-' dans un bloc `sequence { }`, la version 1.2020.02 de PlantUML les ignore et le
-' cylindre DynamoDB reste jaune, en décalage avec le reste de la figure.
 skinparam {
   dpi 150
   defaultFontName Arial
   shadowing false
   ArrowColor #333333
-  ArrowThickness 1.1
   BackgroundColor white
   actorBorderColor #1B3A6B
   actorBackgroundColor #E8F0FE
-  databaseBorderColor #1E6B45
   databaseBackgroundColor #E9F7EF
-  queueBorderColor #1E6B45
-  queueBackgroundColor #E9F7EF
+  databaseBorderColor #1E6B45
   sequence {
     ParticipantBorderColor #333333
     ParticipantBackgroundColor #E8F0FE
     LifeLineBorderColor #BBBBBB
     GroupBorderColor #333333
     GroupHeaderBackgroundColor #F7FBFF
-    NoteBackgroundColor #FEF9E7
-    NoteBorderColor #8A6D1F
   }
 }
 
-title Flux interne — écriture groupée d'un document (C2 et C4)
+title Flux d'écriture groupée (C2, C4)
 
 actor Rédacteur as R
-participant nginx as N
-participant "Application\nhub temps réel" as H
+participant "Application\nhub" as H
 database DynamoDB as D
 actor "Autres\nrédacteurs" as O
 
-R -> N : WS update { opId, payload Base64 }
-N -> H : proxy /ws
-H -> H : valider taille (≤ 64 Kio) et droits
-H -> H : opId déjà vu ? (mémoire du lot)
-H -> H : mettre en file — un seul écrivain par document
-
-== toutes les 250 ms (un « tick ») ==
-H -> H : fusionner les updates du lot\ncompter insertions et suppressions
-H -> D : lecture préalable du crédit (hors transaction)\nGetItem Credits[email#jour] → used, limit
-note right of H
-  L'arithmétique est **impossible** dans une
-  ConditionExpression DynamoDB. Le plafond est donc
-  comparé ici, en lecture. Le risque de course est
-  borné par l'écrivain unique du hub ; la transaction
-  reste la garde d'atomicité pour seq et le journal.
-end note
-H -> D : vérifier le blocage\nGetItem Abuse[email#jour] → blockedUntil
-
-alt écrivain bloqué après 4 refus
-  H --> R : erreur BLOCKED { opId, blockedUntil, creditRemaining }
-  note right of R
-    Un update **système** (restauration de version)
-    franchit ce blocage : il est gratuit et doit rester
-    un recours.
-  end note
-else crédit insuffisant
-  H --> R : erreur CREDIT_EXHAUSTED { opId, creditRemaining }
-  H -> D : marquer le refus (1 seul par opId)\nADD refusals ; bloquer au 4e
-else crédit suffisant
-  H -> D : TransactWriteItems\n• Documents : SET seq = seq+1 si seq = attendue\n• Updates[seq+1] : Put l'update fusionné\n• Credits : ADD used + n (condition de simple existence)\n• OpIds : Put opId **et** empreinte, si absents
-  alt transaction acceptée
-    H -> H : appliquer au Y.Doc en mémoire
-    H --> O : un seul message `update` { seq, payload }\npour tout le lot (aucun champ auteur)
-    H --> R : ack { opIds, seq, creditRemaining }
-  else conflit de séquence (autre processus ou redémarrage)
-    H -> H : recharger l'état, rejouer le lot
-  else opId ou empreinte déjà présents
-    H --> R : ack d'origine (idempotence, pas de double débit)
-  end
-end
-
-opt échec de persistance (DynamoDB indisponible)
-  H --> R : erreur WRITE_FAILED { opId, message }
-  H -> H : remettre le lot en file — la cause peut être transitoire
+R -> H : update { opId, payload }
+H -> H : mettre en file\n(un seul écrivain par document)
+== toutes les 250 ms ==
+H -> D : transaction\n(seq, journal, crédit, opIds)
+alt crédit suffisant
+  H --> R : ack { seq, creditRemaining }
+  H --> O : update diffusée
+else crédit épuisé ou bloqué
+  H --> R : erreur CREDIT_EXHAUSTED / BLOCKED
 end
 
 @enduml

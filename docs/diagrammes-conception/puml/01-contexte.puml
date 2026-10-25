@@ -1,23 +1,6 @@
 @startuml
-' Diagramme de contexte — corrigé.
-'
-' Corrections de fond :
-'  1. le visiteur et le rédacteur étaient présentés comme deux acteurs
-'     symétriques du même système. En réalité le visiteur n'obtient **jamais**
-'     de session : le jeton du lien est sa seule capacité, et il ne touche que
-'     /d/..., à la racine ;
-'  2. « Destinataire de la notification » était modélisé comme un acteur du
-'     système : ce n'est pas un utilisateur de l'application, il reçoit un
-'     e-mail. Le distinguer évite de croire qu'il interagit avec elle ;
-'  3. le stockage objet n'apparaissait pas, alors que le visiteur télécharge
-'     **directement depuis S3** sur une URL présignée : c'est une relation
-'     extérieure au système, et elle explique que 500 téléchargements ne
-'     consomment pas la bande passante de l'instance ;
-'  4. l'administrateur n'était pas distingué par son mode d'authentification
-'     (clé dans l'en-tête, pas de JWT).
-'
-' Défaut de rendu corrigé : les libellés multilignes débordaient des flèches et
-' se chevauchaient au centre ; les relations sont raccourcies et stylées.
+' Diagramme de contexte — version simple.
+' Règle : trois acteurs, un système, deux services externes. Aucune note.
 
 skinparam {
   dpi 150
@@ -25,55 +8,33 @@ skinparam {
   shadowing false
   roundcorner 6
   ArrowColor #333333
-  ArrowThickness 1.1
   BackgroundColor white
   actorBorderColor #1B3A6B
   actorBackgroundColor #E8F0FE
   rectangleBorderColor #333333
   rectangleBackgroundColor #F7FBFF
-  componentBorderColor #333333
+  componentBorderColor #8A6D1F
   componentBackgroundColor #FEF9E7
-  nodesep 45
-  ranksep 80
+  ranksep 70
 }
 
-title Contexte — Éditeur de documents partagé
+title Contexte
 
 left to right direction
 
-actor "Rédacteur\nidentifié par JWT" as R
-actor "Visiteur\ndétenteur d'un lien" as V
-actor "Administrateur\nclé d'administration" as A
+actor "Rédacteur" as R
+actor "Visiteur" as V
+actor "Administrateur" as A
 
-rectangle "Éditeur de documents partagé\napplication web sur AWS — région eu-north-1" as S {
-  component "Édition collaborative\ntemps réel (WebSocket)" as ED
-  component "Distribution à quota\nstrict (liens N exemplaires)" as DL
-  component "Supervision\n/documents ouverts, liens, blocages" as SUP
-}
+rectangle "Éditeur de documents partagé" as S
 
-component "Amazon SES\nnotification de fin de quota" as SES
-component "Stockage objet S3\nPDF et snapshots" as S3
-actor "Créateur du lien\nreçoit un e-mail" as DEST
+component "Amazon SES" as SES
+component "Stockage S3" as S3
 
-R --> S : édite, partage,\ncrée des versions
-R --> S : crée des liens,\nsuit son crédit
-V --> S : consulte l'état,\nréserve un exemplaire
-V ..> S3 : télécharge le PDF\n(URL présignée, 60 s)
-A --> S : consulte l'état\ndu système
-S --> SES : demande d'envoi
-SES --> DEST : un e-mail unique,\nau dernier exemplaire distribué
-
-note bottom of V
-  Aucune session, aucun mot de passe : le jeton du lien
-  est la capacité. Le parcours visiteur est exposé à la
-  racine (/d/...), hors du préfixe /api.
-end note
-
-note bottom of S3
-  Le système ne transporte jamais le PDF : il présigne
-  une URL et laisse S3 servir le fichier. C'est ce qui
-  permet à 500 téléchargements de ne pas passer par
-  l'instance applicative.
-end note
+R --> S : édite, partage,\ncrée des liens
+V --> S : réserve et télécharge
+A --> S : supervise
+S --> SES : notification de fin de quota
+V ..> S3 : télécharge le PDF
 
 @enduml
