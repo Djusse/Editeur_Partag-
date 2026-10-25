@@ -106,6 +106,10 @@ rédacteurs. **Aucun champ `author`** : il est impossible en diffusion fusionné
 Un client qui reçoit un `seq` supérieur à `lastSeq + 1` détecte un trou
 (anormal) et déclenche un rattrapage HTTP `GET /api/documents/{id}/updates?since=`.
 
+⚠️ Ce rattrapage est **plafonné à 2000 entrées** (`MAX_UPDATES_PER_CATCH_UP`) et
+la troncature n'est pas signalée. Il faut boucler en déplaçant `since` jusqu'à une
+réponse vide. Voir [`docs/api.md`](../api.md) §3.1.
+
 ### `ack`
 
 ```json

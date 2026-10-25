@@ -106,9 +106,12 @@ if (typeof state.seq !== 'number' || typeof state.state !== 'string') {
 /**
  * Journal complet, page après page.
  *
- * `GET /documents/:id/updates?since=N` ne prend **que** `since` : la taille de
- * page est fixée à 500 côté serveur (`manager.fetchUpdates`). On boucle donc en
- * déplaçant `since` sur le dernier `seq` reçu, sans paramètre `limit` inutile.
+ * `GET /documents/:id/updates?since=N` ne prend **que** `since` : le serveur
+ * pagine en interne (pages DynamoDB de 500) et **s'arrête à 2000 entrées**
+ * (`MAX_UPDATES_PER_CATCH_UP`), sans le signaler dans la réponse. On boucle donc
+ * en déplaçant `since` sur le dernier `seq` reçu, jusqu'à une réponse vide : sans
+ * cette boucle, la vérification porterait sur un journal tronqué et conclurait à
+ * tort à la convergence d'un document partiel.
  */
 const journal = [];
 let since = 0;
