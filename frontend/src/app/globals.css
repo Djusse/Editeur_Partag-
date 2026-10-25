@@ -488,9 +488,17 @@ input[aria-invalid='true'] {
     display: none;
   }
 
-  /* « Supervision » reste accessible depuis la page /documents. */
+  /*
+   * « Supervision » **reste visible**.
+   *
+   * Il était masqué sous 767 px, avec l'idée qu'on le retrouverait depuis
+   * /documents. En pratique, c'est justement sur l'éditeur et depuis un écran
+   * étroit qu'on en a besoin (vérifier une présence, un lien actif), et le
+   * libellé n'occupe que ~90 px. On le garde, sans retour à la ligne.
+   */
   .topbar-admin {
-    display: none;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 
   /* Jauge plus compacte : le libellé long disparaît, la barre reste lisible. */
@@ -506,6 +514,10 @@ input[aria-invalid='true'] {
     gap: 8px;
     flex: 1;
     justify-content: flex-end;
+    /* `flex-wrap` évite que la jauge ou « Changer d'identité » débordent quand
+       « Supervision » reste affiché sur un écran très étroit (≤ 360 px). */
+    flex-wrap: wrap;
+    row-gap: 4px;
   }
 
   .doc-toolbar {

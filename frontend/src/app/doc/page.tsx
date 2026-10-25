@@ -890,6 +890,24 @@ function VersionsModal({
         Une version est aussi enregistrée automatiquement pendant l&#8217;écriture.
         La restauration est gratuite : elle ne consomme pas de crédit.
       </p>
+
+      {/*
+        Limite du CRDT, énoncée plutôt que masquée.
+
+        La restauration produit une opération « remplacer le texte par celui de
+        la version N ». Yjs la fusionne avec le reste : les frappes qu'un autre
+        rédacteur émet **au même moment** sont des opérations nouvelles, donc
+        elles s'ajoutent après le remplacement. On ne peut pas annuler une
+        opération qui n'a pas encore été émise — c'est la contrepartie assumée
+        de l'édition sans verrou, et c'est vérifié par
+        `backend/test-restore-2clients.mjs` : aucune frappe **acceptée** n'est
+        perdue, les trois états convergent.
+      */}
+      <p className="muted" style={{ marginTop: 8 }}>
+        Les personnes qui écrivent au même instant conserveront leurs modifications : la
+        restauration remplace le texte existant, elle n&#8217;efface pas ce qui est en cours
+        de frappe chez les autres.
+      </p>
     </Modal>
   );
 }
