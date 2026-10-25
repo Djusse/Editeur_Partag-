@@ -456,19 +456,42 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -euxo pipefail
+          # Pas de `set -e` : on veut **tout tenter** et rapporter un bilan
+          # détaillé, plutôt que d'abandonner sur la première commande qui
+          # échoue sans laisser de trace exploitable.
+          set -uxo pipefail
+
+          # Journal lisible même après le rollback (l'instance est alors détruite).
+          exec > >(tee -a /var/log/editeur-init.log) 2>&1
+
+          STEP="initialisation"
+          step() { STEP="$1"; echo "=== ETAPE : $STEP ==="; }
 
           # `cfn-signal` appartient au paquet `aws-cfn-bootstrap`, **absent
-          # d'AL2023**. Sans cette installation, le `trap` ci-dessous échouait
-          # silencieusement : aucun signal n'était envoyé, CloudFormation
-          # attendait 25 minutes puis faisait un rollback supprimant l'instance.
-          dnf install -y aws-cfn-bootstrap
+          # d'AL2023**. On l'installe avant tout le reste pour pouvoir rapporter
+          # un échec, quel qu'il soit.
+          if ! dnf install -y aws-cfn-bootstrap; then
+            echo "ERREUR FATALE : aws-cfn-bootstrap introuvable"
+            /opt/aws/bin/cfn-signal -e 1 --reason "aws-cfn-bootstrap introuvable" \
+              --stack ${AWS::StackName} --resource Instance --region ${AWS::Region} || true
+            exit 1
+          fi
 
-          # Signale le résultat à CloudFormation (0 = succès) quoi qu'il arrive.
-          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Instance --region ${AWS::Region}' EXIT
+          # Signale le résultat à CloudFormation quoi qu'il arrive, en incluant
+          # l'étape courante dans la raison : c'est ce texte qui apparaît dans
+          # `ResourceStatusReason` côté CloudFormation.
+          trap 'CODE=$?; echo "SORTIE code=$CODE etape=$STEP"; \
+                /opt/aws/bin/cfn-signal -e $CODE --reason "etape=$STEP code=$CODE" \
+                  --stack ${AWS::StackName} --resource Instance --region ${AWS::Region} || true' EXIT
 
-          dnf update -y
-          dnf install -y nginx nodejs22
+          # `dnf update` n'est pas indispensable au premier démarrage : il
+          # allonge le provisionnement de plusieurs minutes et peut dépasser le
+          # délai de la `CreationPolicy`. Les paquets utiles sont installés
+          # nommément juste après. Réactiver si l'on veut une AMI à jour.
+          step "installation-des-paquets"
+          dnf install -y nginx nodejs22 || { echo "ECHEC installation paquets"; exit 2; }
+
+          step "configuration-systeme"
 
           # --- Limites de descripteurs (12 000+ connexions WebSocket) ---------
           cat >/etc/security/limits.d/99-editeur.conf <<'EOF'
@@ -673,16 +696,30 @@ Resources:
           EOF
           chown ec2-user:ec2-user /opt/editeur/app.env
 
+          step "demarrage-services"
           systemctl daemon-reload
           systemctl enable nginx editeur-app editeur-worker || true
-          systemctl start nginx
 
+          # `nginx -t` avant de démarrer : une configuration invalide produirait
+          # un échec obscur, et la raison remontée à CloudFormation serait vide.
+          if ! nginx -t; then
+            echo "ECHEC : configuration nginx invalide"
+            nginx -t || true
+            exit 3
+          fi
+          systemctl start nginx || { echo "ECHEC : demarrage nginx"; exit 4; }
+          echo "nginx demarre"
+
+          step "installation-application"
           aws s3 cp "s3://${Bucket}/artifacts/app.tar.gz" /tmp/app.tar.gz --region ${AWS::Region} || echo "archive absente : en attente de deploy.sh"
           if [ -f /tmp/app.tar.gz ]; then
             tar -xzf /tmp/app.tar.gz -C /opt/editeur
             chown -R ec2-user:ec2-user /opt/editeur
-            systemctl start editeur-app editeur-worker
+            systemctl start editeur-app editeur-worker || { echo "ECHEC : demarrage editeur-app"; exit 5; }
           fi
+
+          step "termine"
+          echo "Initialisation reussie"
 
       Tags:
         - { Key: Projet, Value: editeur-documents-partage }
