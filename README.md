@@ -74,7 +74,7 @@ backend/            Node.js 22 / TypeScript
   src/routes/       routes Fastify (/api/* et parcours visiteur)
   src/server/       main.ts (Fastify + ws), worker.ts (SQS), app.ts (assemblage)
   src/local/        mode local sans AWS
-  test/             33 tests unitaires (Vitest)
+  test/             42 tests unitaires (Vitest)
 frontend/           Next.js 14 en export statique, thème clair
   src/app/          /, /documents, /doc, /d, /admin
   src/lib/          client API, provider Yjs, utilitaires (uuidv4, copyText)
@@ -96,8 +96,14 @@ tests/              k6 (S1, S2) et vérification de convergence
 | OpenSSL | — | génération des secrets SSM par `deploy.sh` |
 | k6 | ≥ 0.49 | tests de charge (optionnel) |
 
-Paire de clés SSH ED25519 pour l'accès à l'instance, et une adresse **vérifiée dans
-SES** (bac à sable : seules les adresses vérifiées reçoivent les e-mails).
+Paire de clés SSH ED25519 pour l'accès à l'instance (facultative : `KEY_NAME=""`
+déploie sans clé, l'accès passe alors par Session Manager), et une adresse
+**vérifiée dans SES**.
+
+SES doit être **sorti du bac à sable** pour prévenir n'importe quel destinataire.
+L'usage déclaré est strictement transactionnel : un seul e-mail par lien de
+téléchargement, au moment où le dernier exemplaire est distribué, à l'adresse de
+la personne qui a créé le lien.
 
 ```bash
 aws sesv2 create-email-identity --email-identity vous@gmail.com --region eu-north-1
@@ -158,13 +164,14 @@ npm install
 npm test
 ```
 
-33 tests couvrent la logique critique :
+42 tests couvrent la logique critique :
 
 | Fichier | Ce qui est prouvé |
 | - | - |
 | `test/claim.test.ts` (11) | **C1** : N exact, 50 claims concurrents, idempotence, ticket renvoyé après épuisement, T1 figée, un seul job PDF par version |
 | `test/credit.test.ts` (15) | **C4** : débit exact, plafond, multi-appareils, `opId` rejoué, contenu identique, suppressions facturées, séquence contiguë, restauration gratuite, blocage au 4ᵉ refus, isolation d'un refus dans un lot, jour métier à minuit heure de Douala, refus après blocage |
 | `test/yjs-update.test.ts` (7) | Comptage sur de vrais updates Yjs : insertions, suppressions, update complet, unicode, update corrompu |
+| `test/email.test.ts` (9) | **Notification** : envoi au seul dernier exemplaire, idempotence, panne SES sans impact sur le visiteur, relâchement du verrou, échappement HTML, pluriel |
 
 ### Tester en local, sans AWS
 
@@ -202,7 +209,23 @@ cd backend && node test-credit-exhaustion.mjs
 node tests/node/verify-client-bundle.mjs --dev
 ```
 
-Ce qui n'est **pas** testable en local : le pic de charge (C5), SES et nginx.
+Ce qui n'est **pas** testable en local : le pic de charge (C5) et nginx. Le
+parcours de notification est observable : le mode local n'appelle pas SES, il
+journalise le message (`[e-mail local] à … — …`).
+
+### Notification de fin de quota (SES)
+
+Un lien distribue son **dernier** exemplaire → son créateur reçoit un e-mail
+unique. Trois garanties, chacune couverte par [`test/email.test.ts`](backend/test/email.test.ts) :
+
+| Garantie | Mécanisme |
+| - | - |
+| Un seul envoi | verrou `notified` posé de façon **conditionnelle** avant l'envoi ; seule la transition `false → true` envoie |
+| Jamais d'échec visible pour le visiteur | `notifyLinkExhausted` ne lève pas : une panne SES est journalisée, le PDF déjà réservé reste servi |
+| Nouvelle tentative possible | en cas d'échec d'envoi, le verrou est **relâché** — mieux vaut un doublon rare qu'un créateur jamais prévenu |
+
+Le contenu est échappé (le titre et le nom sont saisis par l'utilisateur) et le
+transport est injectable (`setMailer`), comme S3 et SQS : aucun test n'appelle AWS.
 
 #### Outils de développement (mode local uniquement)
 

@@ -15,6 +15,7 @@ import { db } from './db';
 import { gone, invalidInput, notFound, unavailable } from './errors';
 import { jitter, sleep } from './ids';
 import { randomToken } from './ids';
+import { notifyLinkExhausted } from './email';
 import { jobQueue } from './queue';
 import { pdfKey, presignedUrl } from './s3';
 import type { LinkRow, PdfCacheRow, TicketRow } from './types';
@@ -202,8 +203,9 @@ export async function claim(token: string, visitorId: string): Promise<ClaimResu
       if (outcome.ok) {
         // Transition monotone ACTIVE → EXHAUSTED, séparée et idempotente :
         // seul le claim qui amène réellement `remaining` à 0 peut la poser.
-        await db()
-          .update(
+        let justExhausted = false;
+        try {
+          await db().update(
             cfg.linksTable,
             { token },
             {
@@ -212,8 +214,25 @@ export async function claim(token: string, visitorId: string): Promise<ClaimResu
               names: { '#status': 'status' },
               values: { ':exhausted': 'EXHAUSTED', ':active': 'ACTIVE', ':zero': 0, ':now': new Date().toISOString() },
             },
-          )
-          .catch(() => undefined);
+          );
+          justExhausted = true;
+        } catch (error) {
+          // `ConditionalCheckFailed` = un claim concurrent a déjà posé la
+          // transition, donc déjà notifié (ou en train de l'être). Toute autre
+          // erreur est réelle : la notification serait alors perdue, ce qui
+          // mérite une trace, mais ne doit pas faire échouer le visiteur.
+          if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') {
+            console.warn('Transition EXHAUSTED en échec', { token, error });
+          }
+        }
+
+        // La notification part **après** la transition, et uniquement pour le
+        // claim qui l'a posée : c'est le « dernier exemplaire distribué ».
+        // `notifyLinkExhausted` est idempotente et ne lève jamais : un échec SES
+        // ne peut pas empêcher ce visiteur d'obtenir son PDF déjà réservé.
+        if (justExhausted) {
+          await notifyLinkExhausted({ ...current, status: 'EXHAUSTED', remaining: 0 });
+        }
 
         return resolve(ticket, current.docTitle);
       }

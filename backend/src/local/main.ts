@@ -17,6 +17,7 @@ import { MemoryDatabase } from '../../test/helpers/memory-db';
 import { setDatabase } from '../lib/db';
 import { setObjectStore, type ObjectStore } from '../lib/s3';
 import { setSecretOverrides, generateLocalSecrets } from '../lib/secrets';
+import { setMailer } from '../lib/email';
 import { setJobQueue } from '../lib/queue';
 import { setLastSeqReader } from '../lib/links';
 import { resetConfigCache } from '../lib/config';
@@ -156,6 +157,14 @@ async function main(): Promise<void> {
       setImmediate(() => {
         void buildPdf(job).catch((error) => console.error('PDF local en échec', error));
       });
+    },
+  });
+  // E-mails : en mode local, on **journalise** au lieu d'appeler SES. Le
+  // parcours « dernier exemplaire distribué » reste donc observable de bout en
+  // bout sans compte AWS, comme le PDF et le claim.
+  setMailer({
+    async send(email) {
+      console.log(`[e-mail local] à ${email.to} — ${email.subject}`);
     },
   });
   setLastSeqReader((docId) => manager.lastSeq(docId));
