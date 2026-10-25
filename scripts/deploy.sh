@@ -29,7 +29,13 @@ AWS_REGION="${AWS_REGION:-eu-north-1}"
 KEY_NAME="${KEY_NAME:-}"
 SES_SENDER="${SES_SENDER:-}"
 ADMIN_CIDR="${ADMIN_CIDR:-}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
+# Le défaut est **défini ici et nulle part ailleurs** : il était auparavant
+# `t3.large`, ce qui écrasait silencieusement le `Default` du template
+# (`m7i-flex.large`) — le script passait toujours son propre paramètre, donc le
+# template n'avait jamais voix au chapitre.
+# `m7i-flex.large` : éligible au Free Tier, 2 vCPU / 8 Gio (même mémoire que la
+# cible du plan v7). Surchargeable : INSTANCE_TYPE=t3.small ./scripts/deploy.sh
+INSTANCE_TYPE="${INSTANCE_TYPE:-m7i-flex.large}"
 PROPRIETAIRE="${PROPRIETAIRE:-Djusse Tameno Christian}"
 PROJET="${PROJET:-editeur-documents-partage}"
 
@@ -114,6 +120,29 @@ else
 fi
 
 echo "==> 3/6 Déploiement de la pile CloudFormation"
+
+# Une pile en ROLLBACK_COMPLETE ne peut plus être mise à jour : `deploy` échoue
+# avec « is in ROLLBACK_COMPLETE state and can not be updated ». C'est l'état que
+# laisse **tout** échec de création (quota, type d'instance, user data). On la
+# supprime avant de recréer : le rollback a déjà détruit les ressources, seule
+# l'enveloppe de la pile subsiste.
+STACK_STATE="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" --query "Stacks[0].StackStatus" --output text 2>/dev/null || true)"
+case "$STACK_STATE" in
+  ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED)
+    echo "    pile en $STACK_STATE (échec antérieur) — suppression puis recréation"
+    aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$AWS_REGION"
+    if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$AWS_REGION"; then
+      echo "ERREUR : la suppression de la pile $STACK_STATE a échoué."
+      aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$AWS_REGION" \
+        --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+        --output table || true
+      exit 1
+    fi
+    echo "    pile supprimée — recréation"
+    ;;
+esac
+
 # Les balises se propagent à toutes les ressources qui les supportent.
 aws cloudformation deploy \
   --template-file infra/template.yaml \
