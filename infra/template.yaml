@@ -10,14 +10,17 @@ Metadata:
 
 Parameters:
   KeyName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: Paire de clés SSH existante (créée à la phase 0).
+    Type: String
+    Default: ''
+    Description: >
+      Paire de clés SSH existante. Laisser vide pour n'utiliser que
+      Session Manager (recommandé : aucune clé à protéger).
   AdminCidr:
     Type: String
-    Default: 0.0.0.0/0
+    Default: ''
     Description: >
-      Plage autorisée pour SSH (port 22). Mettre votre IP en /32.
-      Laisser 0.0.0.0/0 si vous utilisez uniquement Session Manager.
+      Plage autorisée pour SSH (port 22), p. ex. votre IP en /32. Vide ou
+      0.0.0.0/0 = port 22 FERMÉ (accès par Session Manager uniquement).
   InstanceType:
     Type: String
     Default: t3.large
@@ -26,13 +29,6 @@ Parameters:
   SesSenderEmail:
     Type: String
     Description: Adresse expéditrice vérifiée dans SES (Gmail vérifié).
-  AppArchiveUrl:
-    Type: String
-    Default: ''
-    Description: >
-      URL S3 de l'archive de l'application (build + front). Vide au premier
-      déploiement : l'instance démarre alors avec une page d'attente, et
-      scripts/deploy.sh pousse l'application par SSM.
   CreditPerDay:
     Type: Number
     Default: 10000
@@ -45,6 +41,12 @@ Parameters:
   TickMs:
     Type: Number
     Default: 250
+
+Conditions:
+  HasKey: !Not [!Equals [!Ref KeyName, '']]
+  OpenSsh: !And
+    - !Not [!Equals [!Ref AdminCidr, '']]
+    - !Not [!Equals [!Ref AdminCidr, '0.0.0.0/0']]
 
 Resources:
 
@@ -74,10 +76,16 @@ Resources:
             Status: Enabled
             Prefix: artifacts/
             ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
           - Id: expire-pdf
             Status: Enabled
             Prefix: pdf/
             ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
       Tags:
         - { Key: Projet, Value: editeur-documents-partage }
 
@@ -259,10 +267,11 @@ Resources:
         deadLetterTargetArn: !GetAtt PdfDeadLetterQueue.Arn
         maxReceiveCount: 3
       Tags: [{ Key: Projet, Value: editeur-documents-partage }]
-# Les secrets (`/editeur/jwt-secret`, `/editeur/admin-key`) ne sont **pas**
-# créés par ce template : `scripts/deploy.sh` les génère avec `openssl rand`
-# puis les écrit en `SecureString`. Ils n'existent donc ni dans le dépôt, ni
-# dans l'historique CloudFormation, ni dans le user data.
+
+  # Les secrets (`/editeur/jwt-secret`, `/editeur/admin-key`) ne sont **pas**
+  # créés par ce template : `scripts/deploy.sh` les génère avec `openssl rand`
+  # puis les écrit en `SecureString`. Ils n'existent donc ni dans le dépôt, ni
+  # dans l'historique CloudFormation, ni dans le user data.
 
   # ---------------------------------------------------------------------------
   # Réseau : Security Group, rôle d'instance
@@ -270,22 +279,22 @@ Resources:
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Editeur documents partage - HTTP public, SSH restreint
+      GroupDescription: Editeur documents partage - HTTP public, SSH uniquement si AdminCidr
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
           Description: HTTP (REST et WebSocket)
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !Ref AdminCidr
-          Description: SSH limite
-      SecurityGroupEgress:
-        - IpProtocol: '-1'
-          CidrIp: 0.0.0.0/0
-          Description: Sortie libre (DynamoDB, S3, SQS, SES, SSM)
+        - !If
+          - OpenSsh
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref AdminCidr
+            Description: SSH limite
+          - !Ref AWS::NoValue
+      # Sortie : règle par défaut (tout autorisé) pour DynamoDB, S3, SQS, SES, SSM
       Tags: [{ Key: Projet, Value: editeur-documents-partage }]
 
   InstanceRole:
@@ -313,7 +322,12 @@ Resources:
                   - dynamodb:DeleteItem
                   - dynamodb:Query
                   - dynamodb:Scan
-                  - dynamodb:TransactWriteItems
+                  # `ConditionCheckItem` est l'action réellement évaluée pour un
+                  # `ConditionCheck` dans `TransactWriteItems`. Il n'existe pas
+                  # d'action IAM nommée `dynamodb:TransactWriteItems` : c'est
+                  # l'avertissement de `cfn-lint`, et une transaction refusée
+                  # aurait fait échouer toutes les écritures groupées du hub.
+                  - dynamodb:ConditionCheckItem
                 Resource:
                   - !GetAtt DocumentsTable.Arn
                   - !GetAtt MembersTable.Arn
@@ -384,16 +398,27 @@ Resources:
     Type: AWS::EC2::Instance
     # Pas de secret dans le user data : il est lisible via les métadonnées.
     # Les secrets vivent dans SSM et sont lus par le rôle d'instance.
+    #
+    # La pile n'est déclarée « terminée » que si le user data a réussi : le
+    # script appelle `cfn-signal` sur son code de sortie. En contrepartie, tout
+    # échec provoque un rollback **et la suppression de l'instance** ; pour
+    # déboguer, créer la pile avec `--disable-rollback`.
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT25M
     Properties:
-      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
-      KeyName: !Ref KeyName
+      KeyName: !If [HasKey, !Ref KeyName, !Ref AWS::NoValue]
       IamInstanceProfile: !Ref InstanceProfile
       SecurityGroupIds: [!Ref SecurityGroup]
       Monitoring: true
       MetadataOptions:
         HttpTokens: required
-        HttpPutResponseHopLimit: 2
+        # 1 : le SDK AWS (et SSM) parlent directement à IMDS, aucun conteneur
+        # intermédiaire ne justifie un second saut.
+        HttpPutResponseHopLimit: 1
         HttpEndpoint: enabled
       CreditSpecification:
         CPUCredits: standard
@@ -407,8 +432,18 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -euxo pipefail
+
+          # `cfn-signal` appartient au paquet `aws-cfn-bootstrap`, **absent
+          # d'AL2023**. Sans cette installation, le `trap` ci-dessous échouait
+          # silencieusement : aucun signal n'était envoyé, CloudFormation
+          # attendait 25 minutes puis faisait un rollback supprimant l'instance.
+          dnf install -y aws-cfn-bootstrap
+
+          # Signale le résultat à CloudFormation (0 = succès) quoi qu'il arrive.
+          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Instance --region ${AWS::Region}' EXIT
+
           dnf update -y
-          dnf install -y nginx nodejs22 amazon-cloudwatch-agent
+          dnf install -y nginx nodejs22
 
           # --- Limites de descripteurs (12 000+ connexions WebSocket) ---------
           cat >/etc/security/limits.d/99-editeur.conf <<'EOF'
@@ -434,13 +469,44 @@ Resources:
               try_files $uri $uri.html $uri/ =404;
             }
 
+            # ------------------------------------------------------------------
+            # Parcours visiteur : /d/{token}/{status,claim,file}
+            #
+            # Ces routes sont exposées par Fastify **à la racine**, pas sous
+            # /api (voir `registerVisitorRoutes` dans backend/src/server/app.ts).
+            # Seul `/status` était proxifié auparavant : `claim` et `file`
+            # tombaient dans `location /` et renvoyaient 404 — le bouton
+            # « Télécharger » et la réservation d'exemplaire étaient donc cassés
+            # en production, alors que tous les tests locaux passaient (ils
+            # interrogent Node directement, sans nginx).
+            # ------------------------------------------------------------------
+            location /d/ {
+              proxy_pass http://127.0.0.1:3000;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_read_timeout 65s;
+            }
+
             # Micro-cache de l'état public (C5/C6) : 1 s tant qu'actif,
             # 60 s une fois épuisé (via X-Accel-Expires renvoyé par Node).
+            #
+            # La regex porte sur `/d/…`, l'URL réellement appelée par le client
+            # (`VISITOR_BASE` retire le suffixe `/api`). Une regex `^/api/d/…`
+            # ne matchait jamais et laissait 15 000 visiteurs frapper Node.
+            # Les locations par regex sont prioritaires sur le préfixe `/d/`.
             location ~ ^/d/[^/]+/status$ {
               proxy_pass http://127.0.0.1:3000;
+              proxy_http_version 1.1;
               proxy_set_header Host $host;
+              proxy_set_header Connection "";
               proxy_cache MYCACHE;
               proxy_cache_valid 200 1s;
+              # Une seule requête vers Node par clé, les autres attendent (C5).
+              proxy_cache_lock on;
+              proxy_cache_lock_timeout 2s;
               proxy_cache_use_stale error timeout updating;
               add_header X-Cache-Status $upstream_cache_status;
             }
@@ -467,23 +533,36 @@ Resources:
 
             location /health {
               proxy_pass http://127.0.0.1:3000;
+              proxy_set_header Host $host;
             }
           }
 
-          proxy_cache_path /var/cache/nginx/editeur levels=1:2 keys_zone=MYCACHE:10m max_size=200m inactive=10m use_temp_path=off;
           EOF
 
+          # nginx.conf complet : sans les blocs `events` et `http`, nginx refuse
+          # de démarrer (`sendfile`, `keepalive_timeout` et `proxy_cache_path`
+          # ne sont valides que dans `http`). Avec `set -e`, le reste du user
+          # data s'arrêtait donc là et l'instance restait sans application.
           cat >/etc/nginx/nginx.conf <<'EOF'
           user nginx;
           worker_processes auto;
           worker_rlimit_nofile 65536;
           error_log /var/log/nginx/error.log warn;
           pid /run/nginx.pid;
-          include /etc/nginx/mime.types;
-          default_type application/octet-stream;
-          sendfile on;
-          keepalive_timeout 65;
-          include /etc/nginx/conf.d/*.conf;
+
+          events {
+            worker_connections 16384;
+          }
+
+          http {
+            include /etc/nginx/mime.types;
+            default_type application/octet-stream;
+            sendfile on;
+            keepalive_timeout 65;
+            access_log /var/log/nginx/access.log;
+            proxy_cache_path /var/cache/nginx/editeur levels=1:2 keys_zone=MYCACHE:10m max_size=200m inactive=10m use_temp_path=off;
+            include /etc/nginx/conf.d/*.conf;
+          }
           EOF
 
           # --- Application ---------------------------------------------------
@@ -582,6 +661,7 @@ Resources:
 
       Tags:
         - { Key: Projet, Value: editeur-documents-partage }
+        - { Key: Proprietaire, Value: Djusse Tameno Christian }
         - { Key: Name, Value: editeur-app }
 
   ElasticIp:

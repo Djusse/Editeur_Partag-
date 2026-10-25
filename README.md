@@ -259,28 +259,22 @@ mesurerait le réseau, pas l'application.
 ## 6. Supprimer
 
 ```bash
-aws cloudformation delete-stack --stack-name editeur --region eu-north-1
-aws cloudformation wait stack-delete-complete --stack-name editeur --region eu-north-1
-
-# Les secrets et le bucket doivent être supprimés explicitement
-aws ssm delete-parameter --name /editeur/jwt-secret --region eu-north-1
-aws ssm delete-parameter --name /editeur/admin-key --region eu-north-1
+./scripts/destroy.sh          # demande confirmation (« supprimer »)
+./scripts/destroy.sh --yes    # sans confirmation
 ```
 
-### Vérifier que la suppression est complète
+Un simple `aws cloudformation delete-stack` ne suffit pas :
 
-```bash
-aws cloudformation describe-stacks --stack-name editeur --region eu-north-1
-# → "Stack with id editeur does not exist"
+- le bucket est **versionné** — `delete-stack` échoue tant qu'il contient des
+  objets, et supprimer seulement les objets courants laisse les versions ;
+- les paramètres SSM `/editeur/*` et la paire de clés sont **hors pile** et
+  subsistent après la suppression.
 
-aws ec2 describe-instances --region eu-north-1 \
-  --filters "Name=tag:Projet,Values=editeur-documents-partage" \
-  --query "Reservations[].Instances[].InstanceId"          # → []
-
-aws ec2 describe-addresses --region eu-north-1 --query "Addresses[].PublicIp"   # → []
-aws dynamodb list-tables --region eu-north-1 --query "TableNames[?starts_with(@, 'editeur')]"  # → []
-aws sqs list-queues --region eu-north-1 --query "QueueUrls[?contains(@, 'editeur')]"          # → []
-```
+Le script enchaîne donc : inventaire → purge du bucket (objets **et** versions,
+marqueurs de suppression compris) → suppression de la pile et attente → secrets,
+paire de clés et files SQS résiduelles → **vérification finale** (pile, instances,
+Elastic IP, tables, buckets, files, paramètres, groupes de logs). Il se termine en
+erreur s'il reste une ressource facturable.
 
 > **Avant toute suppression** : exporter les résultats bruts (`tests/results/`) et
 > les extraits CloudWatch. Les groupes de logs disparaissent avec la pile.

@@ -6,18 +6,114 @@ Une seule pile CloudFormation ([`template.yaml`](template.yaml)) déployée en `
 | - | - |
 | `Instance` (EC2 t3.large) | Node.js : Fastify (REST) + `ws` (WebSocket) + Yjs, état en mémoire |
 | `ElasticIp` | URL stable (l'IP publique change après arrêt/démarrage) |
-| `SecurityGroup` | 80 ouvert, 22 limité à `AdminCidr` |
+| `SecurityGroup` | 80 ouvert ; 22 **seulement** si `AdminCidr` est une vraie plage |
 | `InstanceRole` | Moindre privilège : tables nommées, préfixe S3, file SQS, SES filtré, `/editeur/*` en SSM |
 | `Bucket` | PDF, snapshots, versions, artefacts ; public bloqué, chiffré, HTTPS obligatoire |
 | 10 tables DynamoDB | Documents, Members, Updates, Credits, OpIds, Abuse, Links, Tickets, PdfCache, Versions |
 | `PdfQueue` + DLQ | Génération PDF asynchrone, 3 essais puis lettre morte |
 | `AppLogGroup` | /editeur/app, rétention 7 jours |
 
-Le user data installe nginx (avec micro-cache de `/status` et proxy WebSocket),
-systemd (`editeur-app`, `editeur-worker`, `Restart=always`, `LimitNOFILE=65536`)
-et écrit `/opt/editeur/app.env`. **Aucun secret n'y figure** : ils sont lus dans
-SSM par le rôle d'instance.
+Le user data installe nginx (avec micro-cache de `/d/{token}/status` et proxy
+WebSocket), systemd (`editeur-app`, `editeur-worker`, `Restart=always`,
+`LimitNOFILE=65536`) et écrit `/opt/editeur/app.env`. **Aucun secret n'y figure** :
+ils sont lus dans SSM par le rôle d'instance.
 
 Les secrets `/editeur/jwt-secret` et `/editeur/admin-key` sont créés par
 `scripts/deploy.sh`, jamais par le template : ils n'apparaissent donc ni dans le
 dépôt, ni dans l'historique CloudFormation.
+
+---
+
+## Routage nginx
+
+Fastify expose **deux familles de routes**, et nginx doit les proxifier toutes les deux :
+
+| Chemin | Origine | Traitement nginx |
+| - | - | - |
+| `/`, `/doc.html`, `/documents.html`… | export statique Next.js | `try_files` sur `/opt/editeur/public` |
+| `/d/{token}/status` | `registerVisitorRoutes`, **à la racine** | proxy + **micro-cache** (`MYCACHE`) |
+| `/d/{token}/claim`, `/d/{token}/file` | `registerVisitorRoutes`, **à la racine** | proxy simple |
+| `/api/*` | routes du rédacteur (préfixe `/api`) | proxy simple |
+| `/ws` | WebSocket | proxy avec `Upgrade` |
+
+Trois pièges corrigés, tous invisibles en test local (les tests interrogent Node
+directement sur le port 4000, sans passer par nginx) :
+
+1. **`nginx.conf` incomplet.** `sendfile`, `keepalive_timeout` et surtout
+   `proxy_cache_path` ne sont valides que dans un bloc `http`. Un fichier sans
+   `events {}` ni `http {}` empêche nginx de démarrer ; avec `set -e`, tout le
+   user data s'arrêtait et l'instance restait sans application.
+2. **Mauvais préfixe pour le cache.** La regex visait `^/api/d/…/status$`, alors
+   que le client appelle `/d/…/status` (voir `VISITOR_BASE` dans
+   `frontend/src/lib/api.ts`). Résultat : le micro-cache n'était jamais utilisé et
+   chaque visiteur frappait Node.
+3. **`claim` et `file` non proxifiés.** Seul `/status` avait une `location`. Les
+   deux autres tombaient dans le `try_files` du front statique et renvoyaient 404 :
+   le bouton « Télécharger » et la réservation d'exemplaire étaient cassés en
+   production.
+
+---
+
+## Vérifications avant de déployer
+
+```bash
+# 1. Syntaxe YAML (les balises !Ref/!Sub exigent un loader permissif)
+python3 -c "
+import yaml
+class L(yaml.SafeLoader): pass
+def m(l,s,n):
+    return l.construct_scalar(n) if isinstance(n,yaml.ScalarNode) else (
+           l.construct_sequence(n) if isinstance(n,yaml.SequenceNode) else l.construct_mapping(n))
+L.add_multi_constructor('!',m)
+d=yaml.load(open('infra/template.yaml'),Loader=L); print(len(d['Resources']),'ressources')"
+
+# 2. Configuration nginx réelle (extrait les here-doc du user data)
+#    Remplacer listen 80 par 8080 et 127.0.0.1:3000 par host.docker.internal:3000,
+#    puis :
+docker run --rm \
+  -v /tmp/ngxtest/nginx.conf:/etc/nginx/nginx.conf:ro \
+  -v /tmp/ngxtest/conf.d:/etc/nginx/conf.d:ro \
+  nginx:alpine nginx -t
+
+# 3. Routage réel, avec un backend factice sur le port 3000
+curl -s http://127.0.0.1:8080/d/tok/claim        # doit atteindre Node, pas 404
+curl -sI http://127.0.0.1:8080/d/tok/status | grep X-Cache-Status   # HIT au 2ᵉ appel
+```
+
+Après déploiement, sur l'Elastic IP :
+
+```bash
+curl -s  http://$IP/d/<token>/status
+curl -s -X POST http://$IP/d/<token>/claim -H 'content-type: application/json' \
+     -d '{"visitorId":"v_test_0001"}'
+curl -sI http://$IP/d/<token>/status | grep X-Cache-Status
+```
+
+---
+
+## Points connus
+
+- **`CreationPolicy`** : la pile n'est déclarée terminée que si `cfn-signal`
+  répond. Le paquet `aws-cfn-bootstrap` est donc installé en première ligne du user
+  data (`dnf install -y aws-cfn-bootstrap`). Sans lui, aucun signal n'est envoyé et
+  CloudFormation fait un rollback au bout de 25 minutes, **en supprimant
+  l'instance**. Pour déboguer un échec, recréer la pile avec
+  `aws cloudformation create-stack --disable-rollback`.
+- **Suppression** : `DeletionPolicy: Delete` ne vide pas un bucket versionné, donc
+  `delete-stack` échoue tant qu'il contient des objets. Les paramètres SSM
+  `/editeur/*` et la paire de clés sont hors pile et subsistent après suppression.
+  Un `destroy.sh` est nécessaire (vider le bucket **versions comprises**, supprimer
+  la pile, les paramètres et la clé).
+- **Remplacement d'instance** : l'AMI est résolue à chaque déploiement
+  (`{{resolve:ssm:…al2023-ami…}}`). Si Amazon publie une nouvelle AMI entre deux
+  `deploy`, l'instance est remplacée et l'IP change. Faire le dernier déploiement
+  **avant** les tests de charge, puis ne plus y toucher.
+- **`app.env` n'est écrit qu'au premier démarrage.** Modifier `CreditPerDay`,
+  `MaxUpdateBytes`, `BatchMs` ou `TickMs` exige un remplacement d'instance, pas
+  seulement un `deploy.sh`.
+- **CloudWatch** : l'agent n'est plus installé (il l'était sans configuration, ce
+  qui laissait `AppLogGroup` vide). Les journaux restent dans
+  `/var/log/editeur/*.log`.
+- **SES en bac à sable** : seules les adresses vérifiées reçoivent les e-mails. Sans
+  accès production, les notifications de fin de quota n'iront pas aux adresses du
+  jury.
