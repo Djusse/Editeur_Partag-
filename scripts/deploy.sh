@@ -51,6 +51,37 @@ aws sts get-caller-identity --region "$AWS_REGION" --output text >/dev/null
 ACCOUNT_ID="$(aws sts get-caller-identity --region "$AWS_REGION" --query Account --output text)"
 echo "    compte $ACCOUNT_ID en $AWS_REGION"
 
+# --- Éligibilité du type d'instance -------------------------------------------
+# Inutile de lancer la pile pour la voir échouer après plusieurs minutes :
+# un compte en Free Tier refuse `t3.large` avec « not eligible for Free Tier ».
+echo "    type d'instance : $INSTANCE_TYPE"
+if ! aws ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" \
+     --region "$AWS_REGION" \
+     --query "InstanceTypes[].InstanceType" --output text 2>/dev/null | grep -q "$INSTANCE_TYPE"; then
+  echo "ERREUR : le type $INSTANCE_TYPE n'existe pas dans $AWS_REGION."
+  exit 1
+fi
+
+# Vérification **factuelle** auprès d'AWS plutôt qu'une liste tenue à la main :
+# les types éligibles au Free Tier varient selon le compte et la région
+# (m7i-flex.large l'est, t3.large ne l'est pas). On interroge l'API.
+ELIGIBLE="$(aws ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" \
+  --region "$AWS_REGION" --filters "Name=free-tier-eligible,Values=true" \
+  --query "InstanceTypes[].InstanceType" --output text 2>/dev/null || true)"
+
+if [[ "$ELIGIBLE" == *"$INSTANCE_TYPE"* ]]; then
+  echo "    éligible au Free Tier (vérifié auprès d'AWS) — 2 vCPU / RAM selon le type"
+else
+  echo "    AVERTISSEMENT : $INSTANCE_TYPE n'est pas éligible au Free Tier selon AWS."
+  echo "      Sur un compte en Free Tier, la création échouera avec :"
+  echo "      « The specified instance type is not eligible for Free Tier »."
+  echo "      Types actuellement éligibles : ${ELIGIBLE:-aucun}"
+  echo "      Pour un premier déploiement :"
+  echo "        INSTANCE_TYPE=m7i-flex.large ./scripts/deploy.sh   # 2 vCPU / 8 Gio"
+  echo "      (poursuite dans 5 s — Ctrl+C pour annuler)"
+  sleep 5
+fi
+
 echo "==> 2/6 Paire de clés et secrets"
 if [[ -n "$KEY_NAME" ]]; then
   if ! aws ec2 describe-key-pairs --key-names "$KEY_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then

@@ -2,6 +2,91 @@
 
 Une seule pile CloudFormation ([`template.yaml`](template.yaml)) déployée en `eu-north-1`.
 
+---
+
+## Free Tier : quelle taille d'instance ?
+
+Le plan v7 visait `t3.large` (2 vCPU / 8 Gio) pour tenir C5 — 12 000 connexions
+WebSocket avec l'état des documents **en mémoire**. Ce n'est pas une exigence du
+code, mais une exigence de **capacité**.
+
+Le piège : `t3.large` **n'est pas éligible au Free Tier**, et un compte neuf
+échoue à la création avec :
+
+```
+Resource handler returned message: "The specified instance type is not eligible
+for Free Tier. … (Service: Ec2, Status Code: 400) (HandlerErrorCode: InvalidRequest)"
+```
+
+**La solution retenue : `m7i-flex.large`**, éligible au Free Tier **et** doté de
+8 Gio. On conserve donc la **mémoire** de la cible initiale sans quitter le
+gratuit.
+
+⚠️ **Mais 8 Gio de RAM ne suffisent pas à garantir C5.** Deux différences
+subsistent avec `t3.large` :
+
+| Point | `t3.large` (plan v7) | `m7i-flex.large` | Effet sur C5 |
+| - | - | - | - |
+| CPU | 2 vCPU **burstable**, crédits Standard (24/h) | 2 vCPU **non burstable**, pleine puissance en continu | à la charge : `m7i-flex` est **meilleur** (pas d'épuisement de crédits) |
+| Débit réseau | jusqu'à 5 Gbit/s | **jusqu'à 12,5 Gbit/s** | à la charge : `m7i-flex` est **meilleur** |
+| Mémoire | 8 Gio | 8 Gio | identique |
+| **EBS** | **baseline 3 000 IOPS** garantis | baseline plus faible, dépend du volume | **point faible** : peu d'écritures ici (250 ms de tick), impact limité |
+| Coût si facturé | ~0,0832 $/h | ~0,1008 $/h | sans objet en Free Tier |
+
+Ce qui **n'est pas** garanti : 15 000 clics + 300 rédacteurs au même instant.
+C5 est une contrainte de **débit mesuré**, pas une spécification de machine.
+Seul le scénario S5 le dira.
+
+| Taille | vCPU | RAM | Free Tier | Usage |
+| - | - | - | - | - |
+| `m7i-flex.large` | 2 | **8 Gio** | **oui** | **défaut : même mémoire que la cible** |
+| `t3.micro` | 2 (burstable) | 1 Gio | oui | trop juste (OOM probable) |
+| `t3.small` | 2 (burstable) | 2 Gio | oui | repli si `m7i-flex` indisponible |
+| `t3.medium` | 2 | 4 Gio | non | compromis |
+| `t3.large` | 2 | 8 Gio | non | référence du plan v7 (EBS garanti) |
+| `t3.xlarge` | 4 | 16 Gio | non | marge confortable |
+
+`CreditSpecification` est appliqué **conditionnellement** aux familles
+burstable : l'envoyer pour `m7i-flex` (qui ne l'accepte pas) fait échouer la
+création avec `InvalidParameterCombination`.
+
+L'éligibilité **dépend du compte et de la région** : elle ne se devine pas, elle
+s'interroge. [`deploy.sh`](../scripts/deploy.sh) le fait désormais avant de créer
+la pile, au lieu d'attendre l'échec après plusieurs minutes.
+
+Pour lister les types éligibles sur ton compte :
+
+```bash
+aws ec2 describe-instance-types --region eu-north-1 \
+  --filters "Name=free-tier-eligible,Values=true" \
+  --query "InstanceTypes[].[InstanceType,VCpuInfo.DefaultVCpus,MemoryInfo.SizeInMiB]" \
+  --output table
+```
+
+### Autres limites du Free Tier
+
+| Ressource | Limite gratuite | État dans ce template |
+| - | - | - |
+| EBS gp3 | **30 Gio** au total | 20 Gio → conforme |
+| Elastic IP | 1 par compte, gratuite **si attachée** | 1, attachée → conforme |
+| DynamoDB | 25 Gio ; `PAY_PER_REQUEST` facturé à l'usage | quelques centimes |
+| S3 | 5 Gio | PDF et snapshots, négligeable |
+| SQS | 1 M requêtes/mois | conforme |
+
+**Si `m7i-flex.large` n'est pas éligible sur ton compte**, la démarche honnête
+est de descendre en `t3.small` et d'assumer la limite :
+
+1. **valider le fonctionnel** (C1, C2, C3, C4, C6) — tout passe : claim exact,
+   convergence, PDF, crédit, blocage, notification SES ;
+2. **mesurer C5 avec un plafond explicite** : k6 avec un nombre de connexions
+   que l'instance tient réellement, et publier le chiffre obtenu plutôt qu'un
+   seuil théorique non mesuré ;
+3. **changer de taille** pour la soutenance, en acceptant la facturation
+   (quelques centimes par heure).
+
+Le changement se fait par `INSTANCE_TYPE=…`. L'instance est alors **remplacée**,
+mais l'Elastic IP est réattachée : l'adresse publique reste stable.
+
 | Ressource | Rôle |
 | - | - |
 | `Instance` (EC2 t3.large) | Node.js : Fastify (REST) + `ws` (WebSocket) + Yjs, état en mémoire |

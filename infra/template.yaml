@@ -23,9 +23,20 @@ Parameters:
       0.0.0.0/0 = port 22 FERMÉ (accès par Session Manager uniquement).
   InstanceType:
     Type: String
-    Default: t3.large
-    AllowedValues: [t3.medium, t3.large, t3.xlarge]
-    Description: t3.large = 2 vCPU / 8 Gio, crédits CPU en mode Standard.
+    Default: m7i-flex.large
+    AllowedValues:
+      - m7i-flex.large
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+    Description: >
+      m7i-flex.large (2 vCPU / 8 Gio) est **éligible au Free Tier** tout en
+      offrant la mémoire du plan v7 pour C5 (12 000 connexions) : c'est le choix
+      par défaut. Les t3.* restent acceptés ; t3.large et au-delà ne sont pas
+      éligibles au Free Tier et échouent sur un compte neuf. Voir
+      infra/README-infra.md, section « Free Tier ».
   SesSenderEmail:
     Type: String
     Description: Adresse expéditrice vérifiée dans SES (Gmail vérifié).
@@ -47,6 +58,16 @@ Conditions:
   OpenSsh: !And
     - !Not [!Equals [!Ref AdminCidr, '']]
     - !Not [!Equals [!Ref AdminCidr, '0.0.0.0/0']]
+
+  # `CreditSpecification` n'est accepté que par les familles **burstable**
+  # (t2 / t3 / t4g). L'envoyer pour `m7i-flex.large`, qui ne l'est pas, fait
+  # échouer la création de l'instance avec `InvalidParameterCombination`.
+  IsBurstable: !Or
+    - !Equals [!Ref InstanceType, 't3.micro']
+    - !Equals [!Ref InstanceType, 't3.small']
+    - !Equals [!Ref InstanceType, 't3.medium']
+    - !Equals [!Ref InstanceType, 't3.large']
+    - !Equals [!Ref InstanceType, 't3.xlarge']
 
 Resources:
 
@@ -420,8 +441,12 @@ Resources:
         # intermédiaire ne justifie un second saut.
         HttpPutResponseHopLimit: 1
         HttpEndpoint: enabled
-      CreditSpecification:
-        CPUCredits: standard
+      # Crédits CPU en mode Standard : uniquement pour les burstable, dont le
+      # mode `unlimited` peut facturer des dépassements. Sans objet ailleurs.
+      CreditSpecification: !If
+        - IsBurstable
+        - CPUCredits: standard
+        - !Ref AWS::NoValue
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
