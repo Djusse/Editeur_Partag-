@@ -35,9 +35,6 @@ la recrée et affiche la nouvelle IP Elastic (stable d'un redéploiement à l'au
 | [`infra/README-infra.md`](infra/README-infra.md) | Free Tier, routage nginx, défauts révélés par le premier déploiement réel |
 | [`tests/k6/README.md`](tests/k6/README.md) | Scénarios de charge : préparation, budget de crédit, pièges de k6 |
 
-Le plan d'exécution complet est dans
-[`plan-execution-editeur-documents-final.md`](plan-execution-editeur-documents-final.md).
-
 ---
 
 ## 1. Architecture en un schéma

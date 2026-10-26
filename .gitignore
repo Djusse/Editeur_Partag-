@@ -27,6 +27,23 @@ samconfig.local.toml
 # Tests et artefacts
 tests/results/
 
+# Banque d'updates de S2 : 600 Kio de données générées, entièrement
+# reproductibles par `node tests/k6/gen-updates.mjs 20000`. Le lanceur
+# `tests/k6/run.sh` la recrée automatiquement si elle manque, il n'y a donc
+# aucune raison de versionner un artefact aussi volumineux.
+tests/k6/data/
+
+# Documents de travail, hors périmètre de la livraison
+# - le plan d'exécution est un document de pilotage, rédigé à la deuxième
+#   personne (adresses personnelles, IP du poste, interprétations à confirmer) :
+#   il n'a pas sa place dans un dépôt présenté à un évaluateur ;
+# - le script de reproduction ciblait une Phase déjà franchie, il est remplacé
+#   par `test-credit-exhaustion.mjs`, versionné ;
+# - le PDF du sujet appartient à l'enseignant, pas au projet.
+plan-execution-editeur-documents-final.md
+backend/test-bloque-repro.mjs
+sujet_projet_stage-1.pdf
+
 # Divers
 .DS_Store
 *.swp
