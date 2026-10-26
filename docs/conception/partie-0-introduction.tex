@@ -1,0 +1,169 @@
+% =============================================================================
+% Partie 0 — Introduction
+% =============================================================================
+\section{Introduction}
+
+\subsection{Objet du document}
+
+Ce dossier décrit la conception d'un éditeur de documents partagé déployé sur
+AWS. L'application poursuit deux buts que l'énoncé oppose volontairement :
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item plusieurs centaines de personnes écrivent \emph{en même temps} dans le
+        même texte, et aucune frappe acceptée ne doit être perdue ;
+  \item un lien public distribue le document en PDF à \emph{exactement} $N$
+        personnes, jamais $N+1$, chacune recevant le document tel qu'il était
+        au moment où elle a réservé son exemplaire.
+\end{itemize}
+
+Le premier objectif demande de la souplesse : des écritures concurrentes, un
+historique, de la reprise après coupure. Le second demande de la rigidité : un
+compteur exact, une transaction, une réponse unique. Tenir les deux dans la même
+application est l'essentiel du travail de conception.
+
+\subsection{Ce que ce dossier est, et n'est pas}
+
+Ce dossier décrit la conception \emph{réellement implémentée}, vérifiée contre
+le code source, et non une intention de conception. Trois conséquences :
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item là où l'implémentation s'écarte du plan initial, l'écart est signalé avec
+        sa raison — ces écarts sont souvent la partie la plus instructive ;
+  \item chaque affirmation sur une contrainte renvoie à un test unitaire, un
+        script d'intégration ou un scénario de charge, tous exécutables ;
+  \item les limites sont énoncées sans être atténuées. Une limite annoncée vaut
+        mieux qu'une limite découverte par le lecteur.
+\end{enumerate}
+
+\subsection{Plan}
+
+La \textbf{partie A} traite de l'architecture : contexte, déploiement, décisions
+et alternatives écartées, flux internes, sécurité, infrastructure, limites.
+
+La \textbf{partie B} traite de la conception applicative : cas d'utilisation,
+organisation des paquets, modèle du domaine, états, séquences système, puis une
+lecture par contrainte, de C1 à C6.
+
+La \textbf{partie C} conclut : ce qui est prouvé, ce qui reste à mesurer, et ce
+que ce projet a réellement appris.
+
+% -----------------------------------------------------------------------------
+\section{Contexte, objectif et contraintes}
+
+\subsection{Contexte}
+
+Le sujet impose de démontrer la maîtrise des services AWS au travers d'une
+application non triviale, dont chaque choix doit pouvoir être justifié. Il
+précise que « une application simple, mais dont chaque choix est compris et
+justifié, vaut mieux qu'une application complexe que vous ne savez pas
+expliquer ». Ce dossier suit cette consigne : peu de services, mais chacun
+employé pour ce qu'il fait de mieux, et chaque fois avec l'alternative écartée.
+
+Deux points du sujet sont éliminatoires : les contraintes C1 et C2. Une
+application rapide qui les viole est non fonctionnelle, quel que soit son
+polissage.
+
+\subsection{Les six contraintes}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{0.6cm}p{5.3cm}p{7.3cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Contrainte de l'énoncé} & \textbf{Réponse retenue} \\
+\midrule
+C1 & Exactement $N$ téléchargements, jamais $N+1$
+   & transaction DynamoDB : décrément de \code{remaining} et création du ticket
+     dans la même écriture conditionnelle. Une garde en mémoire allège la base
+     sous le pic, mais n'est jamais l'autorité \\
+\addlinespace
+C2 & Aucune modification acceptée perdue ; convergence
+   & CRDT Yjs avec \emph{un seul écrivain} par document ; une modification n'est
+     acquittée qu'\emph{après} écriture durable dans le journal \\
+\addlinespace
+C3 & Document tel qu'il est à $T_1$, complet et cohérent
+   & le claim fige un numéro de séquence $T_1$ ; le PDF est construit depuis le
+     journal jusqu'à ce numéro, une seule fois par version, de façon asynchrone \\
+\addlinespace
+C4 & Jamais plus que son crédit, même sur plusieurs appareils
+   & compteur DynamoDB par (e-mail, jour) débité dans la même transaction que
+     l'écriture au journal ; comptage effectué côté serveur, sur le binaire Yjs \\
+\addlinespace
+C5 & 15\,000 clics (80\,\% en 60\,s) pendant que 300 rédacteurs écrivent
+   & micro-cache nginx sur l'état du lien, garde en mémoire sur les
+     réservations, diffusion par lots de 250\,ms, instance dimensionnée par la
+     mesure. Trois états explicites : prêt, patienter, épuisé \\
+\addlinespace
+C6 & Dernier exemplaire : visiteurs prévenus vite, plus de travail inutile
+   & état épuisé monotone : réponse immédiate, aucun appel à la base, mis en
+     cache longuement par nginx \\
+\bottomrule
+\end{tabular}
+\caption{Les six contraintes et la réponse architecturale retenue.}
+\label{tab:contraintes}
+\end{table}
+
+\subsection{Hypothèses d'interprétation}
+
+Le sujet laisse plusieurs points ouverts. Les choix ci-dessous ne sont pas
+confirmés par l'enseignant : ils sont donc explicités, pour que le lecteur
+puisse contester l'interprétation plutôt que le résultat.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{5.4cm}p{10.2cm}@{}}
+\toprule
+\textbf{Sujet} & \textbf{Interprétation retenue} \\
+\midrule
+Consommation d'un exemplaire & au clic qui réserve le téléchargement, et non au
+  téléchargement effectif du fichier \\
+\addlinespace
+Instant $T_1$ & lecture du dernier numéro de séquence au début du claim \\
+\addlinespace
+Crédit & 10\,000 caractères par jour ; insertions \emph{et} suppressions
+  comptées ; restauration de version gratuite \\
+\addlinespace
+Recharge du crédit & minuit, heure de Douala — et non minuit UTC (voir B.6) \\
+\addlinespace
+Blocage & 4 refus pour crédit épuisé dans la journée bloquent l'écriture
+  jusqu'à la recharge ; la lecture et le téléchargement restent possibles \\
+\addlinespace
+Pic d'écriture & 300 rédacteurs dans le \emph{même} document : c'est le pire cas,
+  retenu comme cible ; le palier réellement atteint est celui qui est rapporté \\
+\addlinespace
+Identité & nom et e-mail, sans mot de passe. Le sujet l'autorise ; l'e-mail est
+  la clé du crédit et du partage \\
+\addlinespace
+Livrables & français, dépôt GitHub privé, jury ajouté en collaborateur \\
+\bottomrule
+\end{tabular}
+\caption{Hypothèses d'interprétation, à confronter à l'énoncé.}
+\label{tab:hypotheses}
+\end{table}
+
+\hypothese{La recharge du crédit à minuit \emph{heure de Douala} s'écarte de
+l'hypothèse initiale (minuit UTC). L'écart vient de l'usage : un utilisateur à
+Douala lisait « recharge à 01:00 » et ne comprenait pas. Le décalage est
+constant toute l'année, le Cameroun n'appliquant pas d'heure d'été, ce qui rend
+l'arithmétique exacte sans table de fuseaux.}
+
+\subsection{Objectif mesurable}
+
+La conception n'est acceptable que si elle est mesurable. Quatre jalons ont
+guidé les décisions :
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item $N$ réservations exactement pour un lien de $N$ exemplaires, sous
+        15\,000 clics dont 80\,\% en 60 secondes, sans aucune erreur serveur ;
+  \item zéro modification acceptée sans acquittement, sous écriture simultanée
+        de plusieurs dizaines de rédacteurs ;
+  \item convergence du contenu vérifiable : journal sans trou, reconstruction
+        identique par deux chemins indépendants ;
+  \item un palier de rédacteurs réellement atteint, rapporté tel quel, même s'il
+        est inférieur à la cible.
+\end{enumerate}
+
+Le troisième point mérite d'être souligné : un test de charge mesure un
+\emph{débit d'acquittement}, pas une convergence de contenu. Les deux preuves
+sont distinctes, et le dossier les traite séparément.

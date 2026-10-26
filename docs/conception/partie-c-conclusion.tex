@@ -1,0 +1,101 @@
+% =============================================================================
+% Partie C — Conclusion
+% =============================================================================
+\section{Conclusion}
+
+\subsection{Ce qui est tenu, et comment on le sait}
+
+Deux contraintes étaient éliminatoires. Elles sont traitées par des mécanismes
+différents, et vérifiées par des preuves différentes — ce qui est précisément
+pourquoi elles méritent d'être distinguées.
+
+\textbf{C1 est prouvée en charge, en production.} Un lien de 500 exemplaires a
+reçu 16\,753 requêtes dont 500 réservations exactement, sans une seule erreur
+serveur, avec un pic à 200 requêtes par seconde. Le compteur final est à zéro et
+l'état du lien est « épuisé ». Ce résultat n'est pas une moyenne : la contrainte
+est « exactement $N$ », et l'écart mesuré est nul.
+
+\textbf{C2 est prouvée en deux temps.} Sous charge, chaque modification émise a
+reçu son acquittement : aucun message manquant. Mais un acquittement ne prouve
+pas la convergence du contenu, et un outil de charge ne peut pas le faire. Un
+second outil, avec un vrai client CRDT, reconstruit le document depuis le journal,
+vérifie que les numéros de séquence sont contigus, et compare deux
+reconstructions indépendantes. Il conclut à la convergence, et il conclut à
+l'échec dès qu'un numéro manque.
+
+\textbf{Les quatre autres contraintes sont couvertes par des tests unitaires.}
+Le quota de crédit, la version figée du PDF, le comportement sous pic et la
+notification du dernier exemplaire ont chacun leur jeu de tests, sans aucun appel
+à un service distant.
+
+\subsection{Ce qui reste à mesurer}
+
+Le dossier doit être honnête sur ce point.
+
+Le nombre de rédacteurs simultanés effectivement tenu reste à établir par paliers
+successifs, et le résultat doit être rapporté tel quel, même inférieur à la cible
+de 300. Une cible non atteinte et annoncée vaut mieux qu'un chiffre flatteur et
+invérifiable.
+
+Le comportement après un arrêt brutal du processus en pleine écriture dispose
+d'un scénario dédié, qui tue le processus et vérifie que le journal a progressé
+sans trou après redémarrage. Ce scénario est écrit, son exécution reste à
+consigner.
+
+Les métriques système — occupation processeur, mémoire de pointe, solde de
+crédits de processeur — ne sont pas observables depuis l'outil de charge. Elles
+se relèvent en parallèle sur la supervision du fournisseur, et doivent
+accompagner les résultats de charge pour que le dimensionnement soit justifié
+plutôt qu'affirmé.
+
+\subsection{Ce que ce projet a réellement appris}
+
+Trois leçons, dans l'ordre de ce qu'elles ont coûté.
+
+\textbf{Première leçon : un faux service doit imiter les refus, pas seulement les
+succès.} Un double en mémoire de la base évaluait lui-même les expressions de
+condition. Il était donc plus permissif que le vrai service. Résultat :
+quarante-deux tests verts, et aucune écriture possible en production, parce que le
+service réel refuse l'arithmétique entre deux valeurs dans une condition. Le même
+défaut s'est reproduit avec les mots réservés. La correction n'a pas été de
+réparer le code, mais de rendre le double \emph{plus strict} : il rejette
+désormais ce que le service rejette.
+
+\textbf{Deuxième leçon : une compilation réussie ne prouve rien.} Les douze
+diagrammes de conception compilaient sans erreur, et plusieurs étaient faux : un
+code 200 là où le service répond 202, une redirection qui n'existe pas, un
+numéro de version compté deux fois. L'outil de diagrammes écrit ses erreurs dans
+l'image et renvoie un succès. Il a fallu relire chaque source contre le code et
+regarder chaque rendu.
+
+\textbf{Troisième leçon : un test qui ne peut pas échouer ne protège rien.} Un
+seuil de taux d'échec posé sur un parcours qui renvoie légitimement des refus est
+inatteignable par construction. Un outil de vérification qui interroge une route
+dont la réponse n'a pas la forme attendue ne vérifie rien. À chaque fois, la
+question utile n'est pas « le test passe-t-il ? » mais « ai-je déjà vu ce test
+échouer ? ». C'est pour cette raison que les trois détecteurs de ce projet ont
+été éprouvés en provoquant la panne qu'ils prétendent détecter.
+
+\subsection{Perspectives}
+
+Trois évolutions seraient utiles sans être nécessaires.
+
+Le chiffrement du trafic suppose un nom de domaine : c'est la limite la plus
+visible du déploiement actuel, et la plus simple à lever.
+
+La haute disponibilité suppose de traiter l'écrivain unique autrement :
+élection d'un responsable par document, ou externalisation de l'état. C'est un
+chantier d'architecture à part entière, pas un réglage.
+
+Le palier de rédacteurs, enfin, se mesure avant de s'optimiser : le résultat
+réel doit guider la suite, plutôt qu'une optimisation supposée.
+
+\subsection{Mot de la fin}
+
+Le sujet prévenait : une application simple dont chaque choix est compris vaut
+mieux qu'une application complexe qu'on ne sait pas expliquer. Ce dossier a
+suivi cette consigne à la lettre, y compris dans ce qu'elle a de désagréable :
+les limites sont énoncées, les hypothèses sont marquées comme telles, et les
+écarts entre le plan et l'implémentation sont rapportés plutôt que lissés. C'est
+la partie du travail qui a le plus servi, parce que c'est celle qui a révélé les
+défauts que les tests ne voyaient pas.

@@ -1,0 +1,368 @@
+% =============================================================================
+% Partie B — Conception de l'application
+% =============================================================================
+\section{Partie B — Conception de l'application}
+
+\subsection{Cas d'utilisation}
+
+Trois acteurs, onze cas. La lecture utile n'est pas la liste mais les deux
+relations entre cas, qui portent chacune une décision.
+
+\illus{05-cas-utilisation}{0.88}{Cas d'utilisation : rédacteur, visiteur,
+administrateur.}{fig:cas-utilisation}
+
+La première relation paraît anodine et ne l'est pas : « éditer en collaboration »
+\emph{étend} « consulter son crédit », et non l'inverse. Le crédit n'est jamais
+interrogé avant d'écrire. Le retour du serveur — acquittement ou refus — porte
+déjà le crédit restant, et c'est le refus qui met la jauge à jour. Une relation
+d'inclusion aurait décrit un aller-retour qui n'existe pas.
+
+La seconde est une absence qu'il faut assumer : il n'y a \emph{aucune} relation
+entre « réserver un exemplaire » et « s'identifier ». Le visiteur ne s'identifie
+jamais. Ce n'est pas un oubli dans la conception, c'est la décision qui rend le
+parcours visiteur absorbable à 15\,000 clics : pas de session à créer, pas de
+jeton à vérifier, une seule écriture conditionnelle.
+
+\subsection{Diagramme de paquets}
+
+L'organisation du code suit une règle unique : les routes dépendent du domaine,
+le domaine dépend des accès aux services, jamais l'inverse. Un seul paquet parle
+aux services AWS. Le domaine reçoit le stockage, la file et le courriel par
+injection, ce qui permet aux tests de n'appeler aucun service.
+
+\illus{06-packages}{0.80}{Organisation des paquets du backend.}{fig:packages}
+
+Cette organisation n'est pas décorative. C'est elle qui a permis d'écrire
+43 tests sans aucun appel réseau, et c'est elle qui a rendu possible le mode
+local complet, où l'application tourne avec un stockage et une base en mémoire,
+sans compte AWS.
+
+\subsection{Diagramme de classes et modèle de données}
+
+Le modèle tient en dix tables, dont trois portent une règle plutôt qu'une donnée.
+
+\illus{07-classes}{0.86}{Modèle du domaine : dix entités, trois portent une
+règle de concurrence ou de quota.}{fig:classes}
+
+Trois points de conception méritent l'attention, parce qu'ils sont faciles à
+modéliser faux.
+
+Le premier concerne les \textbf{versions}. Le numéro de version \emph{est} le
+numéro de séquence du document au moment de l'enregistrement. Ce n'est pas deux
+champs mais un seul, utilisé deux fois. La conséquence pratique est agréable : la
+numérotation ne peut pas avoir de trous, puisqu'elle suit une séquence déjà
+garantie contiguë par le journal.
+
+Le deuxième concerne l'\textbf{idempotence}. La table des marqueurs porte deux
+clés par mise à jour : l'identifiant d'opération fourni par le client, et
+l'empreinte du contenu. La seconde existe parce qu'un client qui se reconnecte
+peut renvoyer la même modification sous un autre identifiant ; sans elle, un
+renvoi débiterait le crédit deux fois.
+
+Le troisième concerne le \textbf{cache de PDF}. Il porte un compteur de
+tentatives et une date de bail. Sans eux, deux visiteurs arrivant sur un PDF
+absent publieraient deux travaux de génération, et un PDF qui échoue serait
+redemandé indéfiniment.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{5.2cm}p{6.6cm}@{}}
+\toprule
+\textbf{Table} & \textbf{Clé} & \textbf{Rôle de conception} \\
+\midrule
+\code{Documents} & \code{docId} & séquence courante, dernier instantané, longueur du
+  texte \\
+\code{Members} & \code{docId} + \code{email} & appartenance ; index secondaire par
+  adresse pour lister les documents d'un rédacteur \\
+\code{Updates} & \code{docId} + \code{seq} & journal : une entrée par lot, avec
+  l'update Yjs fusionné \\
+\code{Versions} & \code{docId} + \code{n} & instantané consultable ; \code{n} est
+  le numéro de séquence \\
+\code{Links} & \code{token} & quota : \code{remaining} et statut \\
+\code{Tickets} & \code{token} + \code{visitorId} & exemplaire réservé et numéro
+  figé \\
+\code{PdfCache} & \code{docId\#seq} & état de génération, verrou, tentatives \\
+\code{Credits} & \code{email\#jour} & compteur consommé et plafond \\
+\code{Abus} & \code{email\#jour} & refus du jour et terme du blocage \\
+\code{OpIds} & \code{id} & idempotence : identifiant d'opération et empreinte \\
+\bottomrule
+\end{tabular}
+\caption{Modèle de données : dix tables, une clé et un rôle par table.}
+\label{tab:tables}
+\end{table}
+
+\subsection{Diagrammes d'états-transitions}
+
+Trois objets ont un cycle de vie qui porte une règle : le lien, le visiteur, et
+le crédit.
+
+\subsubsection{États du lien}
+
+Un lien naît actif avec son quota, le consomme, et devient épuisé. La transition
+est \emph{monotone} : un lien ne redevient jamais actif. Point important pour la
+lecture du diagramme : l'état épuisé \textbf{n'est pas terminal}. Le lien reste
+consultable indéfiniment et répond « épuisé », ce qui est précisément ce que
+demande C6 — plus aucun travail inutile.
+
+\illus{08a-etats-lien}{0.52}{États d'un lien de téléchargement.}{fig:etats-lien}
+
+\subsubsection{États du visiteur}
+
+Le visiteur suit un chemin qui dépend de deux choses indépendantes : le quota du
+lien et l'état du fichier. C'est ce qui produit trois réponses distinctes là où
+on attendrait une seule : prêt, patienter, épuisé.
+
+\illus{08b-etats-visiteur}{0.62}{États d'un visiteur sur un lien.}{fig:etats-visiteur}
+
+Un point mérite d'être souligné : une fois l'exemplaire réservé, il est
+\emph{acquis}. L'URL présignée expire au bout de soixante secondes, mais le
+visiteur peut en redemander une indéfiniment. Rien de ce qu'il fait ensuite ne
+consomme d'exemplaire supplémentaire.
+
+\subsubsection{États du crédit}
+
+Le crédit a trois états, et le troisième est celui qu'on oublie : un utilisateur
+peut être \emph{bloqué alors qu'il lui reste du crédit}. Le blocage est posé par
+quatre refus dans la journée ; il ne s'efface pas parce que le compteur a été
+remis à zéro.
+
+\illus{08c-etats-credit}{0.62}{États du crédit d'écriture, par jour et par
+adresse.}{fig:etats-credit}
+
+La remise à zéro mérite une explication, parce qu'elle a été source de confusion.
+Ce n'est pas un événement, c'est un changement de clé : le compteur est indexé
+par adresse et par jour. Deux journées différentes sont deux lignes différentes,
+sans qu'aucune écriture ne soit nécessaire.
+
+\hypothese{Le « jour » est celui de Douala, pas le jour UTC. C'est un écart avec
+l'hypothèse initiale du plan. Un utilisateur lisait « recharge à 01:00 » et ne
+comprenait pas : minuit UTC tombe à une heure du matin sur place. Le décalage
+est constant — le Cameroun n'applique pas d'heure d'été — ce qui rend
+l'arithmétique exacte toute l'année. Le terme du blocage est par ailleurs
+\emph{recalculé} à chaque lecture et non relu en base, ce qui a corrigé les
+lignes écrites sous l'ancienne règle sans aucune migration.}
+
+\subsection{Diagrammes de séquence système}
+
+Trois parcours structurent l'application : réserver puis télécharger, éditer,
+restaurer.
+
+\subsubsection{Réserver et télécharger}
+
+\illus{09-ssd-telechargement}{0.80}{Séquence système : réserver puis télécharger
+un exemplaire.}{fig:ssd-telechargement}
+
+Deux précisions que le diagramme ne peut pas montrer. Consulter l'état du lien
+ne consomme rien : c'est une exigence de conception, sans quoi un aperçu de lien
+dans une messagerie ou un robot d'indexation épuiserait le quota. Et
+l'interrogation d'attente porte sur le \emph{fichier}, pas sur l'état du lien :
+l'état du lien ne dit rien de l'avancement de la génération.
+
+\subsubsection{Éditer un document}
+
+\illus{10-ssd-ecriture}{0.72}{Séquence système : éditer un document en
+collaboration.}{fig:ssd-ecriture}
+
+Le comportement en cas de refus mérite d'être explicite, parce qu'il est
+contre-intuitif. À la réception d'un refus de crédit, le client vide sa file
+locale et reconstruit le document depuis le serveur. Ce n'est pas une
+resynchronisation : le refus n'a rien modifié. Le client reconstruit parce que
+les frappes déjà saisies ne seront \emph{jamais} enregistrées, et qu'il faut le
+montrer sans ambiguïté plutôt que laisser un état intermédiaire trompeur.
+
+\subsubsection{Restaurer une version}
+
+\illus{11-ssd-restauration}{0.78}{Séquence système : restaurer une version.}{fig:ssd-restauration}
+
+La restauration est une écriture, pas un retour en arrière. Trois propriétés en
+découlent, et toutes les trois sont voulues : la compatibilité avec le CRDT, donc
+la convergence des autres clients ; la conservation de l'historique, puisque le
+texte écrasé est d'abord sauvegardé comme version ; la gratuité, puisqu'aucun
+caractère n'est facturé et que l'opération franchit un blocage. Cette dernière
+propriété est un choix : sans elle, un utilisateur ayant épuisé son crédit serait
+enfermé sans recours.
+
+\subsection{Conception par contrainte}
+
+Cette section reprend les six contraintes une par une, et indique pour chacune
+\emph{où} elle se tient dans la conception, et \emph{comment} elle est vérifiée.
+C'est la lecture la plus utile du dossier : elle relie chaque exigence à un
+mécanisme et à une preuve.
+
+\subsubsection{C1 — exactement $N$ téléchargements}
+
+\textbf{Où.} Dans une seule transaction conditionnelle sur la table des liens et
+la table des tickets. Le décrément n'a lieu que si le compteur est positif et le
+lien actif ; le ticket n'est créé que si ce visiteur n'en a pas.
+
+\textbf{Ce qui rend la faute possible, et comment elle est évitée.} Quatre
+pièges ont été identifiés :
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item chercher le ticket existant \emph{après} le court-circuit « épuisé » :
+        un visiteur déjà servi recevrait alors un refus. L'ordre est inversé
+        exprès ;
+  \item compter l'exemplaire au téléchargement du fichier et non à la
+        réservation : un visiteur qui recharge la page consommerait deux fois.
+        L'exemplaire est consommé au claim ;
+  \item poser la transition « épuisé » dans la même écriture que le décrément :
+        cinquante claims simultanés tenteraient alors cinquante fois la même
+        transition. Elle est séparée et conditionnelle ;
+  \item croire que la garde en mémoire décide du quota. Elle ne fait
+        qu'\emph{alléger} la base sous le pic ; un visiteur qu'elle écarte reçoit
+        « patienter », jamais « épuisé ».
+\end{enumerate}
+
+\textbf{Preuve.} Onze tests unitaires, dont un test de concurrence : cinquante
+claims simultanés pour vingt exemplaires donnent exactement vingt réservations.
+En charge, 15\,000 visiteurs sur un lien de 500 exemplaires ont produit
+\emph{exactement} 500 réservations, sans une seule erreur serveur.
+
+\subsubsection{C2 — aucune modification acceptée perdue}
+
+\textbf{Où.} Dans l'écrivain unique par document et dans l'ordre
+acquittement-après-écriture. Un lot est écrit en une transaction atomique, puis
+diffusé en un seul message. Un acquittement ne part qu'après validation de la
+transaction.
+
+\textbf{Ce qui rend la faute possible, et comment elle est évitée.} Trois
+risques :
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item acquitter avant d'écrire : une panne entre les deux perd la modification
+        sans que personne ne le sache. L'acquittement est émis après ;
+  \item renvoyer une modification sous un nouvel identifiant après une coupure :
+        elle serait écrite deux fois. Le client renvoie le \emph{même}
+        identifiant, et le serveur déduplique aussi par empreinte du contenu ;
+  \item mesurer la convergence avec un outil qui ne peut pas la mesurer. Un
+        générateur de charge compte des acquittements, il ne fait pas tourner un
+        client CRDT.
+\end{enumerate}
+
+\textbf{Preuve.} Deux preuves distinctes, et c'est le point important. Le
+générateur de charge vérifie que chaque modification émise reçoit son
+acquittement. Un second outil, écrit en Node avec un vrai client CRDT,
+reconstruit le document depuis le journal, vérifie que les numéros de séquence
+sont contigus, et compare deux reconstructions indépendantes par empreinte. Ce
+second outil a été validé dans les deux sens : il conclut à la convergence sur un
+journal sain, et à l'échec dès qu'un numéro manque. Un détecteur qu'on n'a jamais
+vu détecter ne prouve rien.
+
+\subsubsection{C3 — document tel qu'il est à $T_1$}
+
+\textbf{Où.} Au moment du claim : le dernier numéro de séquence réellement écrit
+est figé dans le ticket. Le PDF est ensuite construit depuis le journal jusqu'à
+ce numéro.
+
+\textbf{Ce qui rend la faute possible.} Le PDF pourrait être généré à la demande,
+au moment du téléchargement : deux visiteurs d'une même rafale recevraient alors
+des documents différents, ce qui viole l'exigence de complétude et de cohérence.
+Il pourrait aussi être régénéré à chaque visite, ce qui multiplierait le travail
+par le nombre de visiteurs au lieu du nombre de versions.
+
+\textbf{Preuve.} Le contenu du PDF est déterminé par le numéro figé, et la clé de
+cache inclut ce numéro : une version, un fichier. Un verrou avec bail empêche
+deux générations simultanées pour la même version.
+
+\subsubsection{C4 — jamais plus que son crédit}
+
+\textbf{Où.} Dans un compteur par adresse et par jour, débité dans la même
+transaction que l'écriture au journal. Le comptage est effectué sur le binaire
+Yjs, côté serveur : le client ne déclare pas ce qu'il a écrit.
+
+\textbf{Ce qui rend la faute possible, et comment elle est évitée.}
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item compter côté client : un client modifié déclarerait zéro. Le comptage
+        est serveur, en décodant la mise à jour ;
+  \item ne pas facturer les suppressions : écrire puis effacer serait gratuit, et
+        le plafond contournable en trois gestes. Les suppressions sont facturées ;
+  \item compter par connexion plutôt que par adresse : cinq onglets donneraient
+        cinq quotas. La clé est l'adresse ;
+  \item inscrire le plafond comme condition de la transaction : DynamoDB refuse
+        l'arithmétique entre valeurs. C'est une lecture préalable.
+\end{enumerate}
+
+\textbf{Preuve.} Seize tests unitaires, dont l'acceptation exacte jusqu'au
+plafond et pas un caractère de plus, le partage du compteur entre plusieurs
+connexions, la déduplication par identifiant et par empreinte, et le blocage au
+quatrième refus.
+
+\subsubsection{C5 — 15\,000 clics et 300 rédacteurs}
+
+\textbf{Où.} À quatre endroits complémentaires : le micro-cache du serveur
+frontal, la garde en mémoire sur les réservations, la diffusion par lots, et le
+dimensionnement de l'instance.
+
+\textbf{Ce qui rend la faute possible.} Chaque mécanisme a un mode de défaillance
+propre, et c'est leur combinaison qui tient :
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item sans micro-cache, 15\,000 lectures d'état frappent la base et la font
+        échouer en limitation de débit ;
+  \item sans garde en mémoire, autant d'écritures conditionnelles simultanées
+        produisent le même effet ;
+  \item sans diffusion par lots, un message par frappe multiplie la charge
+        réseau par le nombre de rédacteurs ;
+  \item sans dimensionnement mesuré, une instance trop petite s'effondre
+        précisément pendant le pic qu'on mesure.
+\end{itemize}
+
+\textbf{Preuve.} Le scénario mixte fait tourner visiteurs, rédacteurs et sondes
+d'état en même temps. Les mesures relevées sont la latence de réservation, la
+latence d'état, la latence d'acquittement, et le nombre d'erreurs serveur —
+celui-ci doit rester à zéro, y compris pour le parcours visiteur.
+
+Un piège de mesure mérite d'être signalé : une réponse « épuisé » est un code 410,
+que les outils de charge comptent comme une requête échouée. Un seuil sur ce taux
+d'échec est donc inatteignable par construction — 84\,\% mesurés sans la moindre
+panne. Le critère utile est un compteur dédié aux erreurs serveur.
+
+\subsubsection{C6 — dernier exemplaire : prévenir vite, arrêter le travail}
+
+\textbf{Où.} Dans la monotonie de l'état épuisé et dans son cache. Une fois le
+lien épuisé, la réponse est immédiate, ne touche pas la base, et le serveur
+frontal la conserve longuement. Le créateur du lien reçoit un courriel unique.
+
+\textbf{Ce qui rend la faute possible.} Deux choses : recalculer l'état à chaque
+visite, ce qui revient à travailler pour ne rien dire ; et envoyer le courriel
+plusieurs fois, une par visiteur qui constate l'épuisement. Le courriel est donc
+protégé par un verrou conditionnel : seul le claim qui pose la transition
+déclenche l'envoi.
+
+\textbf{Preuve.} L'état épuisé est posé une seule fois, et la notification est
+idempotente : neuf tests unitaires couvrent l'envoi au seul dernier exemplaire,
+l'absence de second envoi, la panne du service de courriel sans impact pour le
+visiteur, et le relâchement du verrou en cas d'échec — mieux vaut un doublon rare
+qu'un créateur jamais prévenu.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{0.7cm}p{5.6cm}p{8.7cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Mécanisme} & \textbf{Preuve exécutable} \\
+\midrule
+C1 & transaction conditionnelle, ordre des vérifications, transition séparée
+   & 11 tests dont concurrence 50/20 ; en charge, 500 réservations exactes \\
+\addlinespace
+C2 & écrivain unique, acquittement après écriture, déduplication par empreinte
+   & acquittements sous charge ; contiguïté du journal et double reconstruction \\
+\addlinespace
+C3 & numéro figé au claim, une génération par version, verrou avec bail
+   & clé de cache par version ; un seul travail par version \\
+\addlinespace
+C4 & comptage serveur sur le binaire, suppressions facturées, clé par adresse
+   & 16 tests : plafond exact, multi-connexions, blocage au 4\up{e} refus \\
+\addlinespace
+C5 & micro-cache, garde mémoire, diffusion par lots, dimensionnement mesuré
+   & scénario mixte : visiteurs, rédacteurs et sondes simultanés \\
+\addlinespace
+C6 & état épuisé monotone et mis en cache, notification idempotente
+   & 9 tests : envoi unique, panne sans impact, verrou relâché \\
+\bottomrule
+\end{tabular}
+\caption{Synthèse : une contrainte, un mécanisme, une preuve.}
+\label{tab:synthese-contraintes}
+\end{table}

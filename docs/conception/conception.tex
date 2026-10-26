@@ -1,0 +1,170 @@
+% =============================================================================
+% Dossier de conception — Éditeur de documents partagé
+%
+% Structure : un fichier maître (celui-ci) et quatre parties incluses :
+%   partie-0-introduction.tex
+%   partie-a-architecture.tex
+%   partie-b-conception.tex
+%   partie-c-conclusion.tex
+%
+% Compilation :
+%   pdflatex conception.tex && pdflatex conception.tex
+% (deux passes : la première résout les références et la table des matières)
+%
+% Les figures sont lues dans ../diagrammes-conception/png/.
+% =============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\usepackage[a4paper,margin=2.4cm,headheight=15pt]{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage[colorlinks=true,linkcolor=black,urlcolor=blue!60!black,citecolor=black]{hyperref}
+\usepackage{url}
+
+% --- Palette sobre, lisible en noir et blanc --------------------------------
+\definecolor{accent}{HTML}{1B3A6B}
+\definecolor{attenue}{HTML}{555555}
+\definecolor{encadre}{HTML}{F7FBFF}
+
+% --- Titres -----------------------------------------------------------------
+\titleformat{\section}{\Large\bfseries\color{accent}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\color{accent}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.5em}{}
+\titlespacing*{\section}{0pt}{2.2ex plus 1ex}{1.2ex}
+\titlespacing*{\subsection}{0pt}{1.8ex plus 1ex}{1ex}
+
+% --- En-têtes ---------------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{attenue}Éditeur de documents partagé}
+\fancyhead[R]{\small\color{attenue}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% --- Légendes ---------------------------------------------------------------
+\captionsetup{
+  font=small,
+  labelfont=bf,
+  justification=raggedright,
+  singlelinecheck=false,
+  skip=6pt
+}
+
+% --- Raccourcis -------------------------------------------------------------
+% Insère une figure depuis le dossier des rendus PlantUML.
+%   \illus{02-deploiement}{0.95}{Titre de la légende}{label}
+%
+% La commande ne s'appelle pas \figure : `babel-french` définit déjà ce nom
+% (pour franciser les légendes), et la redéfinir provoque un arrêt net.
+\newcommand{\illus}[4]{%
+  \begin{figure}[H]
+    \centering
+    \includegraphics[width=#2\linewidth]{../diagrammes-conception/png/#1.png}
+    \caption{#3}
+    \label{#4}
+  \end{figure}%
+}
+
+% Identifiants techniques : chasse fixe, taille courante.
+\newcommand{\code}[1]{\texttt{#1}}
+
+% Encadré « hypothèse » : ce qui relève d'une interprétation, et non du sujet.
+\newcommand{\hypothese}[1]{%
+  \par\medskip
+  \noindent\colorbox{encadre}{%
+    \begin{minipage}{\dimexpr\linewidth-2\fboxsep}
+      \small\textbf{Hypothèse d'interprétation.} #1
+    \end{minipage}%
+  }
+  \par\medskip
+}
+
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{0pt}
+
+% Les tableaux sont larges : l'intercolonne par défaut (6 pt de chaque côté de
+% chaque colonne) fait déborder les tableaux à trois colonnes de 5 mm dans la
+% marge. On la ramène à 4 pt, et les largeurs de colonnes sont exprimées en
+% fraction de \linewidth plutôt qu'en centimètres : le tableau reste juste même
+% si les marges changent.
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+
+\hypersetup{
+  pdftitle={Dossier de conception — Éditeur de documents partagé},
+  pdfauthor={Djusse Tameno Christian},
+  pdfsubject={Projet Cloud — ENSPY}
+}
+
+% =============================================================================
+\begin{document}
+
+% --- Page de titre ----------------------------------------------------------
+\begin{titlepage}
+  \centering
+  \vspace*{2.5cm}
+
+  {\color{accent}\rule{\linewidth}{1.2pt}}\\[0.6cm]
+  {\Huge\bfseries Éditeur de documents partagé\par}
+  \vspace{0.4cm}
+  {\Large Dossier de conception\par}
+  \vspace{0.3cm}
+  {\color{accent}\rule{\linewidth}{1.2pt}}\\[1.2cm]
+
+  {\large Écriture collaborative en temps réel\\
+  et distribution de documents à quota strict\\[0.3cm]
+  sur une infrastructure AWS\par}
+
+  \vspace{2.2cm}
+
+  % La colonne de droite est une colonne de **paragraphe** : dans une colonne
+  % `r`, ni `\url` ni `\texttt` ne peuvent se couper, et l'adresse du dépôt
+  % débordait de la marge de 7,5 pt. Une largeur fixe autorise la césure.
+  \begin{tabular}{@{}rl@{}}
+    \textbf{Auteur} & Djusse Tameno Christian \\[0.2cm]
+    \textbf{Filière} & 5\textsuperscript{e} année Génie informatique, ENSPY \\[0.2cm]
+    \textbf{Cours} & Cloud — projet d'évaluation individuel \\[0.2cm]
+    \textbf{Région AWS} & \code{eu-north-1} (Stockholm) \\[0.2cm]
+    \textbf{Dépôt} & \href{https://github.com/Djusse/Editeur_Partag-}%
+                       {\texttt{github.com/Djusse/}}\texttt{/}%
+                       \href{https://github.com/Djusse/Editeur_Partag-}%
+                       {\texttt{Editeur\_Partag-}} \\
+  \end{tabular}
+
+  \vfill
+
+  {\small\color{attenue}
+    Ce dossier décrit la conception telle qu'elle est \emph{implémentée}, et non
+    telle qu'elle avait été prévue. Les écarts sont signalés, avec leur raison.\\
+    Chaque affirmation sur les contraintes renvoie à un test ou à un scénario
+    de charge exécutable.\par}
+\end{titlepage}
+
+% --- Tables -----------------------------------------------------------------
+\tableofcontents
+\newpage
+
+\listoffigures
+\listoftables
+\newpage
+
+% --- Parties ----------------------------------------------------------------
+\input{partie-0-introduction}
+\input{partie-a-architecture}
+\input{partie-b-conception}
+\input{partie-c-conclusion}
+
+\end{document}

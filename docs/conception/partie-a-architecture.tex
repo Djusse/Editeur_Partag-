@@ -1,0 +1,327 @@
+% =============================================================================
+% Partie A — Architecture globale
+% =============================================================================
+\section{Partie A — Architecture globale}
+
+\subsection{Diagramme de contexte}
+
+Le système a trois catégories d'utilisateurs, qui n'accèdent pas au service de la
+même façon.
+
+Le \textbf{rédacteur} s'identifie par un nom et une adresse électronique, sans
+mot de passe, et reçoit un jeton de session. Il crée des documents, les partage,
+les versionne et fabrique des liens de téléchargement.
+
+Le \textbf{visiteur} est le cas intéressant : il ne s'identifie \emph{jamais}.
+Le jeton du lien qu'il détient \emph{est} sa capacité d'accès. Cette décision a
+une conséquence architecturale : le parcours visiteur est exposé à la racine
+(\code{/d/\{token\}/\dots}), en dehors du préfixe \code{/api} qui regroupe les
+routes authentifiées. La confondre avec les autres routes produit un échec
+silencieux : la requête aboutit sur le fichier statique du front et renvoie un
+code 200 avec du HTML.
+
+L'\textbf{administrateur} consulte l'état du système avec une clé dédiée, dans
+un en-tête, et non avec le jeton de session : c'est une capacité
+d'exploitation, pas une identité applicative.
+
+Deux éléments extérieurs complètent le tableau. \textbf{Amazon SES} envoie un
+unique courriel lorsque le dernier exemplaire d'un lien est distribué.
+\textbf{Le stockage objet} sert les fichiers PDF : le système ne les transporte
+jamais, il présigne une adresse et laisse S3 répondre. C'est ce qui permet à
+500 téléchargements de ne pas passer par l'instance applicative.
+
+\illus{01-contexte}{0.82}{Diagramme de contexte : trois acteurs, un système,
+deux services extérieurs.}{fig:contexte}
+
+Un point de conception mérite d'être explicité ici. Le destinataire du courriel
+de fin de quota n'est pas un acteur du système : il ne dispose d'aucune
+interface, ne peut rien demander et ne reçoit rien d'autre. Le représenter comme
+un acteur donnerait une idée fausse du périmètre.
+
+\subsection{Architecture de déploiement AWS}
+
+Tout le trafic entre par une \textbf{adresse IP élastique}, attachée à une
+instance unique. Cette adresse est indispensable : une adresse publique
+ordinaire change à chaque arrêt puis démarrage de l'instance, ce qui rendrait
+l'évaluation impossible avec une URL stable.
+
+Sur l'instance cohabitent trois rôles, séparés par des processus distincts et
+non par des machines :
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{nginx} sert le front statique, met en micro-cache l'état des
+        liens, et relaie vers Node les préfixes \code{/api}, \code{/d} et
+        \code{/ws} ;
+  \item \textbf{le processus applicatif} tient l'état Yjs des documents ouverts
+        en mémoire et sert l'API REST et le WebSocket ;
+  \item \textbf{le processus de travail} consomme la file de génération de PDF,
+        séparément pour qu'un document lourd ne bloque pas les écritures.
+\end{itemize}
+
+\illus{02-deploiement}{0.95}{Architecture de déploiement : une région, une
+instance applicative, quatre services gérés.}{fig:deploiement}
+
+Le choix du type d'instance est une décision de dimensionnement, pas de confort.
+Le type retenu est \code{m7i-flex.large} : deux processeurs virtuels et huit
+gigaoctets de mémoire. Deux raisons, dans cet ordre :
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item c'est le seul type à la fois \textbf{éligible à l'offre gratuite} et doté
+        de la mémoire nécessaire pour tenir des milliers de connexions
+        simultanées. \code{t3.large} a été essayé d'abord : la création de pile
+        échoue avec « not eligible for Free Tier » ;
+  \item les instances de la famille \code{t} consomment des crédits de processeur
+        et se retrouvent bridées quand ces crédits s'épuisent. En mode
+        \emph{Standard}, une instance bridée s'effondre précisément pendant le
+        pic qu'on cherche à mesurer. Le mode \emph{illimité} évite le
+        bridage mais rend la facture imprévisible.
+\end{enumerate}
+
+\subsection{Décisions d'architecture et alternatives écartées}
+
+Chaque décision est consignée dans un document d'architecture séparé
+(\code{docs/adr/}), avec ses alternatives. Le tableau ci-dessous en donne la
+synthèse et, surtout, ce qui a été \emph{écarté} : une décision sans alternative
+n'est pas une décision.
+
+\begin{table}[H]
+\centering
+\small
+% Largeur utile = 21 cm − 2×2,4 cm de marge − 4×4 pt d'intercolonne = 15,64 cm.
+% Le total ci-dessous (15,5 cm) tient avec une marge ; à 15,9 cm il débordait.
+\begin{tabular}{@{}p{3.0cm}p{6.2cm}p{6.3cm}@{}}
+\toprule
+\textbf{Choix} & \textbf{Retenu, et pourquoi} & \textbf{Écarté, et pourquoi} \\
+\midrule
+Calcul
+& \textbf{Instance EC2 unique} : le WebSocket et l'état en mémoire sont
+  naturels, et un seul écrivain par document rend C2 simple à tenir
+& \textbf{Lambda + API Gateway} : la limite de 400 exécutions simultanées du
+  compte est trop serrée pour 15\,000 clics, et le WebSocket persistant
+  obligerait à externaliser tout l'état \\
+\addlinespace
+Convergence
+& \textbf{CRDT Yjs} : les modifications concurrentes fusionnent sans verrou, et
+  un client hors ligne se réconcilie à la reconnexion
+& \textbf{Verrou exclusif} : un seul rédacteur à la fois, ce que le sujet
+  interdit ; \textbf{transformation opérationnelle} : juste, mais coûteux à
+  écrire et à prouver dans le temps d'un projet \\
+\addlinespace
+Écriture
+& \textbf{Écrivain unique et lots de 250\,ms} : une transaction par lot au lieu
+  d'une par frappe
+& \textbf{Écriture par frappe} : une transaction DynamoDB par caractère épuise
+  le débit disponible et multiplie la facture \\
+\addlinespace
+Persistance
+& \textbf{DynamoDB} : transactions conditionnelles, ce qui donne C1 exactement,
+  et aucune administration de serveur
+& \textbf{PostgreSQL} : les transactions seraient plus expressives, mais
+  imposent un serveur à administrer, sauvegarder et dimensionner \\
+\addlinespace
+Fichiers
+& \textbf{S3 privé + URL présignée de 60 s} : le fichier ne traverse pas
+  l'instance
+& \textbf{Flux servi par Node} : 500 PDF simultanés saturent la bande passante
+  de l'instance et bloquent l'édition \\
+\addlinespace
+PDF
+& \textbf{Génération asynchrone par file} : le visiteur reçoit « patienter » et
+  revient ; un seul travail par version grâce à un verrou
+& \textbf{Génération dans la requête} : une requête de plusieurs secondes sous
+  15\,000 clics ferait tomber l'instance \\
+\addlinespace
+Pic visiteur
+& \textbf{Micro-cache nginx sur l'état du lien} : une seconde de cache absorbe
+  15\,000 lectures sans toucher la base
+& \textbf{Interrogation directe de DynamoDB} : 15\,000 lectures par seconde la
+  font échouer en limitation de débit \\
+\addlinespace
+Front
+& \textbf{Export statique servi par nginx} : quelques fichiers, aucun serveur
+  applicatif pour le rendu
+& \textbf{Rendu côté serveur Next.js} : un second processus Node à
+  dimensionner, sans bénéfice ici \\
+\bottomrule
+\end{tabular}
+\caption{Décisions d'architecture et alternatives écartées.}
+\label{tab:adr}
+\end{table}
+
+\subsection{Flux internes}
+
+Deux flux méritent une figure : celui qui tient la contrainte C1, et celui qui
+tient C2 avec C4. Ce sont les deux contraintes éliminatoires.
+
+\subsubsection{Réservation d'un exemplaire}
+
+L'ordre des vérifications est imposé par le sujet et a des conséquences
+observables. Avant de décider que le lien est épuisé, le serveur cherche
+\emph{d'abord} si ce visiteur possède déjà un ticket. Sans cette précaution, un
+visiteur déjà servi recevrait « épuisé » après l'épuisement du lien — il perdrait
+un exemplaire qu'il avait légitimement obtenu.
+
+Ensuite, la réservation est une transaction conditionnelle : décrémenter
+\code{remaining} \emph{si} il est supérieur à zéro et si le lien est actif, et
+créer le ticket \emph{si} ce visiteur n'en a pas. La transition vers l'état
+épuisé est une écriture séparée, elle aussi conditionnelle : seul le claim qui
+amène réellement le compteur à zéro peut la poser. C'est cette séparation qui
+rend l'épuisement idempotent lorsque cinquante visiteurs arrivent ensemble.
+
+\illus{03-flux-reservation}{0.92}{Flux de réservation : transaction
+conditionnelle, puis génération asynchrone du PDF.}{fig:flux-reservation}
+
+Le numéro de séquence est figé au moment du claim, avant la transaction. Tous
+les visiteurs d'une même rafale partagent donc le même fichier, et une
+modification ultérieure du document ne change pas leur exemplaire.
+
+\subsubsection{Écriture groupée}
+
+Le flux d'écriture porte deux contraintes à la fois : aucune modification perdue
+(C2) et aucun dépassement de crédit (C4). Les deux se règlent au même endroit,
+parce qu'elles portent sur la même transaction.
+
+\illus{04-flux-ecriture}{0.92}{Flux d'écriture : un lot par tick de 250\,ms, une
+transaction atomique, un seul message diffusé.}{fig:flux-ecriture}
+
+Un point de conception a coûté cher et mérite d'être rapporté. Le contrôle du
+crédit ne peut pas être une condition de la transaction : DynamoDB refuse
+l'arithmétique entre deux valeurs dans une expression de condition. La forme
+\code{used + :chars <= :limit} est rejetée par le service. Le contrôle se fait
+donc par une lecture préalable, hors transaction. Le risque de course est borné
+par l'écrivain unique ; la transaction reste la garde d'atomicité pour la
+séquence, le journal et les marqueurs d'idempotence.
+
+\subsection{Sécurité et bonnes pratiques}
+
+Les mesures ci-dessous répondent directement aux bonnes pratiques du cours.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{11cm}@{}}
+\toprule
+\textbf{Point} & \textbf{Mise en œuvre} \\
+\midrule
+Aucune clé d'accès dans le code
+& le poste utilise une connexion fédérée ; le serveur utilise le rôle de
+  l'instance, donc des identifiants temporaires renouvelés \\
+\addlinespace
+Aucun secret dans les données de démarrage
+& les données de démarrage d'une instance sont lisibles via le service de
+  métadonnées. Les deux secrets (signature des sessions, clé d'administration)
+  sont dans le magasin de paramètres, créés une fois et conservés \\
+\addlinespace
+Moindre privilège
+& le rôle de l'instance n'accède qu'aux tables nommées, au préfixe de stockage,
+  à la file, et à l'envoi de courriel filtré sur l'expéditeur vérifié \\
+\addlinespace
+Métadonnées d'instance
+& jeton obligatoire : sans session, les données de démarrage ne sont pas
+  lisibles \\
+\addlinespace
+Stockage objet
+& accès public bloqué, chiffrement au repos, versionnage, règle refusant le
+  trafic non chiffré, URL présignées de 60 secondes \\
+\addlinespace
+Pare-feu
+& port 80 ouvert ; port 22 \emph{fermé} par défaut, accès par session
+  sécurisée. Une valeur permissive est explicitement traitée comme une
+  fermeture, et non comme une ouverture \\
+\addlinespace
+Jeton WebSocket
+& le navigateur ne permet pas d'en-tête d'authentification au handshake : un
+  ticket à usage unique de 60 secondes évite d'exposer le jeton de session dans
+  l'URL, donc dans les journaux du serveur frontal \\
+\addlinespace
+Validation
+& adresse électronique, longueur du titre, longueur de l'identifiant
+  d'opération, plafond de 64 Kio par mise à jour, corps de requête limité \\
+\bottomrule
+\end{tabular}
+\caption{Mesures de sécurité et bonne pratique correspondante.}
+\label{tab:securite}
+\end{table}
+
+\subsection{Infrastructure, déploiement et suppression}
+
+L'infrastructure entière est décrite dans un seul modèle de pile, ce qui rend le
+déploiement reproductible : une instance, une adresse élastique, un groupe de
+sécurité, dix tables, un compartiment de stockage, une file avec file de
+lettres mortes, un rôle d'instance et un groupe de journaux.
+
+Le script de déploiement enchaîne six étapes, et chacune échoue franchement :
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item vérification de l'identité, de la région, et de l'\emph{éligibilité} du
+        type d'instance — interrogée auprès du service, et non tenue dans une
+        liste à la main ;
+  \item création éventuelle de la paire de clés, puis des deux secrets ;
+  \item déploiement de la pile, avec suppression préalable si elle se trouve
+        dans un état d'échec antérieur, qui interdit toute mise à jour ;
+  \item construction du backend puis du front, en libérant les dépendances au
+        fur et à mesure pour tenir dans l'espace disque disponible ;
+  \item envoi de l'archive vers le stockage, puis installation sur l'instance
+        par commande à distance ;
+  \item vérification que le service répond, que le parcours visiteur est
+        relayé, et que le micro-cache est actif.
+\end{enumerate}
+
+La suppression mérite un script dédié, parce qu'une simple suppression de pile
+échoue : le compartiment est versionné, donc il faut purger les objets
+\emph{et} leurs versions ; les paramètres et la paire de clés vivent hors de la
+pile et survivent à sa suppression. Le script purge, supprime, puis \emph{vérifie}
+huit familles de ressources, en distinguant trois états : absent, restant, et
+\emph{inconnu} — une commande de contrôle qui échoue ne doit jamais être comptée
+comme « rien ne reste ».
+
+\subsection{Limites et risques}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}p{11.2cm}@{}}
+\toprule
+\textbf{Limite} & \textbf{Conséquence, et raison du choix} \\
+\midrule
+Trafic sans chiffrement
+& les jetons et les adresses circulent en clair. Un certificat exige un nom de
+  domaine, absent du sujet. Limite assumée, documentée, et non dissimulée \\
+\addlinespace
+Instance unique
+& aucune haute disponibilité : un arrêt de la machine interrompt le service.
+  C'est le prix d'un écrivain unique par document, qui simplifie C2. Le
+  redémarrage automatique ramène le processus, pas la machine \\
+\addlinespace
+Identité sans mot de passe
+& quiconque connaît une adresse peut écrire en son nom. Le sujet l'autorise ;
+  c'est aussi ce qui rend l'identité du visiteur inutile \\
+\addlinespace
+Jeton non révocable
+& un jeton volé reste valable jusqu'à son expiration. Sans liste de révocation,
+  il n'y a pas de contournement autre que le renouvellement \\
+\addlinespace
+Rattrapage plafonné
+& la lecture du journal s'arrête à un nombre d'entrées fixé, sans signaler la
+  troncature : un client doit boucler. Un appel unique sur un document ancien
+  donnerait un journal partiel, donc une vérification de convergence fausse \\
+\addlinespace
+Restauration non facturée
+& une restauration de version est gratuite et franchit un blocage. C'est un
+  recours voulu, mais le compteur ne reflète donc pas tout le travail effectué \\
+\addlinespace
+Bac à sable du courriel
+& tant que l'accès de production n'est pas accordé, seule l'adresse vérifiée
+  reçoit la notification \\
+\bottomrule
+\end{tabular}
+\caption{Limites connues et risques associés.}
+\label{tab:limites}
+\end{table}
+
+\hypothese{L'absence de haute disponibilité est présentée comme une limite
+assumée, non comme un oubli. Le cours demande explicitement de savoir et de dire
+qu'une instance unique n'est pas disponible. Les pistes d'évolution — plusieurs
+instances avec élection d'un écrivain par document, ou externalisation de l'état
+— sont plus coûteuses que le bénéfice attendu pour un projet évalué sur la
+justification des choix.}

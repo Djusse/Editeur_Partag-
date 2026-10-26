@@ -1,0 +1,75 @@
+@startuml
+' Diagramme de paquets — version simple.
+' Un paquet par responsabilité, et la dépendance qui compte : les routes
+' dépendent du domaine, le domaine dépend des accès AWS, jamais l'inverse.
+' Le paquet `local` (serveur complet sans AWS) est décrit dans le texte plutôt
+' que dessiné : ses deux arcs traversaient toute la figure.
+
+skinparam {
+  dpi 150
+  defaultFontName Arial
+  shadowing false
+  roundcorner 4
+  ArrowColor #333333
+  BackgroundColor white
+  packageBorderColor #333333
+  packageBackgroundColor #F7FBFF
+  componentBorderColor #333333
+  componentBackgroundColor #E8F0FE
+  nodesep 30
+  ranksep 45
+}
+
+title Organisation des paquets (backend)
+
+top to bottom direction
+
+package "server" {
+  component "main\nFastify + ws" as MAIN
+  component "app\nassemblage" as APP
+  component "worker\nconsommation SQS" as WORKER
+}
+
+package "routes" {
+  component "session · documents\nws-ticket" as R1
+  component "visitor\n/d/{token}/…" as R2
+  component "admin\n/api/admin" as R3
+}
+
+package "realtime" {
+  component "protocol\nmessages ws" as RT1
+  component "hub\nécrivain unique" as RT2
+  component "manager\ndocuments ouverts" as RT3
+  component "tickets\nusage unique" as RT4
+}
+
+package "lib — domaine" {
+  component "documents · links\ncredits · versions" as L1
+  component "yjs-update\ncomptage crédit" as L2
+}
+
+package "lib — accès AWS" {
+  component "db · s3 · queue\nemail · secrets" as A1
+}
+
+package "lib — socle" {
+  component "config · ids\nerrors · jwt · base64" as S1
+}
+
+MAIN --> APP
+APP --> R1
+APP --> R2
+APP --> R3
+R1 --> RT2
+R2 --> L1
+R3 --> RT3
+RT2 --> L1
+RT2 --> L2
+L1 --> A1
+L2 --> A1
+WORKER --> A1
+WORKER --> L2
+L1 --> S1
+A1 --> S1
+
+@enduml

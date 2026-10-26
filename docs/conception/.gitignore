@@ -1,0 +1,12 @@
+# Fichiers intermédiaires de LaTeX.
+# Le PDF produit, lui, est versionné : il permet de relire le dossier sans
+# installer une distribution LaTeX.
+*.aux
+*.log
+*.toc
+*.lof
+*.lot
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
