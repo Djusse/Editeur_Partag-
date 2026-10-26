@@ -331,15 +331,63 @@ template CloudFormation .. YAML valide, 20 ressources
 
 ## Coûts
 
-À compléter après les tests de charge, à partir de Cost Explorer **et** des métriques
-d'usage (la facturation a ~24 h de retard).
+Relevé le 26/10 à 05h20 UTC, sur la période du 24 au 27 octobre.
 
-| Poste | Mesure | Estimation |
-| - | - | - |
-| EC2 t3.large (heures) | à mesurer | — |
-| Elastic IP (IPv4 publique) | à mesurer | — |
-| DynamoDB (WRU/LRU à la demande) | à mesurer | — |
-| S3 (stockage et requêtes) | à mesurer | — |
-| SQS (messages PDF) | à mesurer | — |
-| SES (e-mails) | quelques unités | négligeable |
-| Instance de charge k6 | à mesurer | — |
+### Ce qui est facturé
+
+**Total : 0,00 USD.** Tous les services consommés restent dans le quota gratuit du
+compte. Le seul montant non nul est négatif (`−0,0000012 USD`), ce qui correspond à
+un crédit ou un arrondi de facturation, pas à une dépense.
+
+| Service | Montant |
+| - | - |
+| Amazon Elastic Compute Cloud — Compute | 0,00 USD |
+| Amazon DynamoDB | 0,00 USD |
+| Amazon Simple Storage Service | 0,00 USD |
+| Amazon Simple Queue Service | 0,00 USD |
+| Amazon Simple Email Service | 0,00 USD |
+| Amazon Virtual Private Cloud | 0,00 USD |
+| AWS CloudFormation · CloudWatch · KMS | 0,00 USD |
+| AWS Data Transfer · EC2 — Other | −0,0000012 USD |
+| **Total** | **0,00 USD** |
+
+Le compte est donc resté **entièrement dans le Free Tier** pendant toute la
+campagne, y compris les six heures d'instance applicative, la VM de charge, les
+trente déploiements et les tests de charge à 15 000 visiteurs.
+
+### Le choix du type d'instance, confirmé par la mesure
+
+C'est le résultat qui valide rétrospectivement la décision d'architecture. Le type
+`t3.large` avait dû être abandonné dès le premier déploiement : la création de pile
+échouait avec « The specified instance type is not eligible for Free Tier ». Le
+`m7i-flex.large` retenu à la place (2 vCPU / 8 Gio) est éligible, et c'est ce qui
+explique un total à zéro — une seule instance hors quota aurait fait basculer toute
+la facture.
+
+### Ce que cette mesure ne dit pas
+
+**Trou de mesure de 36 heures.** Cost Explorer renvoie « Estimated: true » et laisse
+les journées du 25 et du 26 **vides** : la facturation a environ 24 h de retard, donc
+la campagne de la nuit du 26 n'y figure pas encore. Un total à 0,00 USD signifie
+« rien de facturé selon les données disponibles », et non « rien consommé ».
+
+**La commande par balise ne mesure rien.** Le groupement
+`Type=TAG,Key=Projet` renvoie une clé vide (`Projet$`) et un montant nul. AWS ne
+rétro-applique pas les balises : les ressources déjà détruites lors des
+redéploiements successifs ne sont pas comptabilisées, et un tag n'apparaît qu'une
+fois traité. L'analyse par balise n'est donc fiable que pour les ressources
+**encore existantes**.
+
+### Coût résiduel, à connaître avant la soutenance
+
+Une instance **arrêtée** ne coûte plus de calcul, mais elle ne coûte pas zéro :
+le disque EBS et l'adresse IPv4 publique restent facturés, et une Elastic IP est
+due même détachée. Pour arrêter toute dépense, seule la suppression complète le
+fait :
+
+```bash
+./scripts/destroy.sh --yes
+```
+
+Si l'application doit rester accessible au jury, laisser la pile en place coûte
+quelques dollars par mois — l'essentiel étant le stockage et l'adresse.
