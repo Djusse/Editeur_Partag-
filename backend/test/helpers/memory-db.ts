@@ -180,6 +180,27 @@ export class MemoryDatabase implements Database {
    * C'est exactement la garantie dont dépendent C1 et C4.
    */
   async transact(entries: TransactEntry[]): Promise<{ ok: true } | { ok: false; reasons: Array<{ code?: string }> }> {
+    /**
+     * Plafond dur de DynamoDB : **100 éléments par transaction**.
+     *
+     * Ce double ne l'appliquait pas, et c'est la quatrième fois qu'il se révèle
+     * plus permissif que le vrai service — après l'arithmétique entre valeurs,
+     * les mots réservés et l'absence de limite de lot.
+     *
+     * Défaut observé en production le 26/10 : 50 rédacteurs produisent ~50
+     * updates par tick, chaque update engendre 2 items (`OP#` et `HASH#`), la
+     * transaction dépassait 100 items, échouait à chaque tick, et le lot remis
+     * en file grossissait — 227 884 messages d'erreur en 45 s, 0 acquittement.
+     *
+     * On lève donc comme le vrai service, pour que le hub soit obligé de borner.
+     */
+    if (entries.length > 100) {
+      throw new Error(
+        `TransactionWriteItems: Member must have length less than or equal to 100 ` +
+          `(reçu ${entries.length})`,
+      );
+    }
+
     const reasons: Array<{ code?: string }> = [];
 
     for (const entry of entries) {

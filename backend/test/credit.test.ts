@@ -423,4 +423,67 @@ describe('C4 — crédit d’écriture', () => {
     expect((await getCreditState('un@exemple.cm')).used).toBe(9);
     expect((await getCreditState('deux@exemple.cm')).used).toBe(0);
   });
+
+  /**
+   * 50 rédacteurs dans le **même** lot : la transaction doit rester sous la
+   * limite de 100 éléments imposée par DynamoDB.
+   *
+   * Défaut observé en production le 26/10 : chaque update produit 2 items
+   * (`OP#` et `HASH#`), auxquels s'ajoutent le document, l'entrée de journal et
+   * la ligne de crédit. 50 updates = 106 items, donc rejet à chaque tick, lot
+   * remis en file, file qui grossit, 227 884 messages d'erreur en 45 s et zéro
+   * acquittement.
+   *
+   * Le double en mémoire refuse désormais les transactions de plus de 100
+   * éléments, comme le vrai service : ce test échouerait si le hub ne bornait
+   * pas son lot.
+   */
+  it('borne le lot à la limite de 100 éléments de DynamoDB', async () => {
+    harness = setupHarness({ creditPerDay: 100000 });
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
+
+    const doc = await manager.load('doc_test');
+
+    // 50 clients distincts, 50 contenus distincts : exactement le cas réel.
+    const clients: Client[] = [];
+    const mises: IncomingUpdate[] = [];
+    for (let index = 0; index < 50; index++) {
+      const client = makeClient(`redacteur${index}@exemple.cm`);
+      clients.push(client);
+      const payload = updateOf(`t${index}`);
+      mises.push({
+        client,
+        opId: `op_${index}`,
+        payload,
+        chars: String(`t${index}`).length,
+        inserted: String(`t${index}`).length,
+        deleted: 0,
+        hash: hashOf(payload),
+      });
+    }
+
+    // Ne doit pas lever : la limite est respectée par construction.
+    await expect(commitBatch(doc, mises)).resolves.toBeDefined();
+
+    // Le lot a été scindé, mais tout finit par être écrit par les ticks suivants.
+    await doc.flush();
+    for (let essai = 0; essai < 60 && doc.pendingCount() > 0; essai++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await doc.flush();
+    }
+
+    // 50 updates distincts → 50 entrées de journal au total.
+    expect(doc.pendingCount()).toBe(0);
+    expect(doc.seq).toBeGreaterThan(1);
+    expect(doc.seq).toBeLessThan(50);
+
+    // Et chacun des 50 auteurs a bien été débité une fois.
+    for (let index = 0; index < 50; index += 3) {
+      const credit = await getCreditState(`redacteur${index}@exemple.cm`);
+      expect(credit.used).toBeGreaterThan(0);
+    }
+  });
 });

@@ -55,6 +55,12 @@ export interface IncomingUpdate {
   inserted: number;
   deleted: number;
   hash: string;
+  /**
+   * `true` quand l'échec d'écriture de cet update a déjà été annoncé à son
+   * auteur. Sans ce drapeau, un lot remis en file à chaque tick réémet une
+   * erreur par update et par tick : 227 884 messages en 45 s mesurés le 26/10.
+   */
+  notified?: boolean;
 }
 
 export function hashOf(payload: Uint8Array): string {
@@ -74,6 +80,8 @@ export class DocumentState {
   private queue: IncomingUpdate[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private committing = false;
+  /** Échecs consécutifs du tick : sert à espacer le diagnostic dans les journaux. */
+  private consecutiveFailures = 0;
   private lastSnapshotAt = Date.now();
   private entriesSinceSnapshot = 0;
 
@@ -126,14 +134,24 @@ export class DocumentState {
     const batch = this.queue.splice(0, this.queue.length);
     try {
       await commitBatch(this, batch);
+      this.consecutiveFailures = 0;
     } catch (error) {
-      console.error('Échec du tick d\'écriture', { docId: this.docId, error });
-      // Sans ce message, le client affichait « Connecté » et « N modifications
-      // en attente » indéfiniment : le hub réessayait toutes les 250 ms sans
-      // jamais rien dire. On prévient l'utilisateur, et on garde le lot en file :
-      // la cause peut être transitoire (throttling, coupure réseau).
+      this.consecutiveFailures += 1;
       const message = error instanceof Error ? error.message : 'Erreur inconnue';
+
+      // Sans message, le client affichait « Connecté » et « N modifications en
+      // attente » indéfiniment : le hub réessayait sans jamais rien dire.
+      //
+      // Mais prévenir **à chaque tick** pour **tout** le lot transforme une
+      // erreur persistante en tempête. Mesure du 26/10 : 227 884 messages
+      // d'erreur en 45 s, parce que le lot remis en file grossissait à chaque
+      // tick et que chaque tick réémettait une erreur par update en attente.
+      //
+      // On ne prévient donc qu'une fois par update : `notified` évite de répéter
+      // le même message, et le compteur `consecutiveFailures` sert au diagnostic.
       for (const update of batch) {
+        if (update.notified) continue;
+        update.notified = true;
         send(update.client, {
           type: 'error',
           code: 'WRITE_FAILED',
@@ -141,6 +159,19 @@ export class DocumentState {
           message: `Enregistrement impossible : ${message}`,
         });
       }
+
+      if (this.consecutiveFailures === 1 || this.consecutiveFailures % 40 === 0) {
+        console.error('Échec du tick d\'écriture', {
+          docId: this.docId,
+          echecsConsecutifs: this.consecutiveFailures,
+          enAttente: batch.length,
+          error,
+        });
+      }
+
+      // Le lot est réessayé, mais **pas à chaque tick** : une erreur durable
+      // (validation, quota) ne se résout pas en 250 ms, et rejouer sans fin ne
+      // fait que consommer du débit et remplir les journaux.
       this.replay(batch);
     } finally {
       this.committing = false;
@@ -319,10 +350,59 @@ export async function commitBatch(
     byAuthor.set(update.client.email, list);
   }
 
+  /**
+   * Plafond dur de DynamoDB : **100 éléments par transaction**.
+   *
+   * Le compte est plus subtil qu'il n'y paraît, et c'est ce qui a rendu le défaut
+   * difficile à voir. Une transaction comprend :
+   *
+   *   - 1 `Update` sur `Documents` (séquence, longueur) ;
+   *   - 1 `Put` sur `Updates` (l'entrée de journal fusionnée) ;
+   *   - **2 `Put` par update** : `OP#email#opId` et `HASH#docId#empreinte` ;
+   *   - **1 `Update` par *auteur distinct*** sur `Credits`.
+   *
+   * Le dernier point est celui qui m'a fait me tromper : avec 50 rédacteurs
+   * différents, il y a 50 lignes de crédit, pas une. Mesure instrumentée :
+   * **146 items** pour 50 updates — et non les 103 estimés.
+   *
+   * Défaut observé en production le 26/10 : 50 rédacteurs à 1 update/s produisent
+   * ~50 updates par tick de 250 ms. La transaction dépassait 100 items,
+   * échouait à chaque tick, le lot remis en file grossissait, et chaque tick
+   * réémettait une erreur pour tout ce qu'elle contenait — 227 884 messages en
+   * 45 s, aucun acquittement.
+   *
+   * Le défaut restait invisible avant correction du scénario de charge : tous les
+   * VUs envoyaient le même payload, la déduplication réduisait le lot à quelques
+   * updates, et l'on restait sous la limite. Il ne se manifestait qu'avec des
+   * contenus et des auteurs réellement distincts — donc avec une charge réaliste.
+   */
+  const MAX_ITEMS = 100;
+  const FIXED_ITEMS = 2; // Documents + journal
+
+  /**
+   * Découpe `candidates` en respectant le plafond, en tenant compte du coût réel :
+   * 2 items par update, plus 1 par auteur distinct.
+   *
+   * On prend les updates dans l'ordre d'arrivée et on s'arrête dès que le compte
+   * dépasserait le plafond. Le reliquat est réinjecté en tête de file.
+   */
+  const written: IncomingUpdate[] = [];
+  const auteurs = new Set<string>();
+  for (const update of candidates) {
+    const nouveauxAuteurs = auteurs.has(update.client.email) ? 0 : 1;
+    const cout = FIXED_ITEMS + 2 * (written.length + 1) + auteurs.size + nouveauxAuteurs;
+    if (cout > MAX_ITEMS) break;
+    written.push(update);
+    auteurs.add(update.client.email);
+  }
+  // Sécurité : au moins un update par lot, sinon la file ne se viderait jamais.
+  if (written.length === 0) written.push(candidates[0]);
+  const rest = candidates.slice(written.length);
+
   const nextSeq = state.seq + 1;
-  const merged = Y.mergeUpdates(candidates.map((update) => update.payload));
-  const insertedTotal = candidates.reduce((sum, update) => sum + update.inserted, 0);
-  const deletedTotal = candidates.reduce((sum, update) => sum + update.deleted, 0);
+  const merged = Y.mergeUpdates(written.map((update) => update.payload));
+  const insertedTotal = written.reduce((sum, update) => sum + update.inserted, 0);
+  const deletedTotal = written.reduce((sum, update) => sum + update.deleted, 0);
 
   const entries: Parameters<ReturnType<typeof db>['transact']>[0] = [
     {
@@ -350,7 +430,7 @@ export async function commitBatch(
           seq: nextSeq,
           payload: merged,
           chars: insertedTotal + deletedTotal,
-          ops: candidates.map((update) => ({
+          ops: written.map((update) => ({
             opId: update.opId,
             authorEmail: update.client.email,
             chars: update.chars,
@@ -392,10 +472,15 @@ export async function commitBatch(
     }),
   );
 
+  // Débit de crédit : uniquement les auteurs réellement présents dans le lot
+  // **écrit** (`written`), pas dans tout `candidates`. Facturer un update resté
+  // en file le débiterait avant son écriture, et le débiterait deux fois.
+  const authorsWritten = new Set(written.map((update) => update.client.email));
   for (const [email, updates] of byAuthor) {
     // Auteur hors budget : il n'entre pas dans la transaction. Il sera traité
     // comme un refus (et fera l'objet d'un `recordCreditRefusal` plus bas).
     if (overBudget.has(email)) continue;
+    if (!authorsWritten.has(email)) continue;
 
     const chars = updates.reduce((sum, update) => sum + update.chars, 0);
     creditAuthorByIndex.set(entries.length, email);
@@ -450,7 +535,7 @@ export async function commitBatch(
 
   // Seuls les updates réellement persistés reçoivent un marqueur : en créer un
   // pour un update bloqué rendrait son `opId` acquitté plus tard, sans écriture.
-  for (const update of candidates) {
+  for (const update of written) {
     entries.push({
       Put: {
         table: cfg.opIdsTable,
@@ -484,7 +569,10 @@ export async function commitBatch(
   const outcome = await db().transact(entries);
 
   if (outcome.ok) {
-    applyAndBroadcast(state, merged, nextSeq, candidates);
+    applyAndBroadcast(state, merged, nextSeq, written);
+    // Le reliquat (au-delà du plafond de 100 items) reste en file et sera écrit
+    // au tick suivant. On le remet en **tête** : l'ordre d'arrivée est conservé.
+    if (rest.length > 0) state.replay(rest);
     // Les doublons internes n'ont pas été écrits une seconde fois, mais leur
     // contenu est durable : il voyage dans `merged`. On les acquitte maintenant
     // que la transaction a réussi, et non avant — si elle avait échoué, le
@@ -514,8 +602,12 @@ export async function commitBatch(
   if (rejected.size > 0) {
     // Un seul refus ne doit pas bloquer les autres rédacteurs du même tick :
     // on retire les fautifs et on relance immédiatement les survivants.
+    //
+    // On travaille sur `written` et non sur `candidates` : le reliquat au-delà
+    // du plafond de 100 items n'a pas été soumis à la transaction, et le
+    // compter comme survivant le renverrait en file indéfiniment.
     for (const email of rejected) {
-      const own = candidates.filter((update) => update.client.email === email);
+      const own = written.filter((update) => update.client.email === email);
       if (own.length === 0) continue;
       const refusal = await recordCreditRefusal(email, own[0].opId);
       const remaining = await currentCreditRemaining(email);
@@ -540,9 +632,11 @@ export async function commitBatch(
       }
     }
 
-    const survivors = candidates.filter((update) => !rejected.has(update.client.email));
-    if (survivors.length > 0) {
-      rejections.push(...(await commitBatch(state, survivors)));
+    // Le reliquat repart au tick suivant, avec les survivants du lot écrit.
+    const survivors = written.filter((update) => !rejected.has(update.client.email));
+    const next = rest.length > 0 ? [...survivors, ...rest] : survivors;
+    if (next.length > 0) {
+      rejections.push(...(await commitBatch(state, next)));
     }
     return rejections;
   }
