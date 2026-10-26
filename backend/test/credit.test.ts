@@ -344,4 +344,83 @@ describe('C4 — crédit d’écriture', () => {
     expect((await getCreditState('pauvre@exemple.cm')).used).toBe(0);
     expect(doc.seq).toBe(1);
   });
+
+  /**
+   * Un update écarté comme doublon **interne** au lot doit tout de même être
+   * acquitté.
+   *
+   * Défaut observé en charge le 26/10 : 2 292 updates émis par 50 rédacteurs,
+   * 106 acquittés, 50 diffusés, 0 erreur. Le `continue` muet qui retirait les
+   * doublons d'empreinte laissait leurs expéditeurs sans réponse, et l'interface
+   * restait bloquée sur « N modifications en attente ».
+   *
+   * Ce test reproduit la cause exacte : deux clients envoient le **même**
+   * contenu, donc la même empreinte, dans le même lot. Les deux doivent
+   * recevoir un `ack`, et le crédit ne doit être débité qu'une fois.
+   */
+  it('acquitte les doublons internes du lot au lieu de les laisser sans réponse', async () => {
+    harness = setupHarness();
+    await seedDocument(harness.memory);
+    resetConfigCache();
+    const { manager } = await import('../src/realtime/manager');
+    manager.stop();
+
+    const doc = await manager.load('doc_test');
+
+    /**
+     * Deux clients, **le même update binaire**.
+     *
+     * `incoming()` fabrique un `Y.Doc` neuf à chaque appel : l'identifiant de
+     * client étant aléatoire, deux appels produisent deux binaires différents.
+     * Ce ne serait donc pas des doublons, et le test ne prouverait rien — c'est
+     * précisément l'erreur de la première version de ce test, qui échouait pour
+     * cette raison.
+     *
+     * On construit donc un payload unique, partagé par les deux clients. C'est
+     * exactement ce que faisait le scénario k6 avant correction : un seul
+     * `UPDATE_B64` codé en dur pour tous les VUs.
+     */
+    const payload = updateOf('identique');
+    const partage = (client: Client, opId: string): IncomingUpdate => ({
+      client,
+      opId,
+      payload,
+      chars: 9,
+      inserted: 9,
+      deleted: 0,
+      hash: hashOf(payload),
+    });
+
+    const mises: string[] = [];
+    const capture = (email: string): Client => ({
+      ...makeClient(email),
+      socket: {
+        readyState: 1,
+        send: (raw: string) => {
+          const message = JSON.parse(raw) as { type?: string; opIds?: string[] };
+          if (message.type === 'ack') mises.push(`${email}:${(message.opIds ?? []).join(',')}`);
+        },
+      } as never,
+    });
+
+    const a = capture('un@exemple.cm');
+    const b = capture('deux@exemple.cm');
+
+    await commitBatch(doc, [partage(a, 'op_a'), partage(b, 'op_b')]);
+
+    // Les `ack` du chemin normal partent dans une IIFE non attendue
+    // (`applyAndBroadcast`) : on laisse la boucle d'événements les délivrer.
+    for (let essai = 0; essai < 40 && mises.length < 2; essai++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    // Le contenu n'est écrit qu'une fois…
+    expect(doc.seq).toBe(1);
+    // …et les deux expéditeurs sont acquittés, chacun avec son propre opId.
+    expect(mises).toContain('un@exemple.cm:op_a');
+    expect(mises).toContain('deux@exemple.cm:op_b');
+    // Une seule empreinte écrite : le crédit n'est pas débité deux fois.
+    expect((await getCreditState('un@exemple.cm')).used).toBe(9);
+    expect((await getCreditState('deux@exemple.cm')).used).toBe(0);
+  });
 });

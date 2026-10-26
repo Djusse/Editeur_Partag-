@@ -42,7 +42,7 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
 import { apiBase, requireEnv, runId } from './lib/common.js';
-import { runWriterSession, wsBase } from './lib/ws.js';
+import { payloadAt, runWriterSession, updateBank, wsBase } from './lib/ws.js';
 
 const WRITERS = Number(__ENV.WRITERS || 100);
 const DURATION = __ENV.DURATION || '45s';
@@ -51,7 +51,8 @@ const PACE_MS = Number(__ENV.PACE_MS || 1000);
 /** Sursis laissé aux `ack` en vol après l'arrêt de l'écriture. */
 const ACK_WAIT_MS = Number(__ENV.ACK_WAIT_MS || 2500);
 
-const durationMs = parseDuration(DURATION);
+/** Durée du tir en millisecondes, calculée une fois. */
+const DURATION_MS = parseDuration(DURATION);
 
 const acked = new Counter('s2_acked');
 const rejected = new Counter('s2_rejected');
@@ -63,6 +64,22 @@ const creditRefused = new Counter('s2_credit_refused');
 const ackLatency = new Trend('s2_ack_latency', true);
 const ackOk = new Rate('s2_all_acked');
 
+/**
+ * Banque d'updates **distincts**, partagée par tous les VUs.
+ *
+ * Envoyer le même payload à tous les rédacteurs ne produit pas de la
+ * concurrence : le CRDT fusionne les contenus identiques, et le serveur les
+ * déduplique par empreinte. Mesure du 26/10 avec un payload unique :
+ * 2 292 updates émis, **106 acquittés**, 50 diffusés, 0 erreur serveur. Le test
+ * mesurait la déduplication, pas la convergence.
+ *
+ * Génération (une fois, depuis le dépôt) :
+ *   node tests/k6/gen-updates.mjs 20000 tests/k6/data/updates.json
+ */
+const UPDATES = updateBank();
+/** Updates qu'un tir va réellement consommer, avec 20 % de marge. */
+const NEEDED = Math.ceil(WRITERS * (DURATION_MS / PACE_MS) * 1.2);
+
 export const options = {
   scenarios: {
     writers: {
@@ -71,7 +88,7 @@ export const options = {
       duration: DURATION,
       // Doit couvrir la durée de session + le sursis des `ack`, sinon k6 coupe
       // les connexions avant qu'on puisse compter les updates perdues.
-      gracefulStop: `${Math.ceil((durationMs + ACK_WAIT_MS * 2) / 1000)}s`,
+      gracefulStop: `${Math.ceil((DURATION_MS + ACK_WAIT_MS * 2) / 1000)}s`,
       tags: { scenario: 's2' },
     },
   },
@@ -155,14 +172,21 @@ export function setup() {
 
   // Budget de crédit : à documenter dans le rapport, et à comparer au plafond.
   const vusPerToken = Math.ceil(WRITERS / list.length);
-  const charsPerVu = Math.ceil(durationMs / PACE_MS);
+  const charsPerVu = Math.ceil(DURATION_MS / PACE_MS);
   const budget = vusPerToken * charsPerVu;
   const overBudget = budget > 10000;
+
+  // La banque doit couvrir tout le tir **sans se répéter**. Une répétition
+  // réintroduirait exactement le défaut qu'on vient de corriger : des updates
+  // identiques, fusionnés et dédupliqués, donc non acquittés individuellement.
+  const bankShort = UPDATES.length < NEEDED;
 
   console.log(
     `S2 — document ${docId}, ${WRITERS} rédacteurs, ${list.length} jeton(s), ` +
       `${DURATION}, cadence ${PACE_MS} ms, depuis seq=${sinceSeq}` +
-      ` — budget ${budget} caractères/compte${overBudget ? ' ⚠ DÉPASSE 10 000' : ''}`,
+      ` — budget ${budget} caractères/compte${overBudget ? ' ⚠ DÉPASSE 10 000' : ''}` +
+      ` — banque ${UPDATES.length} updates pour ${NEEDED} nécessaires` +
+      `${bankShort ? ' ⚠ BANQUE INSUFFISANTE' : ''}`,
   );
   if (overBudget) {
     console.warn(
@@ -171,8 +195,16 @@ export function setup() {
         'sinon les refus de crédit domineront la mesure.',
     );
   }
+  if (bankShort) {
+    console.warn(
+      `S2 — la banque d'updates est trop courte (${UPDATES.length} < ${NEEDED}). ` +
+        'Les payloads seront réutilisés, donc fusionnés : les mesures ne seront ' +
+        'plus représentatives. Régénérer avec :\n' +
+        `  node tests/k6/gen-updates.mjs ${NEEDED} tests/k6/data/updates.json`,
+    );
+  }
 
-  return { docId, tokens: list, run: runId(), sinceSeq, budget, overBudget };
+  return { docId, tokens: list, run: runId(), sinceSeq, budget, overBudget, bankShort };
 }
 
 export default function (data) {
@@ -214,6 +246,13 @@ export default function (data) {
   }
 
   const ticket = JSON.parse(ticketResponse.body).ticket;
+
+  // Chaque VU démarre à un décalage différent dans la banque : deux VUs ne
+  // consomment donc jamais le même payload. Sans ce décalage, 50 rédacteurs
+  // partageant la banque depuis l'indice 0 enverraient les mêmes updates et
+  // retomberaient sur le défaut de déduplication.
+  const start = ((__VU - 1) * Math.ceil(UPDATES.length / Math.max(WRITERS, 1))) % UPDATES.length;
+
   const session = runWriterSession({
     url:
       `${wsBase(__ENV.API_URL)}/ws?ticket=${encodeURIComponent(ticket)}` +
@@ -221,8 +260,10 @@ export default function (data) {
     docId: data.docId,
     sinceSeq: data.sinceSeq,
     paceMs: PACE_MS,
-    durationMs,
-    updateB64: __ENV.UPDATE_B64 || 'AQGd+OWCBAAEAQdjb250ZW50AXgA',
+    durationMs: DURATION_MS,
+    updateB64: __ENV.UPDATE_B64 || UPDATES[start],
+    bank: __ENV.UPDATE_B64 ? null : UPDATES,
+    bankStart: start,
     opPrefix: `op_s2_${data.run}_${__VU}_${__ITER}`,
     ackWaitMs: ACK_WAIT_MS,
     onUpdate: () => updatesReceived.add(1),

@@ -95,6 +95,51 @@ k6 run -e API_URL=http://13.53.160.209 -e TOKEN=$TOKEN -e DOC_ID=$DOC_ID \
 Paliers : `WRITERS=50`, puis `100`, puis `300`. Le palier retenu est le plus
 haut où `s2_missing_ack` reste à 0.
 
+### Préparer la banque d'updates (obligatoire, une fois)
+
+```bash
+node tests/k6/gen-updates.mjs 20000 tests/k6/data/updates.json
+```
+
+Sans elle, aucun VU ne peut envoyer d'update : le scénario s'arrête à
+l'inspection avec `stat …/updates.json: no such file`.
+
+**Pourquoi une banque, et pas un payload unique.** La version précédente
+envoyait à tous les VUs le **même** `UPDATE_B64`. Or le serveur déduplique par
+empreinte du contenu, pas seulement par `opId` : les updates identiques sont
+retirés du lot, et leurs expéditeurs n'obtenaient pas d'acquittement.
+
+Mesure du 26/10 avec un payload unique, 50 rédacteurs, 45 s :
+
+| Mesure | Valeur | Lecture |
+| - | - | - |
+| updates émis | 2 292 | cohérent (50 × 45) |
+| updates acquittés | **106** | le serveur ne traitait presque rien |
+| updates diffusés | 50 | un seul message par VU |
+| erreurs serveur | 0 | rien n'était cassé |
+| budget de crédit | 585 / 10 000 | le quota n'était pas en cause |
+
+Le défaut était d'abord dans le test : cinquante rédacteurs qui insèrent le même
+caractère produisent **une** opération CRDT, pas cinquante. Ce n'est pas de la
+concurrence. Corriger le test a aussi révélé un angle mort du serveur, désormais
+couvert par un test unitaire : un update écarté comme doublon interne doit tout
+de même être acquitté.
+
+`gen-updates.mjs` crée chaque payload depuis un `Y.Doc()` distinct : l'identifiant
+de client étant aléatoire, les binaires sont tous différents, et le coût reste
+**1 caractère** par update. Le script refuse de produire une banque contenant
+deux empreintes identiques.
+
+S2 affiche au démarrage la taille de banque et le besoin :
+
+```
+banque 20000 updates pour 72 nécessaires
+```
+
+Si la banque est trop courte, le scénario le signale en `⚠ BANQUE INSUFFISANTE`
+et les payloads sont réutilisés — les mesures ne sont alors plus
+représentatives.
+
 ### Connexion persistante et cadence
 
 Chaque VU ouvre **une** connexion WebSocket et écrit toutes les `PACE_MS`

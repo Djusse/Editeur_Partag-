@@ -39,6 +39,21 @@ fi
 # fin, et refuse silencieusement si le chemin est absent.
 mkdir -p tests/results
 
+# Banque d'updates distincts pour S2 : SANS elle, le scénario s'arrête à
+# l'inspection (`stat …/updates.json`). Envoyer le même payload à tous les VUs
+# ne produit pas de la concurrence : le serveur déduplique par empreinte, et les
+# expéditeurs restent sans acquittement. Voir tests/k6/README.md.
+if [ "$SCENARIO" = "s2" ]; then
+  if [ ! -s tests/k6/data/updates.json ]; then
+    echo "banque d'updates absente — génération…"
+    if ! node tests/k6/gen-updates.mjs 20000 tests/k6/data/updates.json; then
+      echo "ERREUR : génération impossible. Node et yjs (backend/) sont requis." >&2
+      echo "  cd backend && npm install && cd .. && node tests/k6/gen-updates.mjs 20000 tests/k6/data/updates.json" >&2
+      exit 1
+    fi
+  fi
+fi
+
 case "$SCENARIO" in
   s1) SCRIPT=tests/k6/s1-claim.js ;;
   s2) SCRIPT=tests/k6/s2-convergence.js ;;

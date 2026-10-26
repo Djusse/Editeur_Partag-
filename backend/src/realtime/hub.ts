@@ -221,17 +221,47 @@ export async function commitBatch(
   const ttl = Math.floor(Date.now() / 1000) + 48 * 3600;
 
   // Doublons dans un même lot : ils casseraient la transaction (même clé).
+  //
+  // Un doublon est **écarté**, mais il doit être **acquitté**. La version
+  // précédente faisait un `continue` muet : le client dont l'update était retiré
+  // n'obtenait jamais d'`ack`, et son interface restait bloquée sur
+  // « N modifications en attente » alors que rien n'était cassé. Défaut observé
+  // en charge (50 rédacteurs envoyant un contenu identique : 2 292 updates émis,
+  // 106 acquittés) — c'était bien un angle mort du serveur, en plus d'un défaut
+  // du test.
+  //
+  // L'`ack` est envoyé tout de suite : le contenu de cet update est déjà porté
+  // par un autre update du même lot, donc il sera durablement écrit par la
+  // transaction qui suit. Acquitter plus tard serait incorrect (le lot peut
+  // encore échouer) ; acquitter ici est exact, puisque la durabilité de ce
+  // contenu est portée par l'entrée retenue.
   const seenOp = new Set<string>();
   const seenHash = new Set<string>();
   const unique: IncomingUpdate[] = [];
+  const duplicates: IncomingUpdate[] = [];
   for (const update of batch) {
     const opKey = `OP#${update.client.email}#${update.opId}`;
-    if (seenOp.has(opKey) || seenHash.has(update.hash)) continue;
+    if (seenOp.has(opKey) || seenHash.has(update.hash)) {
+      duplicates.push(update);
+      continue;
+    }
     seenOp.add(opKey);
     seenHash.add(update.hash);
     unique.push(update);
   }
-  if (unique.length === 0) return [];
+  if (unique.length === 0) {
+    // Lot entièrement composé de doublons internes : rien à écrire, mais chaque
+    // expéditeur attend une réponse.
+    for (const update of duplicates) {
+      send(update.client, {
+        type: 'ack',
+        opIds: [update.opId],
+        seq: state.seq,
+        creditRemaining: await currentCreditRemaining(update.client.email),
+      });
+    }
+    return [];
+  }
 
   const rejections: BatchRejection[] = [];
 
@@ -455,6 +485,18 @@ export async function commitBatch(
 
   if (outcome.ok) {
     applyAndBroadcast(state, merged, nextSeq, candidates);
+    // Les doublons internes n'ont pas été écrits une seconde fois, mais leur
+    // contenu est durable : il voyage dans `merged`. On les acquitte maintenant
+    // que la transaction a réussi, et non avant — si elle avait échoué, le
+    // contenu ne serait pas durable et l'acquittement aurait menti.
+    for (const update of duplicates) {
+      send(update.client, {
+        type: 'ack',
+        opIds: [update.opId],
+        seq: nextSeq,
+        creditRemaining: await currentCreditRemaining(update.client.email),
+      });
+    }
     return rejections;
   }
 

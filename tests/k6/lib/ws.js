@@ -41,10 +41,57 @@
  * crédit devient calculable : `durationMs / paceMs` caractères par VU.
  */
 import ws from 'k6/ws';
+import { SharedArray } from 'k6/data';
 
 /** Convertit une base HTTP en base WebSocket (`http://x` → `ws://x`). */
 export function wsBase(apiUrl) {
   return (apiUrl || 'http://localhost:4000').replace(/\/+$/, '').replace(/^http/, 'ws');
+}
+
+/**
+ * Banque d'updates **distincts**, partagée entre tous les VUs.
+ *
+ * ── Pourquoi ce n'est pas un simple `UPDATE_B64` ────────────────────────────
+ * La première version de S2 envoyait à tous les VUs le même payload codé en
+ * dur. Le serveur déduplique par empreinte du contenu en plus de l'`opId` :
+ * les updates identiques sont retirés du lot, et les VUs concernés n'obtiennent
+ * jamais d'acquittement. Mesure du 26/10 : 2 292 updates émis, **106 acquittés**,
+ * 50 diffusés, 0 erreur serveur. Le serveur ne refusait rien — il écartait du
+ * contenu identique.
+ *
+ * Le défaut était d'abord dans le test : cinquante rédacteurs qui insèrent le
+ * même caractère produisent **une** opération CRDT, pas cinquante. Ce n'est pas
+ * de la concurrence, donc S2 ne mesurait pas ce qu'il annonçait.
+ *
+ * ── Forme de la banque ─────────────────────────────────────────────────────
+ * `tests/k6/data/updates.json` : un tableau de chaînes Base64, produites par
+ * `node tests/k6/gen-updates.mjs N`. Chaque entrée vient d'un `Y.Doc()`
+ * différent, donc d'un identifiant de client différent : les binaires sont tous
+ * distincts, même en insérant le même caractère. Le coût reste 1 caractère.
+ *
+ * `SharedArray` est indispensable : sans lui, chaque VU désérialiserait une copie
+ * du tableau, et 20 000 entrées × 300 VUs épuiseraient la mémoire de la VM de
+ * charge avant même d'ouvrir une connexion.
+ */
+export function updateBank() {
+  // `open()` résout son chemin **relativement au fichier qui l'appelle**, pas au
+  // répertoire courant. Depuis `tests/k6/lib/`, `tests/k6/data/…` donnait
+  // `tests/k6/tests/k6/data/…` — erreur constatée à l'inspection. On part donc
+  // de `./data/`, et `UPDATES_FILE` reste relatif à ce même dossier.
+  const path = __ENV.UPDATES_FILE || './data/updates.json';
+  return new SharedArray('updates', () => JSON.parse(open(path)));
+}
+
+/**
+ * Renvoie le payload d'indice `index`, en bouclant si la banque est plus courte.
+ *
+ * Le modulo assume une banque **suffisamment grande** : une répétition
+ * réintroduirait exactement le défaut décrit plus haut. `runWriterSession`
+ * compte les envois et le résumé avertit si la banque a été parcourue plus d'une
+ * fois, pour que le lecteur sache si la mesure est encore valable.
+ */
+export function payloadAt(bank, index) {
+  return bank[index % bank.length];
 }
 
 /**
@@ -78,6 +125,12 @@ export function runWriterSession(options) {
     paceMs = 1000,
     durationMs = 45000,
     updateB64,
+    // Banque optionnelle : si fournie, chaque envoi prend le payload suivant
+    // au lieu de répéter `updateB64`. Une répétition produirait des updates de
+    // même empreinte, que le serveur fusionne et déduplique — le test mesurerait
+    // alors la déduplication, pas la convergence.
+    bank = null,
+    bankStart = 0,
     opPrefix,
     ackWaitMs = 2500,
     onUpdate,
@@ -107,9 +160,13 @@ export function runWriterSession(options) {
       if (stopped || !result.joined) return;
       counter += 1;
       const opId = `${opPrefix}_${counter}`;
+      // Payload suivant de la banque, en bouclant si elle est plus courte que
+      // le nombre d'envois. Le bouclage est signalé dans le résumé du scénario :
+      // au-delà d'un tour, les mesures ne sont plus représentatives.
+      const payload = bank ? bank[(bankStart + counter) % bank.length] : updateB64;
       sentAt.set(opId, Date.now());
       result.sent += 1;
-      socket.send(JSON.stringify({ type: 'update', opId, documentId: docId, payload: updateB64 }));
+      socket.send(JSON.stringify({ type: 'update', opId, documentId: docId, payload }));
     };
 
     const stop = () => {
