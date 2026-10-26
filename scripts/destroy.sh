@@ -21,7 +21,10 @@ set -euo pipefail
 
 STACK_NAME="${STACK_NAME:-editeur}"
 AWS_REGION="${AWS_REGION:-eu-north-1}"
-KEY_NAME="${KEY_NAME:-cle-christian}"
+# Nom **générique** : le script supprime la paire de clés que `deploy.sh` a pu
+# créer. Y laisser un nom personnel rendait le script inutilisable par un tiers,
+# alors que la suppression doit rester une opération reproductible.
+KEY_NAME="${KEY_NAME:-editeur-key}"
 ASSUME_YES=0
 [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && ASSUME_YES=1
 

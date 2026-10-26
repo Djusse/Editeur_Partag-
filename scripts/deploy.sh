@@ -8,7 +8,13 @@
 #  5. vérifie que /health répond.
 #
 # Usage :
-#   KEY_NAME=cle-christian SES_SENDER="vous@gmail.com" ADMIN_CIDR="82.1.2.3/32" ./scripts/deploy.sh
+#   SES_SENDER="vous@exemple.cm" ./scripts/deploy.sh
+#   # avec accès SSH (facultatif) :
+#   KEY_NAME=ma-cle SES_SENDER="vous@exemple.cm" ADMIN_CIDR="203.0.113.10/32" ./scripts/deploy.sh
+#
+# `203.0.113.0/24` est la plage réservée à la documentation (RFC 5737) : elle ne
+# désigne l'IP de personne. Un exemple avec une adresse réelle finit toujours
+# par être copié tel quel dans un déploiement.
 #
 # Aucune clé d'accès n'est nécessaire : `aws login` (ou un profil SSO) suffit.
 #
