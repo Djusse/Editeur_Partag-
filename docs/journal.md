@@ -331,6 +331,9 @@ template CloudFormation .. YAML valide, 20 ressources
 
 ## Coûts
 
+> Cette section est reprise et détaillée dans [`rapport-tests.md`](rapport-tests.md),
+> section 5, avec les volumes consommés calculés à partir des métriques d'usage.
+
 Relevé le 26/10 à 05h20 UTC, sur la période du 24 au 27 octobre.
 
 ### Ce qui est facturé

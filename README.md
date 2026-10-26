@@ -27,6 +27,7 @@ la recrée et affiche la nouvelle IP Elastic (stable d'un redéploiement à l'au
 
 | Document | Contenu |
 | - | - |
+| [`docs/rapport-tests.md`](docs/rapport-tests.md) | **Rapport de tests et de coûts** : résultats mesurés, défauts révélés, total facturé |
 | [`docs/api.md`](docs/api.md) | Référence complète de l'API : toutes les routes, le protocole temps réel, les règles de crédit |
 | [`docs/api/websocket.md`](docs/api/websocket.md) | Protocole WebSocket : messages, plafonds, cycle de connexion |
 | [`docs/api/openapi.yaml`](docs/api/openapi.yaml) | Description machine de l'API REST |
@@ -483,7 +484,8 @@ frontend/                 Next.js 14, export statique, thème clair
   src/components/         TopBar, Modale, Toasts
 infra/                    template.yaml (CloudFormation), samconfig, README-infra
 scripts/                  deploy.sh, destroy.sh
-docs/                     api.md, api/, adr/, journal.md
+docs/                     rapport-tests.md, api.md, api/, adr/, journal.md,
+                          conception/ (LaTeX), diagrammes-conception/ (PlantUML)
 tests/k6/                 S1, S2, S5, S7 + lib/ + outils (mktokens, run, install)
 tests/node/               verify-convergence.mjs, verify-client-bundle.mjs
 ```
