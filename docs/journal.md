@@ -226,11 +226,88 @@ derrière nginx, avec l'état des documents **en mémoire**. CloudFormation remp
     identité pour relire un document, ce qui n'apporte aucune sécurité
     supplémentaire (aucun mot de passe, l'identité est déclarative).
 
+## 2026-10-26 — Tests de charge en production : trois défauts réels
+
+La campagne de charge a échoué deux fois avant de passer, et chaque échec a
+révélé un défaut que les tests unitaires ne pouvaient pas voir. C'est le
+résultat le plus utile de la session.
+
+### Échec 1 — 2 292 updates émis, 106 acquittés
+
+Le scénario envoyait à **tous** les VUs le même payload, codé en dur. Or le
+serveur déduplique par empreinte du contenu, en plus de l'`opId` : les updates
+identiques étaient retirés du lot, et leurs expéditeurs n'obtenaient jamais
+d'acquittement. Le `continue` qui les écartait était **muet**.
+
+Deux défauts, pas un. Le test était faux — cinquante rédacteurs insérant le même
+caractère produisent *une* opération CRDT, pas cinquante, donc ce n'était pas de
+la concurrence. Et le serveur avait un angle mort : un client réel dont l'update
+est dédupliqué reste bloqué sur « N modifications en attente ».
+
+*Correction* : `gen-updates.mjs` produit 20 000 updates tous distincts (un
+`Y.Doc` par entrée, donc un identifiant de client différent à chaque fois), et
+le serveur acquitte les doublons internes **après** le commit.
+
+### Échec 2 — 227 884 messages d'erreur, 0 acquittement
+
+Ce n'était pas 227 884 refus (il y a eu ~2 250 updates) mais **~5 000 messages
+par seconde** : une tempête de réessais. Le lot échouait à chaque tick, était
+remis en file, la file grossissait, et chaque tick réémettait une erreur pour
+tout ce qu'elle contenait. Croissance quadratique.
+
+Cause : `TransactWriteItems` plafonne à **100 éléments**. Une transaction
+comprend 1 `Update` sur `Documents`, 1 `Put` sur `Updates`, 2 `Put` par update
+(`OP#` et `HASH#`), et **1 `Update` par auteur distinct** sur `Credits`. Avec 50
+rédacteurs différents, cela fait 50 lignes de crédit — et **146 items mesurés
+pour 50 updates**, et non les 103 que j'avais estimés.
+
+*Correction* : découpe du lot selon le coût réel, reliquat réinjecté en tête de
+file, débit de crédit et marqueurs d'idempotence limités au lot **écrit**,
+notification d'échec une seule fois par update.
+
+### La leçon, la même que les trois fois précédentes
+
+Le double en mémoire de DynamoDB **n'imposait aucune limite** sur `transact`.
+C'est la **quatrième** fois qu'il se révèle plus permissif que le vrai service,
+après l'arithmétique entre valeurs, les mots réservés et maintenant la taille de
+transaction. Il refuse désormais plus de 100 éléments, comme DynamoDB.
+
+Un faux service qui n'imite que les succès laisse passer du code cassé.
+
+### Résultat mesuré — palier 50, en production
+
+```
+updates acquittés ......... 2 296   (50 VUs x 45 s à 1 Hz → 2 250 attendus)
+sans ack .................. 0
+refus explicites .......... 0
+latence ack p95 ........... 301 ms  (tick d'écriture : 250 ms)
+updates diffusés .......... 6 845   (~137 par VU, un message par tick)
+verdict ................... C2 tenue
+```
+
+Et la convergence du contenu, vérifiée indépendamment de k6 :
+
+```json
+{ "seqServeur": 138, "entreesJournal": 138, "trous": 0,
+  "longueurFinale": 2297, "seqCoherent": true,
+  "reconstructionStable": true, "verdict": "CONVERGENCE OK" }
+```
+
+Le recoupement est le point important : k6 compte **2 296** acquittements côté
+client, le vérificateur dénombre **138 entrées de journal** contenant chacune
+~16,6 updates, et la longueur finale vaut **2 297** (2 296 + le caractère
+préexistant). Deux outils indépendants, trois chemins de calcul, le même
+nombre — c'est ce qui fait la preuve.
+
+> Les paliers 100 et 300, ainsi que S5 et S7, sont écrits et validés au banc mais
+> n'ont pas été exécutés en production faute de temps. Ils doivent être
+> présentés comme tels.
+
 ## Preuves exécutées
 
 ```
 typecheck backend ......... OK (0 erreur)
-tests unitaires .......... 29/29
+tests unitaires .......... 45/45
 mode local (E2E) ......... 24/24 — WebSocket natif, PDF réel, quota, crédit, CORS
 persistance locale ....... 7/7   — document, texte, lien, session, clé admin
 versions ................. 11/11 — enregistrement, liste, restauration gratuite
